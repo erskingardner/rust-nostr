@@ -1387,7 +1387,7 @@ impl EventBuilder {
 
         Self::new(Kind::GiftWrap, content, tags)
             .custom_created_at(Timestamp::tweaked(nip59::RANGE_RANDOM_TIMESTAMP_TWEAK))
-            .to_event(&keys)
+            .sign_with_keys(&keys)
     }
 
     /// Gift Wrap with Tags
@@ -1395,14 +1395,20 @@ impl EventBuilder {
     /// <https://github.com/nostr-protocol/nips/blob/master/104.md>
     #[inline]
     #[cfg(all(feature = "std", feature = "nip104"))]
-    pub fn gift_wrap_with_tags(
-        sender_keys: &Keys,
+    pub async fn gift_wrap_with_tags<T>(
+        signer: &T,
         receiver: &PublicKey,
         rumor: UnsignedEvent,
         tags: Vec<Tag>,
         expiration: Option<Timestamp>,
-    ) -> Result<Event, Error> {
-        let seal: Event = Self::seal(sender_keys, receiver, rumor)?.to_event(sender_keys)?;
+    ) -> Result<Event, Error>
+    where
+        T: NostrSigner,
+    {
+        let seal: Event = Self::seal(signer, receiver, rumor)
+            .await?
+            .sign(signer)
+            .await?;
         Self::gift_wrap_from_seal_with_tags(receiver, &seal, expiration, tags)
     }
 

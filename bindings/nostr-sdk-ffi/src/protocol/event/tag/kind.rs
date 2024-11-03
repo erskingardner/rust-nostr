@@ -110,6 +110,9 @@ pub enum TagKind {
     Request,
     Web,
     Word,
+    MlsProtocolVersion,
+    MlsCiphersuite,
+    MlsExtensions,
     Unknown {
         unknown: String,
     },
@@ -168,6 +171,9 @@ impl<'a> From<tag::TagKind<'a>> for TagKind {
             tag::TagKind::Request => Self::Request,
             tag::TagKind::Web => Self::Web,
             tag::TagKind::Word => Self::Word,
+            tag::TagKind::MlsProtocolVersion => Self::MlsProtocolVersion,
+            tag::TagKind::MlsCiphersuite => Self::MlsCiphersuite,
+            tag::TagKind::MlsExtensions => Self::MlsExtensions,
             tag::TagKind::Custom(unknown) => Self::Unknown {
                 unknown: unknown.to_string(),
             },
@@ -226,6 +232,9 @@ impl<'a> From<TagKind> for tag::TagKind<'a> {
             TagKind::Request => Self::Request,
             TagKind::Web => Self::Web,
             TagKind::Word => Self::Word,
+            TagKind::MlsProtocolVersion => Self::MlsProtocolVersion,
+            TagKind::MlsCiphersuite => Self::MlsCiphersuite,
+            TagKind::MlsExtensions => Self::MlsExtensions,
             TagKind::Unknown { unknown } => Self::Custom(Cow::Owned(unknown)),
         }
     }

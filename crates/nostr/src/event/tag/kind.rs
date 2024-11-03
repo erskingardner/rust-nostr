@@ -69,6 +69,12 @@ pub enum TagKind<'a> {
     Maintainers,
     /// HTTP Method Request
     Method,
+    /// MLS Protocol Version
+    MlsProtocolVersion,
+    /// MLS ciphersuite
+    MlsCiphersuite,
+    /// MLS Extensions
+    MlsExtensions,
     /// Name
     Name,
     /// Nonce
@@ -150,6 +156,14 @@ impl<'a> TagKind<'a> {
         Self::SingleLetter(SingleLetterTag::lowercase(Alphabet::E))
     }
 
+    /// Construct `h` kind
+    ///
+    /// Shorthand for `TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::H))`.
+    #[inline]
+    pub fn h() -> Self {
+        Self::SingleLetter(SingleLetterTag::lowercase(Alphabet::H))
+    }
+
     /// Construct `p` kind
     ///
     /// Shorthand for `TagKind::SingleLetter(SingleLetterTag::lowercase(Alphabet::P))`.
@@ -205,6 +219,9 @@ impl<'a> fmt::Display for TagKind<'a> {
             Self::Magnet => write!(f, "magnet"),
             Self::Maintainers => write!(f, "maintainers"),
             Self::Method => write!(f, "method"),
+            Self::MlsProtocolVersion => write!(f, "mls_protocol_version"),
+            Self::MlsCiphersuite => write!(f, "mls_ciphersuite"),
+            Self::MlsExtensions => write!(f, "mls_extensions"),
             Self::Name => write!(f, "name"),
             Self::Nonce => write!(f, "nonce"),
             Self::Payload => write!(f, "payload"),
@@ -262,6 +279,9 @@ impl<'a> From<&'a str> for TagKind<'a> {
             "magnet" => Self::Magnet,
             "maintainers" => Self::Maintainers,
             "method" => Self::Method,
+            "mls_protocol_version" => Self::MlsProtocolVersion,
+            "mls_ciphersuite" => Self::MlsCiphersuite,
+            "mls_extensions" => Self::MlsExtensions,
             "name" => Self::Name,
             "nonce" => Self::Nonce,
             "payload" => Self::Payload,

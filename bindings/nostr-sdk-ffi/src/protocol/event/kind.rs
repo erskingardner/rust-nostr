@@ -315,6 +315,12 @@ pub enum KindEnum {
     SetStall,
     /// Set product (NIP15)
     SetProduct,
+    /// Key Package (NIP104)
+    MlsKeyPackage,
+    /// Mls Welcome (NIP104)
+    MlsWelcome,
+    /// Mls Group Message (NIP104)
+    MlsGroupMessage,
     /// Job Feedback (NIP90)
     JobFeedback,
     JobRequest {
@@ -415,6 +421,9 @@ impl From<nostr::Kind> for KindEnum {
             nostr::Kind::SetStall => Self::SetStall,
             nostr::Kind::SetProduct => Self::SetProduct,
             nostr::Kind::JobFeedback => Self::JobFeedback,
+            nostr::Kind::MlsKeyPackage => Self::MlsKeyPackage,
+            nostr::Kind::MlsWelcome => Self::MlsWelcome,
+            nostr::Kind::MlsGroupMessage => Self::MlsGroupMessage,
             nostr::Kind::JobRequest(kind) => Self::JobRequest { kind },
             nostr::Kind::JobResult(kind) => Self::JobResult { kind },
             nostr::Kind::Regular(u) => Self::Regular { kind: u },
@@ -501,6 +510,9 @@ impl From<KindEnum> for nostr::Kind {
             KindEnum::SetStall => Self::SetStall,
             KindEnum::SetProduct => Self::SetProduct,
             KindEnum::JobFeedback => Self::JobFeedback,
+            KindEnum::MlsKeyPackage => Self::MlsKeyPackage,
+            KindEnum::MlsWelcome => Self::MlsWelcome,
+            KindEnum::MlsGroupMessage => Self::MlsGroupMessage,
             KindEnum::JobRequest { kind } => Self::JobRequest(kind),
             KindEnum::JobResult { kind } => Self::JobResult(kind),
             KindEnum::Regular { kind } => Self::Regular(kind),

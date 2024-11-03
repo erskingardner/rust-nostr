@@ -163,6 +163,9 @@ kind_variants! {
     FileMetadata => 1063, "File Metadata (NIP94)",
     HttpAuth => 27235, "HTTP Auth (NIP98)",
     ApplicationSpecificData => 30078, "Application-specific Data (NIP78)",
+    MlsKeyPackage => 443, "MLS Key Package (NIP104)",
+    MlsWelcome => 444, "MLS Welcome (NIP104)",
+    MlsGroupMessage => 445, "MLS Group Message (NIP104)",
 }
 
 impl PartialEq<Kind> for Kind {
