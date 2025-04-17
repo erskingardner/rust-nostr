@@ -16,63 +16,42 @@ impl GroupStorage for NostrMlsMemoryStorage {
         let group_arc = Arc::new(group.clone());
 
         // Store in the MLS group ID cache
-        if let Ok(mut cache) = self.groups_cache.write() {
+        {
+            let mut cache = self.groups_cache.write();
             cache.put(group_arc.mls_group_id.clone(), Arc::clone(&group_arc));
-        } else {
-            return Err(GroupError::DatabaseError(
-                "Failed to acquire write lock on groups cache".to_string(),
-            ));
         }
 
         // Store in the Nostr group ID cache
-        if let Ok(mut cache) = self.groups_by_nostr_id_cache.write() {
+        {
+            let mut cache = self.groups_by_nostr_id_cache.write();
             cache.put(group_arc.nostr_group_id.clone(), Arc::clone(&group_arc));
-        } else {
-            return Err(GroupError::DatabaseError(
-                "Failed to acquire write lock on groups by nostr ID cache".to_string(),
-            ));
         }
 
         Ok(group)
     }
 
     fn all_groups(&self) -> Result<Vec<Group>, GroupError> {
-        if let Ok(cache) = self.groups_cache.read() {
-            // Convert the values from the cache to a Vec
-            let groups: Vec<Group> = cache.iter().map(|(_, v)| (**v).clone()).collect();
-            return Ok(groups);
-        }
-
-        Err(GroupError::DatabaseError(
-            "Failed to acquire read lock on groups cache".to_string(),
-        ))
+        let cache = self.groups_cache.read();
+        // Convert the values from the cache to a Vec
+        let groups: Vec<Group> = cache.iter().map(|(_, v)| (**v).clone()).collect();
+        Ok(groups)
     }
 
     fn find_group_by_mls_group_id(&self, mls_group_id: &[u8]) -> Result<Group, GroupError> {
-        if let Ok(cache) = self.groups_cache.read() {
-            if let Some(group_arc) = cache.peek(mls_group_id) {
-                // Return a clone of the found group
-                return Ok((**group_arc).clone());
-            }
-        } else {
-            return Err(GroupError::DatabaseError(
-                "Failed to acquire read lock on groups cache".to_string(),
-            ));
+        let cache = self.groups_cache.read();
+        if let Some(group_arc) = cache.peek(mls_group_id) {
+            // Return a clone of the found group
+            return Ok((**group_arc).clone());
         }
 
         Err(GroupError::NotFound)
     }
 
     fn find_group_by_nostr_group_id(&self, nostr_group_id: &str) -> Result<Group, GroupError> {
-        if let Ok(cache) = self.groups_by_nostr_id_cache.read() {
-            if let Some(group_arc) = cache.peek(nostr_group_id) {
-                // Return a clone of the found group
-                return Ok((**group_arc).clone());
-            }
-        } else {
-            return Err(GroupError::DatabaseError(
-                "Failed to acquire read lock on groups by nostr ID cache".to_string(),
-            ));
+        let cache = self.groups_by_nostr_id_cache.read();
+        if let Some(group_arc) = cache.peek(nostr_group_id) {
+            // Return a clone of the found group
+            return Ok((**group_arc).clone());
         }
 
         Err(GroupError::NotFound)
@@ -82,14 +61,9 @@ impl GroupStorage for NostrMlsMemoryStorage {
         // Check if the group exists first
         self.find_group_by_mls_group_id(mls_group_id)?;
 
-        if let Ok(cache) = self.messages_by_group_cache.read() {
-            if let Some(messages_arc) = cache.peek(mls_group_id) {
-                return Ok((**messages_arc).clone());
-            }
-        } else {
-            return Err(GroupError::DatabaseError(
-                "Failed to acquire read lock on messages by group cache".to_string(),
-            ));
+        let cache = self.messages_by_group_cache.read();
+        if let Some(messages_arc) = cache.peek(mls_group_id) {
+            return Ok((**messages_arc).clone());
         }
 
         // If not in cache but group exists, return empty vector
@@ -110,14 +84,9 @@ impl GroupStorage for NostrMlsMemoryStorage {
         // Check if the group exists first
         self.find_group_by_mls_group_id(mls_group_id)?;
 
-        if let Ok(cache) = self.group_relays_cache.read() {
-            if let Some(relays_arc) = cache.peek(mls_group_id) {
-                return Ok((**relays_arc).clone());
-            }
-        } else {
-            return Err(GroupError::DatabaseError(
-                "Failed to acquire read lock on group relays cache".to_string(),
-            ));
+        let cache = self.group_relays_cache.read();
+        if let Some(relays_arc) = cache.peek(mls_group_id) {
+            return Ok((**relays_arc).clone());
         }
 
         // If not in cache but group exists, return empty vector
@@ -132,7 +101,8 @@ impl GroupStorage for NostrMlsMemoryStorage {
 
         let group_relay_clone = group_relay.clone();
 
-        if let Ok(mut cache) = self.group_relays_cache.write() {
+        {
+            let mut cache = self.group_relays_cache.write();
             // Get existing relays or create new vector
             let relays = match cache.get(&mls_group_id) {
                 Some(existing_relays_arc) => {
@@ -151,10 +121,6 @@ impl GroupStorage for NostrMlsMemoryStorage {
 
             // Update the cache with the new vector
             cache.put(mls_group_id, Arc::new(relays));
-        } else {
-            return Err(GroupError::DatabaseError(
-                "Failed to acquire write lock on group relays cache".to_string(),
-            ));
         }
 
         Ok(group_relay)

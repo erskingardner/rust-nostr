@@ -2786,6 +2786,7 @@ dependencies = [
  "nostr",
  "nostr-mls-storage",
  "openmls_memory_storage",
+ "parking_lot",
 ]
 
 [[package]]

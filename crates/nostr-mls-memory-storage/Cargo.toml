@@ -16,3 +16,4 @@ lru.workspace = true
 nostr = { workspace = true, features = ["std"] }
 nostr-mls-storage.workspace = true
 openmls_memory_storage = { version = "0.3", default-features = false }
+parking_lot = { version = "0.12", features = ["send_guard"] }
