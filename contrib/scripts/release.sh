@@ -6,6 +6,7 @@ args=(
     "-p nostr"
     "-p nostr-database"
     "-p nostr-lmdb"
+    "-p nostr-mls-memory-storage"
     "-p nostr-mls-storage"
     "-p nostr-ndb"
     "-p nostr-indexeddb"
