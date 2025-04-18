@@ -11,7 +11,6 @@
 #![warn(rustdoc::bare_urls)]
 
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 
 use lru::LruCache;
 use nostr::EventId;
@@ -27,7 +26,7 @@ mod messages;
 mod welcomes;
 
 /// Default cache size for each LRU cache
-const DEFAULT_CACHE_SIZE: usize = 1000;
+const DEFAULT_CACHE_SIZE: NonZeroUsize = NonZeroUsize::new(1000).unwrap();
 
 /// A memory-based storage implementation for Nostr MLS.
 ///
@@ -42,7 +41,6 @@ const DEFAULT_CACHE_SIZE: usize = 1000;
 ///
 /// - Each cache has a configurable size limit (default: 1000 items)
 /// - When a cache reaches its size limit, the least recently used items will be evicted
-/// - All cached data is stored as `Arc<T>` to reduce cloning costs
 ///
 /// ## Thread Safety
 ///
@@ -51,25 +49,26 @@ const DEFAULT_CACHE_SIZE: usize = 1000;
 /// - Exclusive writers (for create/save/delete operations)
 ///
 /// This approach optimizes for read-heavy workloads while still ensuring data consistency.
+#[derive(Debug)]
 pub struct NostrMlsMemoryStorage {
     /// The underlying storage implementation that conforms to OpenMLS's `StorageProvider`
     openmls_storage: MemoryStorage,
     /// LRU Cache for Group objects, keyed by MLS group ID (`Vec<u8>`)
-    groups_cache: RwLock<LruCache<Vec<u8>, Arc<Group>>>,
+    groups_cache: RwLock<LruCache<Vec<u8>, Group>>,
     /// LRU Cache for Group objects, keyed by Nostr group ID (String)
-    groups_by_nostr_id_cache: RwLock<LruCache<String, Arc<Group>>>,
+    groups_by_nostr_id_cache: RwLock<LruCache<String, Group>>,
     /// LRU Cache for GroupRelay objects, keyed by MLS group ID (`Vec<u8>`)
-    group_relays_cache: RwLock<LruCache<Vec<u8>, Arc<Vec<GroupRelay>>>>,
+    group_relays_cache: RwLock<LruCache<Vec<u8>, Vec<GroupRelay>>>,
     /// LRU Cache for Welcome objects, keyed by Event ID
-    welcomes_cache: RwLock<LruCache<EventId, Arc<Welcome>>>,
+    welcomes_cache: RwLock<LruCache<EventId, Welcome>>,
     /// LRU Cache for ProcessedWelcome objects, keyed by Event ID
-    processed_welcomes_cache: RwLock<LruCache<EventId, Arc<ProcessedWelcome>>>,
+    processed_welcomes_cache: RwLock<LruCache<EventId, ProcessedWelcome>>,
     /// LRU Cache for Message objects, keyed by Event ID
-    messages_cache: RwLock<LruCache<EventId, Arc<Message>>>,
+    messages_cache: RwLock<LruCache<EventId, Message>>,
     /// LRU Cache for Messages by Group ID
-    messages_by_group_cache: RwLock<LruCache<Vec<u8>, Arc<Vec<Message>>>>,
+    messages_by_group_cache: RwLock<LruCache<Vec<u8>, Vec<Message>>>,
     /// LRU Cache for ProcessedMessage objects, keyed by Event ID
-    processed_messages_cache: RwLock<LruCache<EventId, Arc<ProcessedMessage>>>,
+    processed_messages_cache: RwLock<LruCache<EventId, ProcessedMessage>>,
 }
 
 impl NostrMlsMemoryStorage {
@@ -96,21 +95,20 @@ impl NostrMlsMemoryStorage {
     /// # Returns
     ///
     /// A new instance of `NostrMlsMemoryStorage` wrapping the provided storage implementation.
-    pub fn with_cache_size(storage_implementation: MemoryStorage, cache_size: usize) -> Self {
-        // Ensure cache_size is non-zero
-        let size = NonZeroUsize::new(cache_size)
-            .unwrap_or_else(|| NonZeroUsize::new(DEFAULT_CACHE_SIZE).unwrap());
-
+    pub fn with_cache_size(
+        storage_implementation: MemoryStorage,
+        cache_size: NonZeroUsize,
+    ) -> Self {
         NostrMlsMemoryStorage {
             openmls_storage: storage_implementation,
-            groups_cache: RwLock::new(LruCache::new(size)),
-            groups_by_nostr_id_cache: RwLock::new(LruCache::new(size)),
-            group_relays_cache: RwLock::new(LruCache::new(size)),
-            welcomes_cache: RwLock::new(LruCache::new(size)),
-            processed_welcomes_cache: RwLock::new(LruCache::new(size)),
-            messages_cache: RwLock::new(LruCache::new(size)),
-            messages_by_group_cache: RwLock::new(LruCache::new(size)),
-            processed_messages_cache: RwLock::new(LruCache::new(size)),
+            groups_cache: RwLock::new(LruCache::new(cache_size)),
+            groups_by_nostr_id_cache: RwLock::new(LruCache::new(cache_size)),
+            group_relays_cache: RwLock::new(LruCache::new(cache_size)),
+            welcomes_cache: RwLock::new(LruCache::new(cache_size)),
+            processed_welcomes_cache: RwLock::new(LruCache::new(cache_size)),
+            messages_cache: RwLock::new(LruCache::new(cache_size)),
+            messages_by_group_cache: RwLock::new(LruCache::new(cache_size)),
+            processed_messages_cache: RwLock::new(LruCache::new(cache_size)),
         }
     }
 }
@@ -173,7 +171,6 @@ mod tests {
     use nostr_mls_storage::messages::MessageStorage;
     use nostr_mls_storage::welcomes::types::{ProcessedWelcomeState, Welcome, WelcomeState};
     use nostr_mls_storage::welcomes::WelcomeStorage;
-    #[cfg(test)]
     use openmls_memory_storage::MemoryStorage;
 
     use super::*;
@@ -486,7 +483,7 @@ mod tests {
         {
             let mut cache = nostr_storage.messages_by_group_cache.write();
             let messages = vec![message.clone()];
-            cache.put(mls_group_id.clone(), Arc::new(messages));
+            cache.put(mls_group_id.clone(), messages);
         }
 
         // Check that we can retrieve messages for the group
@@ -524,7 +521,7 @@ mod tests {
     #[test]
     fn test_with_custom_cache_size() {
         let storage = MemoryStorage::default();
-        let custom_size = 50;
+        let custom_size = NonZeroUsize::new(50).unwrap();
         let nostr_storage = NostrMlsMemoryStorage::with_cache_size(storage, custom_size);
 
         // Create a test group to verify the cache works

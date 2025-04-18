@@ -1,7 +1,5 @@
 //! Memory-based storage implementation of the NostrMlsStorageProvider trait for Nostr MLS groups
 
-use std::sync::Arc;
-
 use nostr::PublicKey;
 use nostr_mls_storage::groups::error::GroupError;
 use nostr_mls_storage::groups::types::*;
@@ -12,19 +10,16 @@ use crate::NostrMlsMemoryStorage;
 
 impl GroupStorage for NostrMlsMemoryStorage {
     fn save_group(&self, group: Group) -> Result<Group, GroupError> {
-        // Create Arc for the group
-        let group_arc = Arc::new(group.clone());
-
         // Store in the MLS group ID cache
         {
             let mut cache = self.groups_cache.write();
-            cache.put(group_arc.mls_group_id.clone(), Arc::clone(&group_arc));
+            cache.put(group.mls_group_id.clone(), group.clone());
         }
 
         // Store in the Nostr group ID cache
         {
             let mut cache = self.groups_by_nostr_id_cache.write();
-            cache.put(group_arc.nostr_group_id.clone(), Arc::clone(&group_arc));
+            cache.put(group.nostr_group_id.clone(), group.clone());
         }
 
         Ok(group)
@@ -33,15 +28,15 @@ impl GroupStorage for NostrMlsMemoryStorage {
     fn all_groups(&self) -> Result<Vec<Group>, GroupError> {
         let cache = self.groups_cache.read();
         // Convert the values from the cache to a Vec
-        let groups: Vec<Group> = cache.iter().map(|(_, v)| (**v).clone()).collect();
+        let groups: Vec<Group> = cache.iter().map(|(_, v)| v.clone()).collect();
         Ok(groups)
     }
 
     fn find_group_by_mls_group_id(&self, mls_group_id: &[u8]) -> Result<Group, GroupError> {
         let cache = self.groups_cache.read();
-        if let Some(group_arc) = cache.peek(mls_group_id) {
+        if let Some(group) = cache.peek(mls_group_id) {
             // Return a clone of the found group
-            return Ok((**group_arc).clone());
+            return Ok(group.clone());
         }
 
         Err(GroupError::NotFound)
@@ -49,9 +44,9 @@ impl GroupStorage for NostrMlsMemoryStorage {
 
     fn find_group_by_nostr_group_id(&self, nostr_group_id: &str) -> Result<Group, GroupError> {
         let cache = self.groups_by_nostr_id_cache.read();
-        if let Some(group_arc) = cache.peek(nostr_group_id) {
+        if let Some(group) = cache.peek(nostr_group_id) {
             // Return a clone of the found group
-            return Ok((**group_arc).clone());
+            return Ok(group.clone());
         }
 
         Err(GroupError::NotFound)
@@ -62,8 +57,8 @@ impl GroupStorage for NostrMlsMemoryStorage {
         self.find_group_by_mls_group_id(mls_group_id)?;
 
         let cache = self.messages_by_group_cache.read();
-        if let Some(messages_arc) = cache.peek(mls_group_id) {
-            return Ok((**messages_arc).clone());
+        if let Some(messages) = cache.peek(mls_group_id) {
+            return Ok(messages.clone());
         }
 
         // If not in cache but group exists, return empty vector
@@ -85,8 +80,8 @@ impl GroupStorage for NostrMlsMemoryStorage {
         self.find_group_by_mls_group_id(mls_group_id)?;
 
         let cache = self.group_relays_cache.read();
-        if let Some(relays_arc) = cache.peek(mls_group_id) {
-            return Ok((**relays_arc).clone());
+        if let Some(relays) = cache.peek(mls_group_id) {
+            return Ok(relays.clone());
         }
 
         // If not in cache but group exists, return empty vector
@@ -105,8 +100,8 @@ impl GroupStorage for NostrMlsMemoryStorage {
             let mut cache = self.group_relays_cache.write();
             // Get existing relays or create new vector
             let relays = match cache.get(&mls_group_id) {
-                Some(existing_relays_arc) => {
-                    let mut new_relays = (**existing_relays_arc).clone();
+                Some(existing_relays) => {
+                    let mut new_relays = existing_relays.clone();
                     // Add the new relay if it doesn't already exist
                     if !new_relays
                         .iter()
@@ -120,7 +115,7 @@ impl GroupStorage for NostrMlsMemoryStorage {
             };
 
             // Update the cache with the new vector
-            cache.put(mls_group_id, Arc::new(relays));
+            cache.put(mls_group_id, relays);
         }
 
         Ok(group_relay)
