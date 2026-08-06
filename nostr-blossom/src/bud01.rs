@@ -114,12 +114,18 @@ impl IntoEventBuilder for BlossomAuthorization {
             }
             BlossomAuthorizationScope::ServerDomains(domains) => {
                 for domain in domains {
-                    tags.push(Tag::parse(["server", domain.as_str()]).expect("BUG: invalid tag"));
+                    tags.push(
+                        Tag::parse(["server", domain.to_ascii_lowercase().as_str()])
+                            .expect("BUG: invalid tag"),
+                    );
                 }
             }
             BlossomAuthorizationScope::ServerDomainsAndBlobSha256Hashes { domains, hashes } => {
                 for domain in domains {
-                    tags.push(Tag::parse(["server", domain.as_str()]).expect("BUG: invalid tag"));
+                    tags.push(
+                        Tag::parse(["server", domain.to_ascii_lowercase().as_str()])
+                            .expect("BUG: invalid tag"),
+                    );
                 }
                 for hash in hashes {
                     tags.push(
