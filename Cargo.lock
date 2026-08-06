@@ -1784,6 +1784,7 @@ dependencies = [
  "opaquerr",
  "reqwest",
  "serde",
+ "serde_json",
  "tokio",
 ]
 
