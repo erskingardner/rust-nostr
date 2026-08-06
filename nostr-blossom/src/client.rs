@@ -61,6 +61,22 @@ impl BlossomClient {
     where
         T: AsyncGetPublicKey + AsyncSignEvent,
     {
+        self.upload_blob_with_payment(data, content_type, authorization_options, signer, None)
+            .await
+    }
+
+    /// Uploads a blob with an optional BUD-07 payment proof.
+    pub async fn upload_blob_with_payment<T>(
+        &self,
+        data: Vec<u8>,
+        content_type: Option<String>,
+        authorization_options: Option<BlossomAuthorizationOptions>,
+        signer: Option<&T>,
+        payment: Option<&BlossomPaymentProof>,
+    ) -> Result<BlobDescriptor, Error>
+    where
+        T: AsyncGetPublicKey + AsyncSignEvent,
+    {
         let url: Url = self.base_url.join("upload")?;
 
         let hash: Sha256Hash = Sha256Hash::hash(&data);
@@ -76,6 +92,7 @@ impl BlossomClient {
         if let Some(ct) = content_type {
             headers.insert(CONTENT_TYPE, HeaderValue::from_str(&ct)?);
         }
+        Self::add_payment_header(&mut headers, payment)?;
 
         if let Some(signer) = signer {
             let default_auth = self.default_auth(
@@ -197,6 +214,22 @@ impl BlossomClient {
     where
         T: AsyncGetPublicKey + AsyncSignEvent,
     {
+        self.get_blob_with_payment(sha256, range, authorization_options, signer, None)
+            .await
+    }
+
+    /// Retrieves a blob with an optional BUD-07 payment proof.
+    pub async fn get_blob_with_payment<T>(
+        &self,
+        sha256: Sha256Hash,
+        range: Option<String>,
+        authorization_options: Option<BlossomAuthorizationOptions>,
+        signer: Option<&T>,
+        payment: Option<&BlossomPaymentProof>,
+    ) -> Result<Vec<u8>, Error>
+    where
+        T: AsyncGetPublicKey + AsyncSignEvent,
+    {
         let url: Url = self.base_url.join(sha256.to_string().as_str())?;
 
         let mut request = self.client.get(url);
@@ -206,6 +239,7 @@ impl BlossomClient {
         if let Some(range_value) = range {
             headers.insert(RANGE, HeaderValue::from_str(&range_value)?);
         }
+        Self::add_payment_header(&mut headers, payment)?;
 
         if let Some(signer) = signer {
             let default_auth = self.default_auth(
@@ -334,6 +368,21 @@ impl BlossomClient {
     where
         T: AsyncGetPublicKey + AsyncSignEvent,
     {
+        self.delete_blob_with_payment(sha256, authorization_options, signer, None)
+            .await
+    }
+
+    /// Deletes a blob with an optional BUD-07 payment proof.
+    pub async fn delete_blob_with_payment<T>(
+        &self,
+        sha256: Sha256Hash,
+        authorization_options: Option<BlossomAuthorizationOptions>,
+        signer: &T,
+        payment: Option<&BlossomPaymentProof>,
+    ) -> Result<(), Error>
+    where
+        T: AsyncGetPublicKey + AsyncSignEvent,
+    {
         let url: Url = self.base_url.join(sha256.to_string().as_str())?;
 
         let mut headers = HeaderMap::new();
@@ -349,6 +398,7 @@ impl BlossomClient {
 
         let auth_header = Self::build_auth_header(signer, final_auth).await?;
         headers.insert(AUTHORIZATION, auth_header);
+        Self::add_payment_header(&mut headers, payment)?;
 
         let response: Response = self.client.delete(url).headers(headers).send().await?;
 
