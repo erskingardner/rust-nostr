@@ -7,7 +7,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bitcoin_hashes::sha256::Hash as Sha256Hash;
 use nostr::prelude::*;
 use nostr::types::Url;
-use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue, RANGE};
+use reqwest::header::{
+    AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, LOCATION, RANGE,
+};
 #[cfg(not(target_arch = "wasm32"))]
 use reqwest::redirect::Policy;
 use reqwest::{Response, StatusCode};
@@ -27,7 +29,10 @@ pub struct BlossomClient {
 
 impl BlossomClient {
     /// Creates a new `BlossomClient` with the given base URL.
-    pub fn new(base_url: Url) -> Self {
+    pub fn new(mut base_url: Url) -> Self {
+        base_url.set_path("/");
+        base_url.set_query(None);
+        base_url.set_fragment(None);
         Self {
             base_url,
             client: Self::build_client().unwrap(),
@@ -38,7 +43,7 @@ impl BlossomClient {
     fn build_client() -> reqwest::Result<reqwest::Client> {
         let builder = reqwest::Client::builder();
         #[cfg(not(target_arch = "wasm32"))]
-        let builder = builder.redirect(Policy::limited(10));
+        let builder = builder.redirect(Policy::none());
         builder.build()
     }
 
@@ -60,8 +65,12 @@ impl BlossomClient {
         let hash: Sha256Hash = Sha256Hash::hash(&data);
         let file_hashes: Vec<Sha256Hash> = vec![hash];
 
+        let data_len = data.len();
         let mut request = self.client.put(url).body(data);
         let mut headers = HeaderMap::new();
+
+        headers.insert(CONTENT_LENGTH, HeaderValue::from(data_len));
+        headers.insert("X-SHA-256", HeaderValue::from_str(&hash.to_string())?);
 
         if let Some(ct) = content_type {
             headers.insert(CONTENT_TYPE, HeaderValue::from_str(&ct)?);
@@ -85,7 +94,7 @@ impl BlossomClient {
         let response: Response = request.send().await?;
 
         match response.status() {
-            StatusCode::OK => {
+            StatusCode::OK | StatusCode::CREATED => {
                 let descriptor: BlobDescriptor = response.json().await?;
                 Ok(descriptor)
             }
@@ -107,7 +116,7 @@ impl BlossomClient {
     where
         T: AsyncGetPublicKey + AsyncSignEvent,
     {
-        let mut url: Url = self.base_url.join("list")?.join(&pubkey.to_hex())?;
+        let mut url: Url = self.base_url.join(&format!("list/{}", pubkey.to_hex()))?;
 
         if let Some(since) = since {
             url.query_pairs_mut()
@@ -166,6 +175,7 @@ impl BlossomClient {
         let mut request = self.client.get(url);
         let mut headers = HeaderMap::new();
 
+        let verify_hash = range.is_none();
         if let Some(range_value) = range {
             headers.insert(RANGE, HeaderValue::from_str(&range_value)?);
         }
@@ -183,32 +193,61 @@ impl BlossomClient {
             headers.insert(AUTHORIZATION, auth_header);
         }
 
-        request = request.headers(headers);
+        request = request.headers(headers.clone());
 
-        let response: Response = request.send().await?;
+        let mut response: Response = request.send().await?;
+
+        #[cfg(not(target_arch = "wasm32"))]
+        for _ in 0..10 {
+            if !response.status().is_redirection() {
+                break;
+            }
+
+            let location = response.headers().get(LOCATION).ok_or_else(|| {
+                Error::with_static_message(
+                    ErrorKind::Invalid,
+                    "Redirect response missing 'Location' header",
+                )
+            })?;
+            let next_url = response.url().join(location.to_str()?)?;
+            if !next_url.as_str().contains(&sha256.to_string()) {
+                return Err(Error::with_static_message(
+                    ErrorKind::Invalid,
+                    "Redirect URL does not contain SHA256",
+                ));
+            }
+
+            let same_origin = next_url.origin() == response.url().origin();
+            let mut next_headers = headers.clone();
+            if !same_origin {
+                next_headers.remove(AUTHORIZATION);
+            }
+            response = self
+                .client
+                .get(next_url)
+                .headers(next_headers)
+                .send()
+                .await?;
+        }
 
         if response.status().is_redirection() {
-            match response.headers().get("Location") {
-                Some(location) => {
-                    let location_str: &str = location.to_str()?;
-                    if !location_str.contains(&sha256.to_string()) {
-                        return Err(Error::with_static_message(
-                            ErrorKind::Invalid,
-                            "Redirect URL does not contain SHA256",
-                        ));
-                    }
-                }
-                None => {
-                    return Err(Error::with_static_message(
-                        ErrorKind::Invalid,
-                        "Redirect response missing 'Location' header",
-                    ));
-                }
-            }
+            return Err(Error::with_static_message(
+                ErrorKind::Invalid,
+                "Too many blob redirects",
+            ));
         }
 
         match response.status() {
-            StatusCode::OK | StatusCode::PARTIAL_CONTENT => Ok(response.bytes().await?.to_vec()),
+            StatusCode::OK | StatusCode::PARTIAL_CONTENT => {
+                let data = response.bytes().await?.to_vec();
+                if verify_hash && Sha256Hash::hash(&data) != sha256 {
+                    return Err(Error::with_static_message(
+                        ErrorKind::Invalid,
+                        "Downloaded blob does not match requested SHA256",
+                    ));
+                }
+                Ok(data)
+            }
             _ => Err(Error::response("Failed to get blob", response)),
         }
     }
