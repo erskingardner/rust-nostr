@@ -4,7 +4,6 @@ use std::fmt;
 
 use bitcoin_hashes::sha256::Hash as Sha256Hash;
 use nostr::event::{EventBuilder, IntoEventBuilder, Kind, Tag};
-use nostr::nips::nipb7::NipB7Tag;
 use nostr::types::{Timestamp, Url};
 
 /// Represents the authorization data for accessing a Blossom server.
@@ -48,6 +47,15 @@ pub enum BlossomAuthorizationScope {
     BlobSha256Hashes(Vec<Sha256Hash>),
     /// Authorizes access to the given server URL.
     ServerUrl(Url),
+    /// Authorizes access to the given server domains.
+    ServerDomains(Vec<String>),
+    /// Authorizes access to the given hashes on the given server domains.
+    ServerDomainsAndBlobSha256Hashes {
+        /// Lowercase server domain names.
+        domains: Vec<String>,
+        /// SHA256 hashes of the authorized blobs.
+        hashes: Vec<Sha256Hash>,
+    },
 }
 
 /// Represents the possible actions that can be authorized by a Blossom authorization event.
@@ -61,6 +69,8 @@ pub enum BlossomAuthorizationVerb {
     List,
     /// Authorizes the deletion of a blob.
     Delete,
+    /// Authorizes media processing.
+    Media,
 }
 
 impl fmt::Display for BlossomAuthorizationVerb {
@@ -77,6 +87,7 @@ impl BlossomAuthorizationVerb {
             Self::Upload => "upload",
             Self::List => "list",
             Self::Delete => "delete",
+            Self::Media => "media",
         }
     }
 }
@@ -97,7 +108,24 @@ impl IntoEventBuilder for BlossomAuthorization {
                 }
             }
             BlossomAuthorizationScope::ServerUrl(url) => {
-                tags.push(NipB7Tag::Server(url).into());
+                if let Some(domain) = url.host_str() {
+                    tags.push(Tag::parse(["server", domain]).expect("BUG: invalid tag"));
+                }
+            }
+            BlossomAuthorizationScope::ServerDomains(domains) => {
+                for domain in domains {
+                    tags.push(Tag::parse(["server", domain.as_str()]).expect("BUG: invalid tag"));
+                }
+            }
+            BlossomAuthorizationScope::ServerDomainsAndBlobSha256Hashes { domains, hashes } => {
+                for domain in domains {
+                    tags.push(Tag::parse(["server", domain.as_str()]).expect("BUG: invalid tag"));
+                }
+                for hash in hashes {
+                    tags.push(
+                        Tag::parse(["x".to_string(), hash.to_string()]).expect("BUG: invalid tag"),
+                    );
+                }
             }
         }
 
@@ -107,5 +135,35 @@ impl IntoEventBuilder for BlossomAuthorization {
         tags.push(Tag::hashtag(self.action.to_string()));
 
         EventBuilder::new(Kind::BlossomAuth, self.content).tags(tags)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nostr::event::IntoEventBuilder;
+
+    use super::*;
+
+    #[test]
+    fn authorization_uses_domain_scopes_and_media_verb() {
+        let authorization = BlossomAuthorization::new(
+            "Optimize media".to_owned(),
+            Timestamp::from_secs(1_800_000_000),
+            BlossomAuthorizationVerb::Media,
+            BlossomAuthorizationScope::ServerUrl(
+                Url::parse("https://CDN.EXAMPLE.COM/some/path").unwrap(),
+            ),
+        );
+
+        let builder = authorization.into_event_builder();
+        let tags: Vec<Vec<String>> = builder.tags.into_iter().map(|tag| tag.to_vec()).collect();
+
+        assert!(tags.contains(&vec!["server".to_owned(), "cdn.example.com".to_owned()]));
+        assert!(tags.contains(&vec!["t".to_owned(), "media".to_owned()]));
+        assert!(
+            !tags
+                .iter()
+                .any(|tag| tag.get(1).is_some_and(|value| value.contains("://")))
+        );
     }
 }

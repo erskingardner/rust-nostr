@@ -3,7 +3,7 @@
 use std::time::Duration;
 
 use base64::Engine;
-use base64::engine::general_purpose;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bitcoin_hashes::sha256::Hash as Sha256Hash;
 use nostr::prelude::*;
 use nostr::types::Url;
@@ -336,7 +336,7 @@ impl BlossomClient {
         T: AsyncGetPublicKey + AsyncSignEvent,
     {
         let auth_event: Event = authz.finalize_async(signer).await?;
-        let encoded_auth: String = general_purpose::STANDARD.encode(auth_event.as_json());
+        let encoded_auth: String = URL_SAFE_NO_PAD.encode(auth_event.as_json());
         let value: String = format!("Nostr {}", encoded_auth);
         Ok(HeaderValue::try_from(value)?)
     }
