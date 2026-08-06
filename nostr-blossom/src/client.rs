@@ -17,6 +17,7 @@ use serde::Serialize;
 
 use crate::bud01::{BlossomAuthorization, BlossomAuthorizationScope, BlossomAuthorizationVerb};
 use crate::bud02::BlobDescriptor;
+use crate::bud10::BlossomUri;
 use crate::error::{Error, ErrorKind};
 
 /// A client for interacting with a Blossom server
@@ -198,6 +199,54 @@ impl BlossomClient {
                 Ok(descriptors)
             }
             _ => Err(Error::response("Failed to list blobs", response)),
+        }
+    }
+
+    /// Lists one cursor-paginated page of blobs according to BUD-12.
+    pub async fn list_blobs_page<T>(
+        &self,
+        pubkey: &PublicKey,
+        options: BlossomListOptions,
+        authorization_options: Option<BlossomAuthorizationOptions>,
+        signer: Option<&T>,
+        payment: Option<&BlossomPaymentProof>,
+    ) -> Result<Vec<BlobDescriptor>, Error>
+    where
+        T: AsyncGetPublicKey + AsyncSignEvent,
+    {
+        let mut url = self.base_url.join(&format!("list/{}", pubkey.to_hex()))?;
+        {
+            let mut query = url.query_pairs_mut();
+            if let Some(cursor) = options.cursor {
+                query.append_pair("cursor", &cursor.to_string());
+            }
+            if let Some(limit) = options.limit {
+                query.append_pair("limit", &limit.to_string());
+            }
+            if let Some(since) = options.since {
+                query.append_pair("since", &since.to_string());
+            }
+            if let Some(until) = options.until {
+                query.append_pair("until", &until.to_string());
+            }
+        }
+
+        let mut headers = HeaderMap::new();
+        Self::add_payment_header(&mut headers, payment)?;
+        self.add_authorization_header(
+            &mut headers,
+            BlossomAuthorizationVerb::List,
+            "Blossom list authorization",
+            BlossomAuthorizationScope::ServerUrl(self.base_url.clone()),
+            authorization_options,
+            signer,
+        )
+        .await?;
+        let response = self.client.get(url).headers(headers).send().await?;
+        if response.status() == StatusCode::OK {
+            Ok(response.json().await?)
+        } else {
+            Err(Error::response("Failed to list blobs", response))
         }
     }
 
@@ -523,6 +572,54 @@ impl BlossomClient {
         Self::descriptor_response("Failed to optimize media", response).await
     }
 
+    /// Submits a signed NIP-56 blob report according to BUD-09.
+    pub async fn report_blobs(&self, report: &Event) -> Result<(), Error> {
+        let has_blob_hash = report.tags.iter().any(|tag| {
+            let values = tag.as_slice();
+            values.first().map(String::as_str) == Some("x") && values.get(1).is_some()
+        });
+        if report.kind != Kind::Reporting || !has_blob_hash {
+            return Err(Error::with_static_message(
+                ErrorKind::Invalid,
+                "Blob reports must be kind 1984 and contain an x tag",
+            ));
+        }
+
+        let response = self
+            .client
+            .put(self.base_url.join("report")?)
+            .header(CONTENT_TYPE, "application/json")
+            .body(report.as_json())
+            .send()
+            .await?;
+        if response.status().is_success() {
+            Ok(())
+        } else {
+            Err(Error::response("Failed to report blob", response))
+        }
+    }
+
+    /// Resolves a BUD-10 URI using ordered URI, author-list, and fallback servers.
+    pub async fn resolve_uri(
+        &self,
+        uri: &BlossomUri,
+        author_servers: impl IntoIterator<Item = Url>,
+        fallback_servers: impl IntoIterator<Item = Url>,
+    ) -> Result<Vec<u8>, Error> {
+        for candidate in uri.candidate_urls(author_servers, fallback_servers) {
+            let client = Self::new(candidate);
+            if let Ok(data) = client.get_blob(uri.sha256, None, None, None::<&Keys>).await {
+                if uri.size.is_none_or(|size| size == data.len() as u64) {
+                    return Ok(data);
+                }
+            }
+        }
+        Err(Error::with_static_message(
+            ErrorKind::Invalid,
+            "Blob could not be resolved from any server",
+        ))
+    }
+
     async fn preflight<T>(
         &self,
         endpoint: &str,
@@ -570,7 +667,13 @@ impl BlossomClient {
                             request: value.to_str().ok()?.to_owned(),
                         })
                     })
-                    .collect();
+                    .collect::<Vec<_>>();
+                if requests.is_empty() || requests.iter().any(|request| !request.is_valid()) {
+                    return Err(Error::with_static_message(
+                        ErrorKind::Malformed,
+                        "Invalid BUD-07 payment challenge",
+                    ));
+                }
                 Ok(BlossomPreflight::PaymentRequired(requests))
             }
             StatusCode::NOT_FOUND => Ok(BlossomPreflight::Unsupported),
@@ -608,6 +711,12 @@ impl BlossomClient {
         payment: Option<&BlossomPaymentProof>,
     ) -> Result<(), Error> {
         if let Some(payment) = payment {
+            if !payment.is_valid() {
+                return Err(Error::with_static_message(
+                    ErrorKind::Malformed,
+                    "Invalid BUD-07 payment proof",
+                ));
+            }
             let name = reqwest::header::HeaderName::from_bytes(
                 format!("X-{}", payment.method).as_bytes(),
             )?;
@@ -653,8 +762,8 @@ impl BlossomClient {
         BlossomAuthorization {
             content: options.content.unwrap_or(default.content.clone()),
             expiration: options.expiration.unwrap_or(default.expiration),
-            action: options.action.unwrap_or(default.action),
-            scope: options.scope.unwrap_or(default.scope.clone()),
+            action: default.action,
+            scope: default.scope.clone(),
         }
     }
 
@@ -683,9 +792,24 @@ pub struct BlossomAuthorizationOptions {
     /// A UNIX timestamp (in seconds) indicating when the authorization should be expired
     pub expiration: Option<Timestamp>,
     /// The type of action authorized by the user
+    #[deprecated = "endpoint actions are fixed by BUD-11 and this field is ignored"]
     pub action: Option<BlossomAuthorizationVerb>,
     /// The scope of the authorization
+    #[deprecated = "endpoint hash requirements are fixed by BUD-11 and this field is ignored"]
     pub scope: Option<BlossomAuthorizationScope>,
+}
+
+/// BUD-12 list filters and cursor pagination.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BlossomListOptions {
+    /// Hash of the last blob from the previous page.
+    pub cursor: Option<Sha256Hash>,
+    /// Maximum number of descriptors to return.
+    pub limit: Option<u32>,
+    /// Deprecated lower upload-time bound.
+    pub since: Option<Timestamp>,
+    /// Deprecated upper upload-time bound.
+    pub until: Option<Timestamp>,
 }
 
 /// Result of a BUD-05 or BUD-06 preflight request.
@@ -708,6 +832,17 @@ pub struct BlossomPaymentRequest {
     pub request: String,
 }
 
+impl BlossomPaymentRequest {
+    /// Checks the payment method's required transport encoding.
+    pub fn is_valid(&self) -> bool {
+        match self.method.as_str() {
+            "cashu" => self.request.starts_with("creqA"),
+            "lightning" => self.request.starts_with("ln") && self.request.is_ascii(),
+            _ => !self.method.is_empty() && !self.request.is_empty(),
+        }
+    }
+}
+
 /// A BUD-07 payment proof to attach to a request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlossomPaymentProof {
@@ -715,6 +850,19 @@ pub struct BlossomPaymentProof {
     pub method: String,
     /// Encoded proof defined by the selected payment method.
     pub proof: String,
+}
+
+impl BlossomPaymentProof {
+    /// Checks the payment method's required proof encoding.
+    pub fn is_valid(&self) -> bool {
+        match self.method.as_str() {
+            "cashu" => self.proof.starts_with("cashuB"),
+            "lightning" => {
+                self.proof.len() == 64 && self.proof.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }
+            _ => !self.method.is_empty() && !self.proof.is_empty(),
+        }
+    }
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -845,5 +993,76 @@ mod tests {
         assert!(request.contains(&format!("x-sha-256: {hash}")));
         assert!(request.contains("x-content-length: 4"));
         assert!(request.contains("x-content-type: application/octet-stream"));
+    }
+
+    #[tokio::test]
+    async fn list_page_sends_cursor_and_limit() {
+        let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n[]";
+        let (base_url, request) = mock_server(response).await;
+        let keys = Keys::generate();
+        let cursor = Sha256Hash::hash(b"cursor");
+
+        let page = BlossomClient::new(base_url)
+            .list_blobs_page(
+                &keys.public_key(),
+                BlossomListOptions {
+                    cursor: Some(cursor),
+                    limit: Some(25),
+                    ..Default::default()
+                },
+                None,
+                None::<&Keys>,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(page.is_empty());
+        let request = request.await.unwrap();
+        assert!(request.starts_with(&format!(
+            "GET /list/{}?cursor={cursor}&limit=25 HTTP/1.1",
+            keys.public_key().to_hex()
+        )));
+    }
+
+    #[tokio::test]
+    async fn rejects_invalid_blob_report_before_request() {
+        let event = EventBuilder::new(Kind::TextNote, "not a report")
+            .finalize(&Keys::generate())
+            .unwrap();
+        let client = BlossomClient::new(Url::parse("http://127.0.0.1:1").unwrap());
+
+        let error = client.report_blobs(&event).await.unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::Invalid);
+    }
+
+    #[tokio::test]
+    async fn uri_resolution_verifies_hash_and_size() {
+        let data = "blossom";
+        let hash = Sha256Hash::hash(data.as_bytes());
+        let response = Box::leak(
+            format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{data}",
+                data.len()
+            )
+            .into_boxed_str(),
+        );
+        let (base_url, request) = mock_server(response).await;
+        let mut uri = BlossomUri::new(hash, "bin");
+        uri.size = Some(data.len() as u64);
+
+        let resolved = BlossomClient::new(base_url.clone())
+            .resolve_uri(&uri, [base_url], [])
+            .await
+            .unwrap();
+
+        assert_eq!(resolved, data.as_bytes());
+        assert!(
+            request
+                .await
+                .unwrap()
+                .starts_with(&format!("GET /{hash} HTTP/1.1"))
+        );
     }
 }
