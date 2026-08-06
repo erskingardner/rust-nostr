@@ -17,6 +17,7 @@
 pub mod bud01;
 pub mod bud02;
 pub mod bud03;
+pub mod bud10;
 pub mod client;
 pub mod error;
 pub mod prelude;
