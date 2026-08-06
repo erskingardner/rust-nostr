@@ -27,6 +27,29 @@
 
 -->
 
+## Unreleased
+
+### Breaking changes
+
+- Require the BUD-02 blob descriptor `type` field and represent blob sizes as `u64`.
+- Prevent authorization options from overriding endpoint-mandated BUD-11 actions and hash scopes.
+
+### Added
+
+- Add BUD-03 server-list and URL hash discovery helpers.
+- Add BUD-04 mirroring and BUD-05 media optimization with BUD-06 preflights.
+- Add generic BUD-07 payment challenge and proof support.
+- Deserialize BUD-08 NIP-94 metadata tags from blob descriptors.
+- Add BUD-09 blob reporting and BUD-10 Blossom URI parsing, formatting, and resolution.
+- Add BUD-12 cursor-based list pagination.
+
+### Fixed
+
+- Encode BUD-11 authorization as unpadded Base64url and scope tokens to domain names.
+- Accept `201 Created` uploads and send `Content-Length` and `X-SHA-256` headers.
+- Build all endpoints at the server origin root and preserve `/list/<pubkey>` paths.
+- Validate redirect targets and downloaded blob hashes.
+
 ## v0.45.0 - 2026/08/05
 
 ### Breaking changes
