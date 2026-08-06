@@ -31,6 +31,7 @@ opaquerr::define_error! {
         nostr::error::Error => ErrorKind::Protocol,
         reqwest::Error => ErrorKind::Http,
         header::InvalidHeaderValue => ErrorKind::Http,
+        header::InvalidHeaderName => ErrorKind::Http,
         url::ParseError => ErrorKind::Malformed,
         header::ToStrError => ErrorKind::Invalid,
     }

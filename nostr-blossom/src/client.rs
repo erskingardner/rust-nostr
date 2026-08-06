@@ -13,6 +13,7 @@ use reqwest::header::{
 #[cfg(not(target_arch = "wasm32"))]
 use reqwest::redirect::Policy;
 use reqwest::{Response, StatusCode};
+use serde::Serialize;
 
 use crate::bud01::{BlossomAuthorization, BlossomAuthorizationScope, BlossomAuthorizationVerb};
 use crate::bud02::BlobDescriptor;
@@ -100,6 +101,32 @@ impl BlossomClient {
             }
             _ => Err(Error::response("Failed to upload blob", response)),
         }
+    }
+
+    /// Checks whether the server would accept a blob upload without sending its body.
+    ///
+    /// This implements the optional BUD-06 `HEAD /upload` preflight endpoint.
+    pub async fn upload_requirements<T>(
+        &self,
+        sha256: Sha256Hash,
+        size: u64,
+        content_type: Option<&str>,
+        authorization_options: Option<BlossomAuthorizationOptions>,
+        signer: Option<&T>,
+    ) -> Result<BlossomPreflight, Error>
+    where
+        T: AsyncGetPublicKey + AsyncSignEvent,
+    {
+        self.preflight(
+            "upload",
+            sha256,
+            size,
+            content_type,
+            BlossomAuthorizationVerb::Upload,
+            authorization_options,
+            signer,
+        )
+        .await
     }
 
     /// Lists blobs uploaded by a specific pubkey.
@@ -332,6 +359,223 @@ impl BlossomClient {
         }
     }
 
+    /// Mirrors an existing blob from its public URL.
+    ///
+    /// This implements BUD-04. The authorization uses the `upload` verb and the
+    /// mirrored blob's hash as required by BUD-11.
+    pub async fn mirror_blob<T>(
+        &self,
+        blob: &BlobDescriptor,
+        authorization_options: Option<BlossomAuthorizationOptions>,
+        signer: Option<&T>,
+        payment: Option<&BlossomPaymentProof>,
+    ) -> Result<BlobDescriptor, Error>
+    where
+        T: AsyncGetPublicKey + AsyncSignEvent,
+    {
+        #[derive(Serialize)]
+        struct MirrorRequest<'a> {
+            url: &'a Url,
+        }
+
+        let url = self.base_url.join("mirror")?;
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(
+            "X-SHA-256",
+            HeaderValue::from_str(&blob.sha256.to_string())?,
+        );
+        headers.insert("X-Content-Length", HeaderValue::from(blob.size));
+        headers.insert("X-Content-Type", HeaderValue::from_str(&blob.mime_type)?);
+        Self::add_payment_header(&mut headers, payment)?;
+        self.add_authorization_header(
+            &mut headers,
+            BlossomAuthorizationVerb::Upload,
+            "Blossom mirror authorization",
+            BlossomAuthorizationScope::BlobSha256Hashes(vec![blob.sha256]),
+            authorization_options,
+            signer,
+        )
+        .await?;
+
+        let response = self
+            .client
+            .put(url)
+            .headers(headers)
+            .json(&MirrorRequest { url: &blob.url })
+            .send()
+            .await?;
+        Self::descriptor_response("Failed to mirror blob", response).await
+    }
+
+    /// Checks whether the server would accept media for optimization.
+    pub async fn media_requirements<T>(
+        &self,
+        sha256: Sha256Hash,
+        size: u64,
+        content_type: Option<&str>,
+        authorization_options: Option<BlossomAuthorizationOptions>,
+        signer: Option<&T>,
+    ) -> Result<BlossomPreflight, Error>
+    where
+        T: AsyncGetPublicKey + AsyncSignEvent,
+    {
+        self.preflight(
+            "media",
+            sha256,
+            size,
+            content_type,
+            BlossomAuthorizationVerb::Media,
+            authorization_options,
+            signer,
+        )
+        .await
+    }
+
+    /// Uploads media for server-selected optimization according to BUD-05.
+    pub async fn upload_media<T>(
+        &self,
+        data: Vec<u8>,
+        content_type: Option<String>,
+        authorization_options: Option<BlossomAuthorizationOptions>,
+        signer: Option<&T>,
+        payment: Option<&BlossomPaymentProof>,
+    ) -> Result<BlobDescriptor, Error>
+    where
+        T: AsyncGetPublicKey + AsyncSignEvent,
+    {
+        let url = self.base_url.join("media")?;
+        let sha256 = Sha256Hash::hash(&data);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_LENGTH, HeaderValue::from(data.len()));
+        headers.insert("X-SHA-256", HeaderValue::from_str(&sha256.to_string())?);
+        if let Some(content_type) = content_type {
+            headers.insert(CONTENT_TYPE, HeaderValue::from_str(&content_type)?);
+        }
+        Self::add_payment_header(&mut headers, payment)?;
+        self.add_authorization_header(
+            &mut headers,
+            BlossomAuthorizationVerb::Media,
+            "Blossom media authorization",
+            BlossomAuthorizationScope::BlobSha256Hashes(vec![sha256]),
+            authorization_options,
+            signer,
+        )
+        .await?;
+
+        let response = self
+            .client
+            .put(url)
+            .headers(headers)
+            .body(data)
+            .send()
+            .await?;
+        Self::descriptor_response("Failed to optimize media", response).await
+    }
+
+    async fn preflight<T>(
+        &self,
+        endpoint: &str,
+        sha256: Sha256Hash,
+        size: u64,
+        content_type: Option<&str>,
+        verb: BlossomAuthorizationVerb,
+        authorization_options: Option<BlossomAuthorizationOptions>,
+        signer: Option<&T>,
+    ) -> Result<BlossomPreflight, Error>
+    where
+        T: AsyncGetPublicKey + AsyncSignEvent,
+    {
+        let url = self.base_url.join(endpoint)?;
+        let mut headers = HeaderMap::new();
+        headers.insert("X-SHA-256", HeaderValue::from_str(&sha256.to_string())?);
+        headers.insert("X-Content-Length", HeaderValue::from(size));
+        if let Some(content_type) = content_type {
+            headers.insert("X-Content-Type", HeaderValue::from_str(content_type)?);
+        }
+        self.add_authorization_header(
+            &mut headers,
+            verb,
+            "Blossom upload preflight authorization",
+            BlossomAuthorizationScope::BlobSha256Hashes(vec![sha256]),
+            authorization_options,
+            signer,
+        )
+        .await?;
+
+        let response = self.client.head(url).headers(headers).send().await?;
+        match response.status() {
+            StatusCode::OK => Ok(BlossomPreflight::Accepted),
+            StatusCode::PAYMENT_REQUIRED => {
+                let requests = response
+                    .headers()
+                    .iter()
+                    .filter_map(|(name, value)| {
+                        let method = name.as_str().strip_prefix("x-")?;
+                        if method == "reason" {
+                            return None;
+                        }
+                        Some(BlossomPaymentRequest {
+                            method: method.to_owned(),
+                            request: value.to_str().ok()?.to_owned(),
+                        })
+                    })
+                    .collect();
+                Ok(BlossomPreflight::PaymentRequired(requests))
+            }
+            StatusCode::NOT_FOUND => Ok(BlossomPreflight::Unsupported),
+            _ => Err(Error::response("Upload preflight failed", response)),
+        }
+    }
+
+    async fn add_authorization_header<T>(
+        &self,
+        headers: &mut HeaderMap,
+        verb: BlossomAuthorizationVerb,
+        content: &'static str,
+        scope: BlossomAuthorizationScope,
+        authorization_options: Option<BlossomAuthorizationOptions>,
+        signer: Option<&T>,
+    ) -> Result<(), Error>
+    where
+        T: AsyncGetPublicKey + AsyncSignEvent,
+    {
+        if let Some(signer) = signer {
+            let default_auth = self.default_auth(verb, content, scope);
+            let authorization = authorization_options
+                .map(|options| Self::update_authorization_fixture(&default_auth, options))
+                .unwrap_or(default_auth);
+            headers.insert(
+                AUTHORIZATION,
+                Self::build_auth_header(signer, authorization).await?,
+            );
+        }
+        Ok(())
+    }
+
+    fn add_payment_header(
+        headers: &mut HeaderMap,
+        payment: Option<&BlossomPaymentProof>,
+    ) -> Result<(), Error> {
+        if let Some(payment) = payment {
+            let name = reqwest::header::HeaderName::from_bytes(
+                format!("X-{}", payment.method).as_bytes(),
+            )?;
+            headers.insert(name, HeaderValue::from_str(&payment.proof)?);
+        }
+        Ok(())
+    }
+
+    async fn descriptor_response(
+        error_message: &'static str,
+        response: Response,
+    ) -> Result<BlobDescriptor, Error> {
+        match response.status() {
+            StatusCode::OK | StatusCode::CREATED => Ok(response.json().await?),
+            _ => Err(Error::response(error_message, response)),
+        }
+    }
+
     /// Returns a default BlossomAuthorization object based on the parameters provided.
     fn default_auth<T>(
         &self,
@@ -392,4 +636,164 @@ pub struct BlossomAuthorizationOptions {
     pub action: Option<BlossomAuthorizationVerb>,
     /// The scope of the authorization
     pub scope: Option<BlossomAuthorizationScope>,
+}
+
+/// Result of a BUD-05 or BUD-06 preflight request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BlossomPreflight {
+    /// The server indicates that the subsequent upload may proceed.
+    Accepted,
+    /// The server does not implement the optional preflight endpoint.
+    Unsupported,
+    /// The server requires one of the advertised payment methods.
+    PaymentRequired(Vec<BlossomPaymentRequest>),
+}
+
+/// A BUD-07 payment request advertised by a server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlossomPaymentRequest {
+    /// Payment method suffix from the `X-{method}` header.
+    pub method: String,
+    /// Encoded payment request supplied by the server.
+    pub request: String,
+}
+
+/// A BUD-07 payment proof to attach to a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlossomPaymentProof {
+    /// Payment method suffix, such as `cashu` or `lightning`.
+    pub method: String,
+    /// Encoded proof defined by the selected payment method.
+    pub proof: String,
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+    use tokio::task::JoinHandle;
+    use tokio::time::{Duration, timeout};
+
+    use super::*;
+
+    async fn mock_server(response: &'static str) -> (Url, JoinHandle<String>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = timeout(Duration::from_secs(2), listener.accept())
+                .await
+                .expect("request deadline elapsed")
+                .unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 4096];
+            loop {
+                let read = timeout(Duration::from_secs(2), stream.read(&mut buffer))
+                    .await
+                    .expect("read deadline elapsed")
+                    .unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+                if let Some(headers_end) =
+                    request.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let headers = String::from_utf8_lossy(&request[..headers_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                        .unwrap_or(0);
+                    if request.len() >= headers_end + 4 + content_length {
+                        break;
+                    }
+                }
+            }
+            stream.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        (
+            Url::parse(&format!("http://{address}/ignored/path")).unwrap(),
+            handle,
+        )
+    }
+
+    #[tokio::test]
+    async fn mirror_uses_root_endpoint_and_metadata_headers() {
+        let hash = Sha256Hash::hash(b"blob");
+        let body = format!(
+            r#"{{"url":"https://cdn.example/{hash}.bin","sha256":"{hash}","size":4,"type":"application/octet-stream","uploaded":1}}"#
+        );
+        let response = Box::leak(
+            format!(
+                "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            )
+            .into_boxed_str(),
+        );
+        let (base_url, request) = mock_server(response).await;
+        let descriptor = BlobDescriptor {
+            url: Url::parse(&format!("https://origin.example/{hash}.bin")).unwrap(),
+            sha256: hash,
+            size: 4,
+            mime_type: "application/octet-stream".to_owned(),
+            uploaded: Timestamp::from_secs(1),
+            nip94: None,
+        };
+
+        BlossomClient::new(base_url)
+            .mirror_blob(
+                &descriptor,
+                None,
+                None::<&Keys>,
+                Some(&BlossomPaymentProof {
+                    method: "cashu".to_owned(),
+                    proof: "cashuBproof".to_owned(),
+                }),
+            )
+            .await
+            .unwrap();
+
+        let request = request.await.unwrap();
+        let request_lowercase = request.to_ascii_lowercase();
+        assert!(request.starts_with("PUT /mirror HTTP/1.1"));
+        assert!(request_lowercase.contains(&format!("x-sha-256: {hash}")));
+        assert!(request_lowercase.contains("x-content-length: 4"));
+        assert!(request_lowercase.contains("x-cashu: cashubproof"));
+        assert!(request.contains(&format!(r#"{{"url":"https://origin.example/{hash}.bin"}}"#)));
+    }
+
+    #[tokio::test]
+    async fn preflight_returns_payment_challenges() {
+        let response = "HTTP/1.1 402 Payment Required\r\nX-Cashu: creqArequest\r\nX-Reason: payment needed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        let (base_url, request) = mock_server(response).await;
+        let hash = Sha256Hash::hash(b"blob");
+
+        let result = BlossomClient::new(base_url)
+            .upload_requirements(
+                hash,
+                4,
+                Some("application/octet-stream"),
+                None,
+                None::<&Keys>,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            BlossomPreflight::PaymentRequired(vec![BlossomPaymentRequest {
+                method: "cashu".to_owned(),
+                request: "creqArequest".to_owned(),
+            }])
+        );
+        let request = request.await.unwrap().to_ascii_lowercase();
+        assert!(request.starts_with("head /upload http/1.1"));
+        assert!(request.contains(&format!("x-sha-256: {hash}")));
+        assert!(request.contains("x-content-length: 4"));
+        assert!(request.contains("x-content-type: application/octet-stream"));
+    }
 }
