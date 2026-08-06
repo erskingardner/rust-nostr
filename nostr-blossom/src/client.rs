@@ -51,7 +51,7 @@ impl BlossomClient {
 
     /// Uploads a blob to the Blossom server.
     ///
-    /// <https://github.com/hzrd149/blossom/blob/master/buds/02.md>
+    /// <https://github.com/hzrd149/blossom/blob/master/buds/12.md>
     pub async fn upload_blob<T>(
         &self,
         data: Vec<u8>,
@@ -506,6 +506,37 @@ impl BlossomClient {
             .send()
             .await?;
         Self::descriptor_response("Failed to mirror blob", response).await
+    }
+
+    /// Uploads to the first BUD-03 server and mirrors to every remaining server.
+    ///
+    /// Descriptors are returned in server-list order. Processing stops on the
+    /// first failed upload or mirror request.
+    pub async fn upload_and_mirror<T>(
+        servers: &[Url],
+        data: Vec<u8>,
+        content_type: Option<String>,
+        authorization_options: Option<BlossomAuthorizationOptions>,
+        signer: Option<&T>,
+    ) -> Result<Vec<BlobDescriptor>, Error>
+    where
+        T: AsyncGetPublicKey + AsyncSignEvent,
+    {
+        let (first, mirrors) = servers.split_first().ok_or_else(|| {
+            Error::with_static_message(ErrorKind::Invalid, "A Blossom server list cannot be empty")
+        })?;
+        let descriptor = Self::new(first.clone())
+            .upload_blob(data, content_type, authorization_options.clone(), signer)
+            .await?;
+        let mut descriptors = Vec::with_capacity(servers.len());
+        descriptors.push(descriptor.clone());
+        for server in mirrors {
+            let mirrored = Self::new(server.clone())
+                .mirror_blob(&descriptor, authorization_options.clone(), signer, None)
+                .await?;
+            descriptors.push(mirrored);
+        }
+        Ok(descriptors)
     }
 
     /// Checks whether the server would accept media for optimization.
@@ -1045,6 +1076,16 @@ mod tests {
         let client = BlossomClient::new(Url::parse("http://127.0.0.1:1").unwrap());
 
         let error = client.report_blobs(&event).await.unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::Invalid);
+    }
+
+    #[tokio::test]
+    async fn rejects_empty_upload_server_list() {
+        let error =
+            BlossomClient::upload_and_mirror(&[], b"blob".to_vec(), None, None, None::<&Keys>)
+                .await
+                .unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::Invalid);
     }

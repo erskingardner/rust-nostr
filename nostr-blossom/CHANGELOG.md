@@ -36,7 +36,7 @@
 
 ### Added
 
-- Add BUD-03 server-list and URL hash discovery helpers.
+- Add BUD-03 server-list discovery, URL hash recovery, and ordered upload-and-mirror workflows.
 - Add BUD-04 mirroring and BUD-05 media optimization with BUD-06 preflights.
 - Add generic BUD-07 payment challenge and proof support.
 - Deserialize BUD-08 NIP-94 metadata tags from blob descriptors.
