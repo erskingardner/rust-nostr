@@ -7,9 +7,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use bitcoin_hashes::sha256::Hash as Sha256Hash;
 use nostr::prelude::*;
 use nostr::types::Url;
-use reqwest::header::{
-    AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, LOCATION, RANGE,
-};
+#[cfg(not(target_arch = "wasm32"))]
+use reqwest::header::LOCATION;
+use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderMap, HeaderValue, RANGE};
 #[cfg(not(target_arch = "wasm32"))]
 use reqwest::redirect::Policy;
 use reqwest::{Response, StatusCode};
@@ -305,6 +305,7 @@ impl BlossomClient {
 
         request = request.headers(headers.clone());
 
+        #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
         let mut response: Response = request.send().await?;
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -606,12 +607,23 @@ impl BlossomClient {
         author_servers: impl IntoIterator<Item = Url>,
         fallback_servers: impl IntoIterator<Item = Url>,
     ) -> Result<Vec<u8>, Error> {
+        let client = reqwest::Client::new();
         for candidate in uri.candidate_urls(author_servers, fallback_servers) {
-            let client = Self::new(candidate);
-            if let Ok(data) = client.get_blob(uri.sha256, None, None, None::<&Keys>).await {
-                if uri.size.is_none_or(|size| size == data.len() as u64) {
-                    return Ok(data);
-                }
+            let Ok(response) = client.get(candidate).send().await else {
+                continue;
+            };
+            if !response.status().is_success()
+                || !response.url().as_str().contains(&uri.sha256.to_string())
+            {
+                continue;
+            }
+            let Ok(data) = response.bytes().await else {
+                continue;
+            };
+            if uri.size.is_none_or(|size| size == data.len() as u64)
+                && Sha256Hash::hash(&data) == uri.sha256
+            {
+                return Ok(data.to_vec());
             }
         }
         Err(Error::with_static_message(
@@ -1062,7 +1074,7 @@ mod tests {
             request
                 .await
                 .unwrap()
-                .starts_with(&format!("GET /{hash} HTTP/1.1"))
+                .starts_with(&format!("GET /{hash}.bin HTTP/1.1"))
         );
     }
 }
