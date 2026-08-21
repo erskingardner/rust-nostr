@@ -29,6 +29,10 @@
 
 ## Unreleased
 
+### Added
+
+- Add `LocalRelay::connections_left` (https://github.com/nostrdevkit/nostr/pull/1459)
+
 ### Deprecated
 
 - Deprecate `LocalRelayBuilder::max_query_results` and `LocalRelayBuilder::default_filter_limit` (https://github.com/nostrdevkit/nostr/pull/1461)
