@@ -50,6 +50,12 @@
 - Build all endpoints at the server origin root and preserve `/list/<pubkey>` paths.
 - Validate redirect targets and downloaded blob hashes.
 
+## v0.45.1 - 2026/09/11
+
+### Fixed
+
+- Include LICENSE file
+
 ## v0.45.0 - 2026/08/05
 
 ### Breaking changes

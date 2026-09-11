@@ -45,6 +45,12 @@
 
 - Enforce max length for relay URLs in `RelayUrl::parse` (https://github.com/nostrdevkit/nostr/pull/1451)
 
+## v0.45.5 - 2026/09/11
+
+### Fixed 
+
+- Include LICENSE file
+
 ## v0.45.4 - 2026/08/30
 
 ### Added

@@ -1748,7 +1748,7 @@ dependencies = [
 
 [[package]]
 name = "nostr"
-version = "0.45.4"
+version = "0.45.5"
 dependencies = [
  "aes",
  "base64",
@@ -1775,7 +1775,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-blossom"
-version = "0.45.0"
+version = "0.45.1"
 dependencies = [
  "base64",
  "bitcoin_hashes 1.1.0",
@@ -1790,7 +1790,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-browser-signer"
-version = "0.45.0"
+version = "0.45.1"
 dependencies = [
  "js-sys",
  "nostr",
@@ -1802,7 +1802,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-browser-signer-proxy"
-version = "0.45.0"
+version = "0.45.1"
 dependencies = [
  "atomic-destructor",
  "bytes",
@@ -1821,7 +1821,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-connect"
-version = "0.45.1"
+version = "0.45.2"
 dependencies = [
  "async-utility",
  "dialoguer",
@@ -1837,7 +1837,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-database"
-version = "0.45.1"
+version = "0.45.2"
 dependencies = [
  "nostr",
  "opaquerr",
@@ -1854,7 +1854,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-gossip"
-version = "0.45.0"
+version = "0.45.1"
 dependencies = [
  "nostr",
  "opaquerr",
@@ -1862,7 +1862,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-gossip-memory"
-version = "0.45.0"
+version = "0.45.1"
 dependencies = [
  "indexmap",
  "lru",
@@ -1874,7 +1874,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-gossip-sqlite"
-version = "0.45.0"
+version = "0.45.1"
 dependencies = [
  "async-utility",
  "nostr",
@@ -1896,7 +1896,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-lmdb"
-version = "0.45.2"
+version = "0.45.3"
 dependencies = [
  "async-utility",
  "flatbuffers 25.12.19",
@@ -1913,7 +1913,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-memory"
-version = "0.45.1"
+version = "0.45.2"
 dependencies = [
  "btreecap",
  "nostr",
@@ -1924,7 +1924,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-ndb"
-version = "0.45.1"
+version = "0.45.2"
 dependencies = [
  "nostr",
  "nostr-database",
@@ -1933,7 +1933,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-sdk"
-version = "0.45.2"
+version = "0.45.4"
 dependencies = [
  "async-utility",
  "async-wsocket",
@@ -1964,7 +1964,7 @@ dependencies = [
 
 [[package]]
 name = "nostr-sqlite"
-version = "0.45.1"
+version = "0.45.2"
 dependencies = [
  "async-utility",
  "nostr",
@@ -2003,7 +2003,7 @@ dependencies = [
 
 [[package]]
 name = "nwc"
-version = "0.45.0"
+version = "0.45.1"
 dependencies = [
  "futures-core",
  "nostr",

@@ -33,6 +33,12 @@
 
 - Change the default value of `GossipAllowedRelays.without_tls` to `false` (https://github.com/nostrdevkit/nostr/pull/1436)
 
+## v0.45.1 - 2026/09/11
+
+### Fixed
+
+- Include LICENSE file
+
 ## v0.45.0 - 2026/08/05
 
 ### Breaking changes

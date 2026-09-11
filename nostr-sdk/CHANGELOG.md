@@ -35,14 +35,22 @@
 - Add `LocalRelayBuilderNip42::relay_url` to make it possible to configure a custom `relay_url` for the nip42 challenge validation (https://github.com/nostrdevkit/nostr/pull/1476)
 - Add `LocalRelayBuilder::new_event_channel_size` for customizing the size of the channel used to notify new received events
 
+### Deprecated
+
+- Deprecate `LocalRelayBuilder::max_query_results` and `LocalRelayBuilder::default_filter_limit` (https://github.com/nostrdevkit/nostr/pull/1461)
+
+## v0.45.4 - 2026/09/19
+
 ### Fixed
 
 - Explicitly close active local relay subscriptions when their live event buffer
   overflows, allowing clients to detect gaps and resubscribe for stored events.
 
-### Deprecated
+## v0.45.3 - 2026/09/11
 
-- Deprecate `LocalRelayBuilder::max_query_results` and `LocalRelayBuilder::default_filter_limit` (https://github.com/nostrdevkit/nostr/pull/1461)
+### Fixed
+
+- Include LICENSE file
 
 ## v0.45.2 - 2026/08/19
 
