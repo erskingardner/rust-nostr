@@ -37,7 +37,6 @@ authors = ["Yuki Kishimoto <yukikishimoto@protonmail.com>", "Nostr Dev Kit Devel
 homepage = "https://nostrdevkit.org"
 repository = "https://github.com/nostrdevkit/nostr.git"
 license = "MIT"
-license-file = "LICENSE"
 rust-version = "1.85.0"
 
 [workspace.dependencies]
