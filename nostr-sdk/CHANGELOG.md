@@ -32,6 +32,7 @@
 ### Added
 
 - Add `LocalRelay::connections_left` (https://github.com/nostrdevkit/nostr/pull/1459)
+- Add `LocalRelayBuilderNip42::relay_url` to make it possible to configure a custom `relay_url` for the nip42 challenge validation (https://github.com/nostrdevkit/nostr/pull/1476)
 
 ### Deprecated
 
