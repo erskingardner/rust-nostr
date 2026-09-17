@@ -34,6 +34,11 @@
 - Add `LocalRelay::connections_left` (https://github.com/nostrdevkit/nostr/pull/1459)
 - Add `LocalRelayBuilderNip42::relay_url` to make it possible to configure a custom `relay_url` for the nip42 challenge validation (https://github.com/nostrdevkit/nostr/pull/1476)
 
+### Fixed
+
+- Explicitly close active local relay subscriptions when their live event buffer
+  overflows, allowing clients to detect gaps and resubscribe for stored events.
+
 ### Deprecated
 
 - Deprecate `LocalRelayBuilder::max_query_results` and `LocalRelayBuilder::default_filter_limit` (https://github.com/nostrdevkit/nostr/pull/1461)
