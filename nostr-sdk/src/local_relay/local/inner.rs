@@ -91,7 +91,7 @@ impl InnerLocalRelay {
         };
 
         // Channels
-        let (new_event, ..) = broadcast::channel(1024);
+        let (new_event, ..) = broadcast::channel(builder.new_event_channel_size.get());
 
         let database: Arc<dyn NostrDatabase> = builder.database.unwrap_or_else(|| {
             let max: NonZeroUsize = NonZeroUsize::new(75_000).unwrap();

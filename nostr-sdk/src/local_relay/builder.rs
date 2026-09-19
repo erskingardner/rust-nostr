@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
+use std::num::NonZeroUsize;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -317,6 +318,8 @@ pub struct LocalRelayBuilder {
     pub(crate) max_negentropy_subscriptions: usize,
     /// Max total negentropy items retained per connection
     pub(crate) max_negentropy_items: usize,
+    /// Size of the channel to notify new received events
+    pub(crate) new_event_channel_size: NonZeroUsize,
     /// Enables NIP-42 authentication for kind 1059 (GiftWrap), ensuring the
     /// authenticated pubkey is the only "p" tag
     pub(crate) auth_dm: bool,
@@ -364,6 +367,7 @@ impl Default for LocalRelayBuilder {
             max_subscription_bytes: DEFAULT_MAX_SUBSCRIPTION_BYTES,
             max_negentropy_subscriptions: 10,
             max_negentropy_items: DEFAULT_MAX_NEGENTROPY_ITEMS,
+            new_event_channel_size: NonZeroUsize::new(1024).unwrap(),
             auth_dm: false,
             min_pow: None,
             kinds_blacklist: HashSet::from(BLACKLISTED_KINDS),
@@ -538,6 +542,13 @@ impl LocalRelayBuilder {
     #[deprecated(note = "Use max_filter_limit instead")]
     pub fn default_filter_limit(self, limit: usize) -> Self {
         self.max_filter_limit(limit)
+    }
+
+    /// Size of the channel to notify new received events
+    #[inline]
+    pub fn new_event_channel_size(mut self, size: NonZeroUsize) -> Self {
+        self.new_event_channel_size = size;
+        self
     }
 
     /// If enabled, NIP-42 will be used for DMs, returning GiftWrap events for
