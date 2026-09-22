@@ -3,7 +3,7 @@ use std::cmp;
 use std::collections::{HashMap, HashSet};
 use std::future::IntoFuture;
 
-use async_utility::time;
+use async_utility::{task, time};
 use negentropy::{Id, Negentropy, NegentropyStorageVector};
 use nostr::event::EventId;
 use nostr::filter::Filter;
@@ -37,9 +37,24 @@ pub struct SyncSummary {
     // pub receive: HashMap<EventId, Vec<String>>,
 }
 
+/// Reconciliation progress and its terminal result for one relay.
+///
+/// Progress may be useful after failure, but only `error == None` means the
+/// selected filter/window completed. Received events are not evidence of
+/// downstream durable admission.
+#[derive(Debug)]
+pub struct RelaySyncOutcome {
+    /// Progress observed before completion or failure.
+    pub summary: SyncSummary,
+    /// Failure that interrupted reconciliation, if any.
+    pub error: Option<Error>,
+}
+
 /// Sync events with relay
 ///
 /// <https://github.com/nostr-protocol/nips/blob/master/77.md>
+/// Use [`SyncEvents::with_outcomes`] to retain partial progress when this relay
+/// fails. Completion only concerns the selected filter/window.
 #[must_use = "Does nothing unless you await!"]
 pub struct SyncEvents<'relay> {
     relay: &'relay Relay,
@@ -77,6 +92,30 @@ impl<'relay> SyncEvents<'relay> {
         self.opts = opts;
         self
     }
+
+    /// Reconcile while retaining partial progress if the operation fails.
+    ///
+    /// Preflight errors still return `Err` before reconciliation begins.
+    pub async fn with_outcomes(self) -> Result<RelaySyncOutcome, Error> {
+        self.relay.inner.ensure_operational()?;
+        if !self.relay.inner.capabilities.can_read() {
+            return Err(Error::read_disabled());
+        }
+
+        let items: Vec<(EventId, Timestamp)> = match self.items {
+            Some(items) => items,
+            None => {
+                let database = self.relay.inner.state.database();
+                database.negentropy_items(self.filter.clone()).await?
+            }
+        };
+
+        let mut summary = SyncSummary::default();
+        let error = sync(self.relay, &self.filter, items, &self.opts, &mut summary)
+            .await
+            .err();
+        Ok(RelaySyncOutcome { summary, error })
+    }
 }
 
 #[inline]
@@ -101,6 +140,49 @@ async fn send_neg_close(relay: &Relay, id: &SubscriptionId) -> Result<(), Error>
 #[inline]
 fn neg_id_to_event_id(id: Id) -> EventId {
     EventId::from_byte_array(id.to_bytes())
+}
+
+// A dropped sync future must not keep its request-owned subscription registered.
+// Network CLOSE is best effort because the relay may already be disconnected.
+struct SyncCleanup {
+    relay: Relay,
+    neg_id: SubscriptionId,
+    down_id: SubscriptionId,
+    armed: bool,
+}
+
+impl SyncCleanup {
+    fn new(relay: &Relay, neg_id: SubscriptionId, down_id: SubscriptionId) -> Self {
+        Self {
+            relay: relay.clone(),
+            neg_id,
+            down_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SyncCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        let relay = self.relay.clone();
+        let neg_id = self.neg_id.clone();
+        let down_id = self.down_id.clone();
+        task::spawn(async move {
+            relay.inner.remove_subscription(&down_id).await;
+            let _ = relay
+                .send_msg(ClientMessage::Close(Cow::Borrowed(&down_id)))
+                .await;
+            let _ = send_neg_close(&relay, &neg_id).await;
+        });
+    }
 }
 
 #[inline(never)]
@@ -328,12 +410,14 @@ pub(super) async fn sync(
 
     // Send the initial negentropy message
     let sub_id: SubscriptionId = SubscriptionId::generate();
+    let down_sub_id: SubscriptionId = SubscriptionId::generate();
     let open_msg: ClientMessage = ClientMessage::NegOpen {
         subscription_id: Cow::Borrowed(&sub_id),
         filter: Cow::Borrowed(filter),
         initial_message: Cow::Owned(faster_hex::hex_string(&initial_message)),
     };
     relay.send_msg(open_msg).await?;
+    let mut cleanup = SyncCleanup::new(relay, sub_id.clone(), down_sub_id.clone());
 
     // Check if negentropy is supported
     check_negentropy_support(&sub_id, opts, &mut temp_notifications).await?;
@@ -343,7 +427,6 @@ pub(super) async fn sync(
     let mut sync_done: bool = false;
     let mut have_ids: Vec<EventId> = Vec::new();
     let mut need_ids: Vec<EventId> = Vec::new();
-    let down_sub_id: SubscriptionId = SubscriptionId::generate();
     let mut last_relevant_msg: Instant = Instant::now();
 
     // Start reconciliation
@@ -516,6 +599,8 @@ pub(super) async fn sync(
 
     tracing::info!(url = %relay.url(), "Negentropy reconciliation terminated.");
 
+    cleanup.disarm();
+
     Ok(())
 }
 
@@ -595,35 +680,11 @@ impl<'relay> IntoFuture for SyncEvents<'relay> {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            // Check if relay is operational
-            self.relay.inner.ensure_operational()?;
-
-            // Check if relay can read
-            if !self.relay.inner.capabilities.can_read() {
-                return Err(Error::read_disabled());
+            let outcome = self.with_outcomes().await?;
+            match outcome.error {
+                Some(error) => Err(error),
+                None => Ok(outcome.summary),
             }
-
-            let items: Vec<(EventId, Timestamp)> = match self.items {
-                Some(items) => items,
-                None => {
-                    // Get negentropy items
-                    let database = self.relay.inner.state.database();
-                    database.negentropy_items(self.filter.clone()).await?
-                }
-            };
-
-            let mut output: SyncSummary = SyncSummary::default();
-
-            sync(
-                self.relay,
-                &self.filter,
-                items.clone(),
-                &self.opts,
-                &mut output,
-            )
-            .await?;
-
-            Ok(output)
         })
     }
 }
@@ -641,6 +702,35 @@ mod tests {
     use crate::error::ErrorKind;
     use crate::local_relay::*;
     use crate::relay::{SyncDirection, SyncOptions};
+
+    #[tokio::test]
+    async fn cancelled_sync_cleans_only_its_subscription() {
+        let relay = Relay::new("wss://relay.example.com".parse().unwrap());
+        let down_id = SubscriptionId::new("sync-download");
+        let unrelated_id = SubscriptionId::new("unrelated-live");
+        relay
+            .inner
+            .add_auto_closing_subscription(down_id.clone(), vec![Filter::new()])
+            .await
+            .unwrap();
+        relay
+            .inner
+            .add_long_lived_subscription(unrelated_id.clone(), vec![Filter::new()])
+            .await
+            .unwrap();
+
+        let cleanup = SyncCleanup::new(&relay, SubscriptionId::new("sync-neg"), down_id.clone());
+        drop(cleanup);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while relay.inner.has_subscription(&down_id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(relay.inner.has_subscription(&unrelated_id).await);
+    }
 
     #[tokio::test]
     async fn test_check_negentropy_support_times_out() {
