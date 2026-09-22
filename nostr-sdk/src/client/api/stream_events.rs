@@ -76,14 +76,28 @@ impl<'client, 'url> StreamEvents<'client, 'url> {
     pub async fn with_outcomes(
         self,
     ) -> Result<Pin<Box<dyn Stream<Item = (RelayUrl, RelayStreamEvent)> + Send>>, Error> {
+        let (_, stream) = self.into_outcome_stream_with_targets().await?;
+        Ok(stream)
+    }
+
+    pub(crate) async fn into_outcome_stream_with_targets(
+        self,
+    ) -> Result<
+        (
+            Vec<RelayUrl>,
+            Pin<Box<dyn Stream<Item = (RelayUrl, RelayStreamEvent)> + Send>>,
+        ),
+        Error,
+    > {
         let targets: HashMap<RelayUrl, Vec<Filter>> =
             build_targets(self.client, self.target).await?;
+        let urls = targets.keys().cloned().collect();
         let stream = self
             .client
             .pool()
             .stream_events(targets, self.id, self.timeout, self.policy)
             .await?;
-        Ok(Box::pin(stream))
+        Ok((urls, Box::pin(stream)))
     }
 }
 

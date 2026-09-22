@@ -34,6 +34,8 @@
 
 - Add `StreamEvents::with_outcomes` for relay and client requests so callers
   can distinguish completion, reached limits, and endpoint errors.
+- Add bounded `FetchEvents::with_outcomes` for aggregate client fetches with
+  partial events, per-relay outcomes, and explicit buffer truncation.
 - Add `Client::notifications_with_gaps` and `Relay::notifications_with_gaps`
   to report receiver-local notification loss while continuing reception.
 - Add `LocalRelay::connections_left` (https://github.com/nostrdevkit/nostr/pull/1459)
