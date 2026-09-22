@@ -32,6 +32,9 @@
 
 ### Added
 
+- Add `Client::acquire_events` for per-relay bounded batches with item and
+  serialized-event-byte budgets, cancellable partial results, and explicit
+  terminal outcomes.
 - Add `StreamEvents::with_outcomes` for relay and client requests so callers
   can distinguish completion, reached limits, and endpoint errors.
 - Add bounded `FetchEvents::with_outcomes` for aggregate client fetches with

@@ -330,6 +330,11 @@ impl InnerRelay {
         subscription.contains_key(id)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn active_subscription_count(&self) -> usize {
+        self.atomic.subscriptions.read().await.len()
+    }
+
     /// Returns all long-lived (non-auto-closing) subscriptions
     pub async fn subscriptions(&self) -> HashMap<SubscriptionId, Vec<Filter>> {
         let subscription = self.atomic.subscriptions.read().await;
