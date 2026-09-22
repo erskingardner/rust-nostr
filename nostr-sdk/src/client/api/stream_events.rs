@@ -66,6 +66,25 @@ impl<'client, 'url> StreamEvents<'client, 'url> {
         self.policy = policy;
         self
     }
+
+    /// Stream events and terminal outcomes for each selected relay.
+    ///
+    /// One relay's failure does not stop healthy relays. `Completed` means the
+    /// configured request policy ended at that relay; `LimitReached` does not
+    /// establish that all matching history was received. Dropping the stream
+    /// cancels the outstanding requests without closing unrelated subscriptions.
+    pub async fn with_outcomes(
+        self,
+    ) -> Result<Pin<Box<dyn Stream<Item = (RelayUrl, RelayStreamEvent)> + Send>>, Error> {
+        let targets: HashMap<RelayUrl, Vec<Filter>> =
+            build_targets(self.client, self.target).await?;
+        let stream = self
+            .client
+            .pool()
+            .stream_events(targets, self.id, self.timeout, self.policy)
+            .await?;
+        Ok(Box::pin(stream))
+    }
 }
 
 impl<'client, 'url> IntoFuture for StreamEvents<'client, 'url>
@@ -77,22 +96,13 @@ where
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            // Build targets
-            let targets: HashMap<RelayUrl, Vec<Filter>> =
-                build_targets(self.client, self.target).await?;
-
-            // Make the stream
-            let stream = self
-                .client
-                .pool()
-                .stream_events(targets, self.id, self.timeout, self.policy)
-                .await?;
+            let stream = self.with_outcomes().await?;
 
             Ok(Box::pin(stream.filter_map(|(url, item)| async move {
                 match item {
                     RelayStreamEvent::Event(event) => Some((url, Ok(event))),
                     RelayStreamEvent::Error(error) => Some((url, Err(error))),
-                    RelayStreamEvent::Completed => None,
+                    RelayStreamEvent::Completed | RelayStreamEvent::LimitReached => None,
                 }
             })) as EventStream)
         })
@@ -101,6 +111,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::net::SocketAddr;
+    use std::pin::Pin;
     use std::time::Duration;
 
     use futures::StreamExt;
@@ -115,6 +128,94 @@ mod tests {
     use crate::test_utils::{
         setup_client, setup_client_with_authenticator, setup_nip42_read_local_relay,
     };
+
+    #[derive(Debug)]
+    struct RejectQuery;
+
+    impl QueryPolicy for RejectQuery {
+        fn admit_query<'a>(
+            &'a self,
+            _query: &'a mut Filter,
+            _addr: &'a SocketAddr,
+        ) -> Pin<Box<dyn Future<Output = QueryPolicyResult> + Send + 'a>> {
+            Box::pin(async {
+                QueryPolicyResult::reject(MachineReadablePrefix::Blocked, "query rejected")
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn aggregate_outcomes_preserve_healthy_events_and_failed_endpoint() {
+        let healthy = LocalRelay::builder().build();
+        healthy.run().await.unwrap();
+        let failing = LocalRelay::builder().query_policy(RejectQuery).build();
+        failing.run().await.unwrap();
+
+        let keys = Keys::generate();
+        let expected = EventBuilder::new(Kind::TextNote, "healthy event")
+            .finalize(&keys)
+            .unwrap();
+        healthy.add_event(expected.clone()).await.unwrap();
+
+        let healthy_url = healthy.url().await;
+        let failing_url = failing.url().await;
+        let client = Client::new();
+        client.add_relay(&healthy_url).and_connect().await.unwrap();
+        client.add_relay(&failing_url).and_connect().await.unwrap();
+
+        let mut stream = client
+            .stream_events(Filter::new().author(keys.public_key()))
+            .timeout(Duration::from_secs(2))
+            .with_outcomes()
+            .await
+            .unwrap();
+
+        let mut saw_event = false;
+        let mut saw_completion = false;
+        let mut saw_failure = false;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some((url, outcome)) = stream.next().await {
+                match outcome {
+                    RelayStreamEvent::Event(event) if url == healthy_url => {
+                        assert_eq!(event.id, expected.id);
+                        saw_event = true;
+                    }
+                    RelayStreamEvent::Completed if url == healthy_url => {
+                        saw_completion = true;
+                    }
+                    RelayStreamEvent::Error(error) if url == failing_url => {
+                        assert!(error.to_string().contains("query rejected"));
+                        saw_failure = true;
+                    }
+                    other => panic!("unexpected outcome from {url}: {other:?}"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(saw_event);
+        assert!(saw_completion);
+        assert!(saw_failure);
+
+        let mut stream = client
+            .stream_events(Filter::new().author(keys.public_key()))
+            .policy(ReqExitPolicy::WaitForEvents(1))
+            .timeout(Duration::from_secs(2))
+            .with_outcomes()
+            .await
+            .unwrap();
+        let mut saw_limit = false;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while let Some((url, outcome)) = stream.next().await {
+                if url == healthy_url && matches!(outcome, RelayStreamEvent::LimitReached) {
+                    saw_limit = true;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(saw_limit);
+    }
 
     #[tokio::test]
     async fn test_stream_terminates_on_drop() {

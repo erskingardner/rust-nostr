@@ -791,6 +791,10 @@ impl Client {
     /// - All relay streams terminate,
     /// - Or an optional timeout expires.
     ///
+    /// Awaiting this builder returns events and relay errors, while successful
+    /// terminal markers are omitted. Use [`StreamEvents::with_outcomes`] to
+    /// distinguish policy completion from an event-count limit at each relay.
+    ///
     /// # Errors
     ///
     /// Returns an error if:

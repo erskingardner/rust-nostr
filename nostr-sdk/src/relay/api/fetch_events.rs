@@ -158,11 +158,13 @@ mod tests {
         assert_eq!(relay.status(), RelayStatus::Connected);
 
         let filter = Filter::new().kind(Kind::Metadata);
-        relay
+        let error = relay
             .fetch_events(filter)
             .timeout(Duration::from_secs(3))
             .await
-            .unwrap();
+            .unwrap_err();
+
+        assert_eq!(error.kind(), crate::error::ErrorKind::State);
 
         assert_eq!(relay.status(), RelayStatus::Banned);
 
