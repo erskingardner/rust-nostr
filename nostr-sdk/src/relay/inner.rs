@@ -2223,7 +2223,6 @@ mod tests {
                 .and_then(|source| source.downcast_ref::<broadcast::error::RecvError>())
                 .is_some_and(|source| matches!(source, broadcast::error::RecvError::Closed))
         );
-
     }
 
     #[tokio::test]
@@ -2418,7 +2417,6 @@ mod tests {
         })
         .await
         .unwrap();
-
     }
 
     #[derive(Debug)]
