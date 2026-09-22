@@ -48,6 +48,9 @@
   count; report receive loss, closure, and rejection instead of returning zero.
 - Report receive lag, closure, disconnection, and timeout from auto-closing
   event requests instead of silently treating them as completed.
+- Preserve the broadcast lag or closure cause in event `OK` and authentication
+  waiters instead of returning a generic premature-exit error. These outcomes
+  leave publication unconfirmed; they do not imply relay rejection.
 
 ### Deprecated
 
