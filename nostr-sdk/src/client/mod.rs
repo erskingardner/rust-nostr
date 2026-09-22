@@ -1237,6 +1237,7 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::num::NonZeroUsize;
 
     use nostr::event::{EventBuilder, FinalizeEvent, Kind};
@@ -1378,6 +1379,19 @@ mod tests {
             slow_relay.next().await,
             Some(NotificationUpdate::Notification(_))
         ));
+
+        // Previous SDK receipt does not consume an event from the relay.
+        // Bounded explicit reacquisition returns every ID after receiver loss.
+        let mut reacquired_ids = HashSet::new();
+        for batch in sent.chunks(2) {
+            let reacquired = client
+                .fetch_events(Filter::new().ids(batch.to_vec()))
+                .timeout(Duration::from_secs(5))
+                .await
+                .unwrap();
+            reacquired_ids.extend(reacquired.iter().map(|event| event.id));
+        }
+        assert_eq!(reacquired_ids, sent.into_iter().collect());
 
         client.shutdown().await;
 
