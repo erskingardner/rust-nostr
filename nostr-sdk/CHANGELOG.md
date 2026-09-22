@@ -35,6 +35,13 @@
 - Add `LocalRelayBuilderNip42::relay_url` to make it possible to configure a custom `relay_url` for the nip42 challenge validation (https://github.com/nostrdevkit/nostr/pull/1476)
 - Add `LocalRelayBuilder::new_event_channel_size` for customizing the size of the channel used to notify new received events
 
+### Fixed
+
+- Preserve reconnect requests made while a terminated connection task is still
+  releasing ownership, instead of leaving the relay pending with no task.
+- Restore long-lived subscriptions on immediate reconnect even when both
+  connections occur within one second.
+
 ### Deprecated
 
 - Deprecate `LocalRelayBuilder::max_query_results` and `LocalRelayBuilder::default_filter_limit` (https://github.com/nostrdevkit/nostr/pull/1461)

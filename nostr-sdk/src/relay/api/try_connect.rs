@@ -72,7 +72,11 @@ impl<'relay> IntoFuture for TryConnect<'relay> {
                 .await?;
 
             // Spawn connection task
-            self.relay.inner.spawn_connection_task(Some(stream));
+            if !self.relay.inner.spawn_connection_task(Some(stream)) {
+                return Err(Error::state_msg(
+                    "previous connection task is stopping; reconnect queued",
+                ));
+            }
 
             Ok(())
         })
