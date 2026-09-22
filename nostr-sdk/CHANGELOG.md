@@ -17,6 +17,9 @@
 
 ### Fixed
 
+- Require a correlated COUNT response before `Relay::count_events` returns a
+  count; report receive loss, closure, and rejection instead of returning zero.
+
 ### Removed
 
 ### Deprecated
