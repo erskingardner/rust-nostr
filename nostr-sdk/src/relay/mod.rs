@@ -49,6 +49,16 @@ enum SubscriptionAutoClosedReason {
     AuthenticationFailed,
     /// Closed
     Closed(String),
+    /// Notification receiver skipped items
+    Lagged(u64),
+    /// Notification channel closed before policy completion
+    ReceiverClosed,
+    /// Request or idle timeout
+    TimedOut,
+    /// Relay disconnected before policy completion
+    Disconnected,
+    /// Configured event limit was reached
+    LimitReached,
     /// Completed
     Completed,
 }
@@ -433,7 +443,10 @@ impl Relay {
         UnsubscribeAll::new(self)
     }
 
-    /// Stream events from relay
+    /// Stream events from relay.
+    ///
+    /// Awaiting the builder omits successful terminal markers. Use
+    /// [`StreamEvents::with_outcomes`] to inspect completion or a reached limit.
     #[inline]
     pub fn stream_events<F>(&self, filters: F) -> StreamEvents<'_>
     where

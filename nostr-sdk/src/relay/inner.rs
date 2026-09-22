@@ -1569,6 +1569,13 @@ impl InnerRelay {
                 // Timeout
                 None => {
                     tracing::warn!(id = %id, "Timeout reached for subscription, auto-closing.");
+                    if let Some(activity) = &activity {
+                        let _ = activity
+                            .send(SubscriptionActivity::Closed(
+                                SubscriptionAutoClosedReason::TimedOut,
+                            ))
+                            .await;
+                    }
                     true
                 }
             };
@@ -1607,19 +1614,39 @@ impl InnerRelay {
             let mut received_eose: bool = false;
             let mut require_resubscription: bool = false;
             let mut last_event: Option<Instant> = None;
+            let mut exit_reason = SubscriptionAutoClosedReason::Completed;
 
             // Listen to notifications with timeout
-            // If no notification is received within no-events timeout, `None` is returned.
-            while let Ok(notification) =
-                time::timeout(opts.idle_timeout, notifications.recv()).await?
-            {
+            loop {
+                let notification =
+                    match time::timeout(opts.idle_timeout, notifications.recv()).await {
+                        Some(Ok(notification)) => notification,
+                        Some(Err(broadcast::error::RecvError::Lagged(skipped))) => {
+                            return Some(HandleAutoClosing {
+                                to_close: true,
+                                reason: Some(SubscriptionAutoClosedReason::Lagged(skipped)),
+                            });
+                        }
+                        Some(Err(broadcast::error::RecvError::Closed)) => {
+                            return Some(HandleAutoClosing {
+                                to_close: false,
+                                reason: Some(SubscriptionAutoClosedReason::ReceiverClosed),
+                            });
+                        }
+                        None => {
+                            return Some(HandleAutoClosing {
+                                to_close: true,
+                                reason: Some(SubscriptionAutoClosedReason::TimedOut),
+                            });
+                        }
+                    };
                 // Check if no-events timeout is reached
                 if let (Some(idle_timeout), Some(last_event)) = (opts.idle_timeout, last_event) {
                     if last_event.elapsed() > idle_timeout {
                         // Close the subscription
                         return Some(HandleAutoClosing {
                             to_close: true,
-                            reason: None,
+                            reason: Some(SubscriptionAutoClosedReason::TimedOut),
                         });
                     }
                 }
@@ -1648,12 +1675,14 @@ impl InnerRelay {
                                 ReqExitPolicy::WaitForEvents(num) => {
                                     wait_for_events_counter += 1;
                                     if wait_for_events_counter >= num {
+                                        exit_reason = SubscriptionAutoClosedReason::LimitReached;
                                         break;
                                     }
                                 }
                                 ReqExitPolicy::WaitForEventsAfterEOSE(num) if received_eose => {
                                     wait_for_events_after_eose_counter += 1;
                                     if wait_for_events_after_eose_counter >= num {
+                                        exit_reason = SubscriptionAutoClosedReason::LimitReached;
                                         break;
                                     }
                                 }
@@ -1758,7 +1787,7 @@ impl InnerRelay {
                     RelayNotification::RelayStatus { status } if status.is_disconnected() => {
                         return Some(HandleAutoClosing {
                             to_close: false, // No need to send CLOSE msg
-                            reason: None,
+                            reason: Some(SubscriptionAutoClosedReason::Disconnected),
                         });
                     }
                     _ => (),
@@ -1766,45 +1795,19 @@ impl InnerRelay {
             }
 
             if let ReqExitPolicy::WaitDurationAfterEOSE(duration) = opts.exit_policy {
-                time::timeout(Some(duration), async {
-                    while let Ok(notification) = notifications.recv().await {
-                        match notification {
-                            RelayNotification::Message { message } => {
-                                if let RelayMessage::Event {
-                                    subscription_id,
-                                    event,
-                                } = *message
-                                {
-                                    if subscription_id.as_ref() == id {
-                                        // Send activity
-                                        if let Some(activity) = activity {
-                                            // TODO: handle error?
-                                            let _ = activity
-                                                .send(SubscriptionActivity::ReceivedEvent(
-                                                    event.into_owned(),
-                                                ))
-                                                .await;
-                                        }
-                                    }
-                                }
-                            }
-                            RelayNotification::RelayStatus { status }
-                                if status.is_disconnected() =>
-                            {
-                                return Ok(());
-                            }
-                            _ => (),
-                        }
-                    }
-
-                    Ok::<(), Error>(())
-                })
-                .await;
+                if let Some(reason) =
+                    post_eose_grace(id, duration, &mut notifications, activity).await
+                {
+                    return Some(HandleAutoClosing {
+                        to_close: true,
+                        reason: Some(reason),
+                    });
+                }
             }
 
             Some(HandleAutoClosing {
                 to_close: true, // Need to send CLOSE msg
-                reason: Some(SubscriptionAutoClosedReason::Completed),
+                reason: Some(exit_reason),
             })
         })
         .await?
@@ -1856,6 +1859,46 @@ impl InnerRelay {
     }
 }
 
+async fn post_eose_grace(
+    id: &SubscriptionId,
+    duration: Duration,
+    notifications: &mut broadcast::Receiver<RelayNotification>,
+    activity: &Option<Sender<SubscriptionActivity>>,
+) -> Option<SubscriptionAutoClosedReason> {
+    time::timeout(Some(duration), async {
+        loop {
+            match notifications.recv().await {
+                Ok(RelayNotification::Message { message }) => {
+                    if let RelayMessage::Event {
+                        subscription_id,
+                        event,
+                    } = *message
+                    {
+                        if subscription_id.as_ref() == id {
+                            if let Some(activity) = activity {
+                                let _ = activity
+                                    .send(SubscriptionActivity::ReceivedEvent(event.into_owned()))
+                                    .await;
+                            }
+                        }
+                    }
+                }
+                Ok(RelayNotification::RelayStatus { status }) if status.is_disconnected() => {
+                    return SubscriptionAutoClosedReason::Disconnected;
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    return SubscriptionAutoClosedReason::Lagged(skipped);
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    return SubscriptionAutoClosedReason::ReceiverClosed;
+                }
+            }
+        }
+    })
+    .await
+}
+
 /// Send a WebSocket message with timeout set to [WEBSOCKET_TX_TIMEOUT].
 async fn send_ws_msg(tx: &mut WebSocketSink, msg: Message) -> Result<(), Error> {
     match time::timeout(Some(WEBSOCKET_TX_TIMEOUT), tx.send(msg)).await {
@@ -1875,6 +1918,7 @@ async fn close_ws(tx: &mut WebSocketSink) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -1891,6 +1935,129 @@ mod tests {
     use crate::error::ErrorKind;
     use crate::policy::{AdmitPolicy, AdmitStatus};
     use crate::relay::{Relay, RelayOptions};
+
+    #[tokio::test]
+    async fn auto_closing_lag_before_eose_is_not_completion() {
+        let relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
+        let id = SubscriptionId::new("lagged-before-eose");
+        let (tx, rx) = broadcast::channel(2);
+        for _ in 0..8 {
+            tx.send(RelayNotification::Authenticated).unwrap();
+        }
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::EndOfStoredEvents(Cow::Owned(id.clone()))),
+        })
+        .unwrap();
+
+        let result = relay
+            .inner
+            .handle_auto_closing(
+                &id,
+                &[Filter::new()],
+                SubscribeAutoCloseOptions::default(),
+                rx,
+                &None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result.reason,
+            Some(SubscriptionAutoClosedReason::Lagged(skipped)) if skipped > 0
+        ));
+    }
+
+    #[tokio::test]
+    async fn auto_closing_receiver_closure_is_not_completion() {
+        let relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
+        let id = SubscriptionId::new("closed-receiver");
+        let (tx, rx) = broadcast::channel(2);
+        drop(tx);
+
+        let result = relay
+            .inner
+            .handle_auto_closing(
+                &id,
+                &[Filter::new()],
+                SubscribeAutoCloseOptions::default(),
+                rx,
+                &None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result.reason,
+            Some(SubscriptionAutoClosedReason::ReceiverClosed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn post_eose_grace_lag_is_not_completion() {
+        let id = SubscriptionId::new("grace-lag");
+        let (tx, mut rx) = broadcast::channel(2);
+        for _ in 0..8 {
+            tx.send(RelayNotification::Authenticated).unwrap();
+        }
+
+        let reason = post_eose_grace(&id, Duration::from_secs(2), &mut rx, &None).await;
+        assert!(matches!(
+            reason,
+            Some(SubscriptionAutoClosedReason::Lagged(skipped)) if skipped > 0
+        ));
+    }
+
+    #[tokio::test]
+    async fn auto_closing_eose_and_limit_have_distinct_reasons() {
+        let relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
+        let id = SubscriptionId::new("completed-eose");
+        let (tx, rx) = broadcast::channel(2);
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::EndOfStoredEvents(Cow::Owned(id.clone()))),
+        })
+        .unwrap();
+        let result = relay
+            .inner
+            .handle_auto_closing(
+                &id,
+                &[Filter::new()],
+                SubscribeAutoCloseOptions::default(),
+                rx,
+                &None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result.reason,
+            Some(SubscriptionAutoClosedReason::Completed)
+        ));
+
+        let id = SubscriptionId::new("reached-limit");
+        let (tx, rx) = broadcast::channel(2);
+        let event = EventBuilder::new(Kind::TextNote, "limit")
+            .finalize(&Keys::generate())
+            .unwrap();
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::Event {
+                subscription_id: Cow::Owned(id.clone()),
+                event: Cow::Owned(event),
+            }),
+        })
+        .unwrap();
+        let result = relay
+            .inner
+            .handle_auto_closing(
+                &id,
+                &[Filter::new()],
+                SubscribeAutoCloseOptions::default().exit_policy(ReqExitPolicy::WaitForEvents(1)),
+                rx,
+                &None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result.reason,
+            Some(SubscriptionAutoClosedReason::LimitReached)
+        ));
+    }
 
     #[derive(Debug)]
     struct CountingAdmitPolicy(Arc<AtomicUsize>);

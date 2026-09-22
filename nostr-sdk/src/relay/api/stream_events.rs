@@ -19,10 +19,19 @@ use crate::relay::{
 
 type EventStream = Pin<Box<dyn Stream<Item = Result<Event, Error>> + Send>>;
 
-pub(crate) enum RelayStreamEvent {
+/// An event or endpoint outcome from an auto-closing relay request.
+#[derive(Debug)]
+pub enum RelayStreamEvent {
+    /// An event received from this relay.
     Event(Event),
+    /// The request failed before its exit policy was satisfied.
     Error(Error),
+    /// The relay completed the request according to its exit policy.
+    ///
+    /// This does not establish global or downstream durable completeness.
     Completed,
+    /// The configured event count was reached; more matching events may exist.
+    LimitReached,
 }
 
 /// Stream events
@@ -103,6 +112,17 @@ impl<'relay> StreamEvents<'relay> {
 
         Ok(SubscriptionActivityEventStream::new(rx, cancel_tx))
     }
+
+    /// Stream events together with the relay's terminal outcome.
+    ///
+    /// Unlike awaiting this builder, this method preserves completion and
+    /// limit-reached markers. Dropping the returned stream cancels only this
+    /// request and asks the relay to close its subscription.
+    pub async fn with_outcomes(
+        self,
+    ) -> Result<Pin<Box<dyn Stream<Item = RelayStreamEvent> + Send>>, Error> {
+        Ok(Box::pin(self.into_relay_event_stream().await?))
+    }
 }
 
 impl<'relay> IntoFuture for StreamEvents<'relay> {
@@ -116,7 +136,7 @@ impl<'relay> IntoFuture for StreamEvents<'relay> {
             Ok(Box::pin(stream.filter_map(async |e| match e {
                 RelayStreamEvent::Event(event) => Some(Ok(event)),
                 RelayStreamEvent::Error(e) => Some(Err(e)),
-                RelayStreamEvent::Completed => None,
+                RelayStreamEvent::Completed | RelayStreamEvent::LimitReached => None,
             })) as EventStream)
         })
     }
@@ -170,13 +190,42 @@ impl Stream for SubscriptionActivityEventStream {
                         self.done = true;
                         Poll::Ready(Some(RelayStreamEvent::Error(Error::relay_msg(message))))
                     }
+                    SubscriptionAutoClosedReason::Lagged(skipped) => {
+                        self.done = true;
+                        Poll::Ready(Some(RelayStreamEvent::Error(
+                            tokio::sync::broadcast::error::RecvError::Lagged(skipped).into(),
+                        )))
+                    }
+                    SubscriptionAutoClosedReason::ReceiverClosed => {
+                        self.done = true;
+                        Poll::Ready(Some(RelayStreamEvent::Error(
+                            tokio::sync::broadcast::error::RecvError::Closed.into(),
+                        )))
+                    }
+                    SubscriptionAutoClosedReason::TimedOut => {
+                        self.done = true;
+                        Poll::Ready(Some(RelayStreamEvent::Error(Error::timeout())))
+                    }
+                    SubscriptionAutoClosedReason::Disconnected => {
+                        self.done = true;
+                        Poll::Ready(Some(RelayStreamEvent::Error(Error::not_connected())))
+                    }
+                    SubscriptionAutoClosedReason::LimitReached => {
+                        self.done = true;
+                        Poll::Ready(Some(RelayStreamEvent::LimitReached))
+                    }
                     SubscriptionAutoClosedReason::Completed => {
                         self.done = true;
                         Poll::Ready(Some(RelayStreamEvent::Completed))
                     }
                 },
             },
-            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(None) => {
+                self.done = true;
+                Poll::Ready(Some(RelayStreamEvent::Error(Error::state_msg(
+                    "stream ended without an outcome",
+                ))))
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -192,12 +241,47 @@ mod tests {
     use nostr::key::Keys;
     use nostr::message::{MachineReadablePrefix, SubscriptionId};
 
+    use super::*;
     use crate::authenticator::SignerAuthenticator;
     use crate::local_relay::*;
     use crate::relay::{Relay, RelayOptions, ReqExitPolicy};
     use crate::test_utils::{
         setup_nip42_read_local_relay, setup_relay, setup_relay_with_authenticator,
     };
+
+    #[tokio::test]
+    async fn reporting_stream_preserves_limit_and_receiver_failure() {
+        let (tx, rx) = mpsc::channel(2);
+        let (cancel_tx, _cancel_rx) = oneshot::channel();
+        let mut stream = SubscriptionActivityEventStream::new(rx, cancel_tx);
+
+        tx.send(SubscriptionActivity::Closed(
+            SubscriptionAutoClosedReason::LimitReached,
+        ))
+        .await
+        .unwrap();
+        assert!(matches!(
+            stream.next().await,
+            Some(RelayStreamEvent::LimitReached)
+        ));
+        assert!(stream.next().await.is_none());
+
+        let (tx, rx) = mpsc::channel(2);
+        let (cancel_tx, _cancel_rx) = oneshot::channel();
+        let mut stream = SubscriptionActivityEventStream::new(rx, cancel_tx);
+        tx.send(SubscriptionActivity::Closed(
+            SubscriptionAutoClosedReason::Lagged(6),
+        ))
+        .await
+        .unwrap();
+        match stream.next().await {
+            Some(RelayStreamEvent::Error(error)) => {
+                assert!(error.to_string().contains("lagged"));
+            }
+            other => panic!("expected receiver loss, got {other:?}"),
+        }
+        assert!(stream.next().await.is_none());
+    }
 
     #[tokio::test]
     async fn test_stream_terminates_on_drop() {

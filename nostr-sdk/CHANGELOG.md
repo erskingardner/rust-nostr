@@ -17,8 +17,6 @@
 
 ### Fixed
 
-- Require a correlated COUNT response before `Relay::count_events` returns a
-  count; report receive loss, closure, and rejection instead of returning zero.
 
 ### Removed
 
@@ -34,11 +32,20 @@
 
 ### Added
 
+- Add `StreamEvents::with_outcomes` for relay and client requests so callers
+  can distinguish completion, reached limits, and endpoint errors.
 - Add `Client::notifications_with_gaps` and `Relay::notifications_with_gaps`
   to report receiver-local notification loss while continuing reception.
 - Add `LocalRelay::connections_left` (https://github.com/nostrdevkit/nostr/pull/1459)
 - Add `LocalRelayBuilderNip42::relay_url` to make it possible to configure a custom `relay_url` for the nip42 challenge validation (https://github.com/nostrdevkit/nostr/pull/1476)
 - Add `LocalRelayBuilder::new_event_channel_size` for customizing the size of the channel used to notify new received events
+
+### Fixed
+
+- Require a correlated COUNT response before `Relay::count_events` returns a
+  count; report receive loss, closure, and rejection instead of returning zero.
+- Report receive lag, closure, disconnection, and timeout from auto-closing
+  event requests instead of silently treating them as completed.
 
 ### Deprecated
 
