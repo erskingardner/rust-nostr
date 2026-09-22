@@ -40,7 +40,7 @@ pub use self::status::*;
 use crate::client::ClientNotification;
 use crate::error::Error;
 use crate::shared::SharedState;
-use crate::stream::NotificationStream;
+use crate::stream::{NotificationStream, NotificationUpdate, ReportingNotificationStream};
 
 /// Subscription auto-closed reason
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -213,6 +213,9 @@ impl Relay {
     ///
     /// The stream terminates when the relay shutdowns or is banned.
     ///
+    /// This legacy stream silently skips notifications lost when its receiver
+    /// falls behind. Use [`Relay::notifications_with_gaps`] when coverage matters.
+    ///
     /// <div class="warning">When you call this method, you subscribe to the notifications channel from that precise moment. Anything received by relay/s before that moment is not included in the channel!</div>
     #[inline]
     pub fn notifications(&self) -> Pin<Box<dyn Stream<Item = RelayNotification> + Send>> {
@@ -235,6 +238,43 @@ impl Relay {
                     if let RelayNotification::RelayStatus { status } = &notification {
                         if status.is_banned() || status.is_shutdown() {
                             // Take the sender and send the oneshot notification
+                            if let Some(tx) = tx.take() {
+                                let _ = tx.send(());
+                            }
+                        }
+                    }
+                })
+                .take_until(rx_done),
+        )
+    }
+
+    /// Get a relay notification stream that reports loss to this receiver.
+    ///
+    /// A [`NotificationUpdate::Lagged`] item reports notifications skipped by
+    /// this receiver only. The stream continues after a gap. It starts at the
+    /// moment this method is called and terminates when the relay is shut down
+    /// or banned. Dropping it does not stop the relay.
+    #[inline]
+    pub fn notifications_with_gaps(
+        &self,
+    ) -> Pin<Box<dyn Stream<Item = NotificationUpdate<RelayNotification>> + Send>> {
+        let status = self.status();
+        if status.is_banned() || status.is_shutdown() {
+            return Box::pin(futures::stream::empty());
+        }
+
+        let rx = self.inner.internal_notification_sender.subscribe();
+        let (tx, rx_done) = oneshot::channel();
+        let mut tx: Option<oneshot::Sender<()>> = Some(tx);
+
+        Box::pin(
+            ReportingNotificationStream::new(rx)
+                .inspect(move |update| {
+                    if let NotificationUpdate::Notification(RelayNotification::RelayStatus {
+                        status,
+                    }) = update
+                    {
+                        if status.is_banned() || status.is_shutdown() {
                             if let Some(tx) = tx.take() {
                                 let _ = tx.send(());
                             }
