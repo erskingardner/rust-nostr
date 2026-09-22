@@ -15,6 +15,14 @@ The SDK can be used to build both sides of a nostr application:
 - clients, bots, and services that connect to existing relays;
 - local relays that run inside your process, including mock relays for tests.
 
+For notification consumers that need to detect receiver buffer overflow, use
+`Client::notifications_with_gaps` or `Relay::notifications_with_gaps`. A `Lagged`
+item reports the number of notifications skipped by that receiver; subsequent
+notifications remain available. The count is not a count of unique events, and
+the stream does not establish complete relay history or downstream storage.
+See the [notification gaps example](examples/notification-gaps.rs) for a minimal
+consumer that continues after a gap while marking its coverage invalid.
+
 ## Getting started
 
 ### Client

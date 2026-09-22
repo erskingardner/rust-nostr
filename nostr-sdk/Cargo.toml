@@ -76,6 +76,9 @@ name = "gossip"
 name = "monitor"
 
 [[example]]
+name = "notification-gaps"
+
+[[example]]
 name = "nostr-connect"
 
 [[example]]

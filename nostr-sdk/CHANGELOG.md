@@ -31,6 +31,8 @@
 
 ### Added
 
+- Add `Client::notifications_with_gaps` and `Relay::notifications_with_gaps`
+  to report receiver-local notification loss while continuing reception.
 - Add `LocalRelay::connections_left` (https://github.com/nostrdevkit/nostr/pull/1459)
 - Add `LocalRelayBuilderNip42::relay_url` to make it possible to configure a custom `relay_url` for the nip42 challenge validation (https://github.com/nostrdevkit/nostr/pull/1476)
 - Add `LocalRelayBuilder::new_event_channel_size` for customizing the size of the channel used to notify new received events
