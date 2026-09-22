@@ -24,3 +24,5 @@ mod stream;
 #[cfg(test)]
 mod test_utils;
 pub mod transport;
+
+pub use crate::stream::NotificationUpdate;
