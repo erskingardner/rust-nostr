@@ -1,7 +1,7 @@
 name: Code Coverage
 
-# Generates code coverage reports using cargo-llvm-cov and uploads results to Codecov.
-# Uploads coverage data to Codecov for tracking and produces an HTML report artifact for download.
+# Generates code coverage reports using cargo-llvm-cov and an HTML artifact.
+# Uploads to Codecov only when the workflow runs in the upstream repository.
 
 on:
   push:
@@ -52,6 +52,7 @@ jobs:
           path: target/llvm-cov/html
 
       - name: Upload coverage to Codecov
+        if: github.repository == 'nostrdevkit/nostr'
         uses: codecov/codecov-action@v5
         with:
           files: lcov.info
