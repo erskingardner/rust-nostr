@@ -1905,11 +1905,10 @@ impl InnerRelay {
                                         )),
                                     });
                                 }
-                                // Mark subscription as completed.
-                                //
-                                // If we are arrived at this point,
-                                // means that no error should be occurred,
-                                // so the subscription can be marked as completed.
+                                // Preserve the legacy early-CLOSED shortcut for
+                                // callers that do not request terminal evidence.
+                                // An unprefixed CLOSED alone does not prove that
+                                // the selected exit policy was satisfied.
                                 //
                                 // # Example
                                 //
@@ -1921,7 +1920,13 @@ impl InnerRelay {
                                 None => {
                                     return Some(HandleAutoClosing {
                                         to_close: false,
-                                        reason: Some(SubscriptionAutoClosedReason::Completed),
+                                        reason: Some(if opts.report_relay_closed {
+                                            SubscriptionAutoClosedReason::RelayClosed(
+                                                message.into_owned(),
+                                            )
+                                        } else {
+                                            SubscriptionAutoClosedReason::Completed
+                                        }),
                                     });
                                 }
                             }
@@ -1973,8 +1978,14 @@ impl InnerRelay {
             }
 
             if let ReqExitPolicy::WaitDurationAfterEOSE(duration) = opts.exit_policy {
-                if let Some(reason) =
-                    post_eose_grace(id, duration, &mut notifications, activity).await
+                if let Some(reason) = post_eose_grace(
+                    id,
+                    duration,
+                    &mut notifications,
+                    activity,
+                    opts.report_relay_closed,
+                )
+                .await
                 {
                     return Some(HandleAutoClosing {
                         to_close: true,
@@ -2042,25 +2053,34 @@ async fn post_eose_grace(
     duration: Duration,
     notifications: &mut broadcast::Receiver<RelayNotification>,
     activity: &Option<Sender<SubscriptionActivity>>,
+    report_relay_closed: bool,
 ) -> Option<SubscriptionAutoClosedReason> {
     time::timeout(Some(duration), async {
         loop {
             match notifications.recv().await {
-                Ok(RelayNotification::Message { message }) => {
-                    if let RelayMessage::Event {
+                Ok(RelayNotification::Message { message }) => match *message {
+                    RelayMessage::Event {
                         subscription_id,
                         event,
-                    } = *message
-                    {
-                        if subscription_id.as_ref() == id {
-                            if let Some(activity) = activity {
-                                let _ = activity
-                                    .send(SubscriptionActivity::ReceivedEvent(event.into_owned()))
-                                    .await;
-                            }
+                    } if subscription_id.as_ref() == id => {
+                        if let Some(activity) = activity {
+                            let _ = activity
+                                .send(SubscriptionActivity::ReceivedEvent(event.into_owned()))
+                                .await;
                         }
                     }
-                }
+                    RelayMessage::Closed {
+                        subscription_id,
+                        message,
+                    } if subscription_id.as_ref() == id && report_relay_closed => {
+                        return if MachineReadablePrefix::parse(&message).is_some() {
+                            SubscriptionAutoClosedReason::Closed(message.into_owned())
+                        } else {
+                            SubscriptionAutoClosedReason::RelayClosed(message.into_owned())
+                        };
+                    }
+                    _ => (),
+                },
                 Ok(RelayNotification::RelayStatus { status }) if status.is_disconnected() => {
                     return SubscriptionAutoClosedReason::Disconnected;
                 }
@@ -2178,7 +2198,7 @@ mod tests {
             tx.send(RelayNotification::Authenticated).unwrap();
         }
 
-        let reason = post_eose_grace(&id, Duration::from_secs(2), &mut rx, &None).await;
+        let reason = post_eose_grace(&id, Duration::from_secs(2), &mut rx, &None, true).await;
         assert!(matches!(
             reason,
             Some(SubscriptionAutoClosedReason::Lagged(skipped)) if skipped > 0
@@ -2236,6 +2256,109 @@ mod tests {
         assert!(matches!(
             result.reason,
             Some(SubscriptionAutoClosedReason::LimitReached)
+        ));
+    }
+
+    #[tokio::test]
+    async fn reporting_request_does_not_complete_on_early_unprefixed_closed() {
+        let relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
+        for (policy, message) in [
+            (ReqExitPolicy::ExitOnEOSE, "temporarily unavailable"),
+            (ReqExitPolicy::WaitForEvents(2), ""),
+        ] {
+            let id = SubscriptionId::generate();
+            let (tx, rx) = broadcast::channel(2);
+            tx.send(RelayNotification::Message {
+                message: Box::new(RelayMessage::Closed {
+                    subscription_id: Cow::Owned(id.clone()),
+                    message: Cow::Borrowed(message),
+                }),
+            })
+            .unwrap();
+            let result = relay
+                .inner
+                .handle_auto_closing(
+                    &id,
+                    &[Filter::new()],
+                    SubscribeAutoCloseOptions::default()
+                        .exit_policy(policy)
+                        .report_relay_closed(true),
+                    rx,
+                    &None,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                result.reason,
+                Some(SubscriptionAutoClosedReason::RelayClosed(ref reason)) if reason == message
+            ));
+        }
+
+        let id = SubscriptionId::generate();
+        let (tx, rx) = broadcast::channel(2);
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::Closed {
+                subscription_id: Cow::Owned(id.clone()),
+                message: Cow::Borrowed("legacy shortcut"),
+            }),
+        })
+        .unwrap();
+        let result = relay
+            .inner
+            .handle_auto_closing(
+                &id,
+                &[Filter::new()],
+                SubscribeAutoCloseOptions::default(),
+                rx,
+                &None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result.reason,
+            Some(SubscriptionAutoClosedReason::Completed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn reporting_grace_does_not_complete_on_matching_closed() {
+        let relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
+        let id = SubscriptionId::generate();
+        let (tx, rx) = broadcast::channel(4);
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::EndOfStoredEvents(Cow::Owned(id.clone()))),
+        })
+        .unwrap();
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::Closed {
+                subscription_id: Cow::Owned(SubscriptionId::generate()),
+                message: Cow::Borrowed("unrelated"),
+            }),
+        })
+        .unwrap();
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::Closed {
+                subscription_id: Cow::Owned(id.clone()),
+                message: Cow::Borrowed("grace interrupted"),
+            }),
+        })
+        .unwrap();
+        let result = relay
+            .inner
+            .handle_auto_closing(
+                &id,
+                &[Filter::new()],
+                SubscribeAutoCloseOptions::default()
+                    .exit_policy(ReqExitPolicy::WaitDurationAfterEOSE(Duration::from_secs(2)))
+                    .report_relay_closed(true),
+                rx,
+                &None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result.reason,
+            Some(SubscriptionAutoClosedReason::RelayClosed(ref reason)) if reason == "grace interrupted"
         ));
     }
 

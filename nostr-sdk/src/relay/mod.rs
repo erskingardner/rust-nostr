@@ -49,6 +49,8 @@ enum SubscriptionAutoClosedReason {
     AuthenticationFailed,
     /// Closed
     Closed(String),
+    /// Relay closed the request without satisfying the exit policy.
+    RelayClosed(String),
     /// Notification receiver skipped items
     Lagged(u64),
     /// Notification channel closed before policy completion

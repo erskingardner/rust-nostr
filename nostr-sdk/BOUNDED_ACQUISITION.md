@@ -81,7 +81,9 @@ Unrelated subscriptions on the connection remain registered.
 
 Each relay reports `Completed`, `ExitLimitReached`, `ItemBudgetExceeded`,
 `ByteBudgetExceeded`, `Cancelled`, `TimedOut`, `Disconnected`, `ReceiveLoss`,
-`ReceiverClosed`, `AuthenticationFailed`, `Rejected`, or setup `Failed`.
+`ReceiverClosed`, `AuthenticationFailed`, `Rejected`, `RelayClosed`, or setup
+`Failed`. An unprefixed relay `CLOSED` before the request exit policy is
+satisfied is `RelayClosed`, including during the post-EOSE grace interval.
 Only `Completed` satisfies the chosen request exit policy. This says nothing
 about durable MDK admission or full historical coverage. A configured relay
 count exit policy is incomplete even if the relay stopped normally. There is

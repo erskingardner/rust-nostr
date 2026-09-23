@@ -94,7 +94,8 @@ impl<'relay> StreamEvents<'relay> {
         // Compose auto-closing options
         let opts: SubscribeAutoCloseOptions = SubscribeAutoCloseOptions::default()
             .exit_policy(self.policy)
-            .timeout(self.timeout);
+            .timeout(self.timeout)
+            .report_relay_closed(report_terminal_errors);
 
         // Get or generate a subscription ID
         let id: SubscriptionId = self.id.unwrap_or_else(SubscriptionId::generate);
@@ -198,6 +199,10 @@ impl Stream for SubscriptionActivityEventStream {
                         ))))
                     }
                     SubscriptionAutoClosedReason::Closed(message) => {
+                        self.done = true;
+                        Poll::Ready(Some(RelayStreamEvent::Error(Error::relay_msg(message))))
+                    }
+                    SubscriptionAutoClosedReason::RelayClosed(message) => {
                         self.done = true;
                         Poll::Ready(Some(RelayStreamEvent::Error(Error::relay_msg(message))))
                     }
@@ -314,6 +319,23 @@ mod tests {
             tx.send(SubscriptionActivity::Closed(reason)).await.unwrap();
             assert!(stream.next().await.is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn reporting_stream_does_not_complete_on_early_relay_closed() {
+        let (tx, rx) = mpsc::channel(1);
+        let (cancel_tx, _cancel_rx) = oneshot::channel();
+        let mut stream = SubscriptionActivityEventStream::new(rx, cancel_tx, true);
+        tx.send(SubscriptionActivity::Closed(
+            SubscriptionAutoClosedReason::RelayClosed("temporarily unavailable".to_owned()),
+        ))
+        .await
+        .unwrap();
+        assert!(matches!(
+            stream.next().await,
+            Some(RelayStreamEvent::Error(error)) if error.to_string().contains("temporarily unavailable")
+        ));
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]

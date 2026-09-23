@@ -58,6 +58,8 @@
   leave publication unconfirmed; they do not imply relay rejection.
 - Preserve partial NIP-77 progress in aggregate sync results when one relay
   fails, and clean up request-owned subscriptions on interruption.
+- Report an early unprefixed relay `CLOSED` as incomplete in acquisition and
+  outcome streams.
 - Preserve reconnect requests made while a terminated connection task is still
   releasing ownership, instead of leaving the relay pending with no task.
 - Restore long-lived subscriptions on immediate reconnect even when both

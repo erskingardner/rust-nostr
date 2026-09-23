@@ -100,6 +100,8 @@ pub enum AcquisitionEnd {
     AuthenticationFailed,
     /// The relay sent CLOSED or another subscription error.
     Rejected(String),
+    /// The relay sent an unprefixed CLOSED before the exit policy was satisfied.
+    RelayClosed(String),
     /// Subscription setup failed.
     Failed(Error),
 }
@@ -115,6 +117,7 @@ impl From<SubscriptionAutoClosedReason> for AcquisitionEnd {
             SubscriptionAutoClosedReason::ReceiverClosed => Self::ReceiverClosed,
             SubscriptionAutoClosedReason::AuthenticationFailed => Self::AuthenticationFailed,
             SubscriptionAutoClosedReason::Closed(message) => Self::Rejected(message),
+            SubscriptionAutoClosedReason::RelayClosed(message) => Self::RelayClosed(message),
         }
     }
 }
@@ -292,7 +295,9 @@ pub(crate) async fn acquire_relay(
         result.end = AcquisitionEnd::Failed(error);
         return result;
     }
-    let opts = SubscribeAutoCloseOptions::default().exit_policy(limits.policy);
+    let opts = SubscribeAutoCloseOptions::default()
+        .exit_policy(limits.policy)
+        .report_relay_closed(true);
     relay.inner.spawn_auto_closing_handler(
         id,
         filters,
@@ -405,5 +410,8 @@ mod tests {
     fn relay_receive_loss_is_not_completion() {
         let end = AcquisitionEnd::from(SubscriptionAutoClosedReason::Lagged(7));
         assert!(matches!(end, AcquisitionEnd::ReceiveLoss(7)));
+
+        let end = AcquisitionEnd::from(SubscriptionAutoClosedReason::RelayClosed(String::new()));
+        assert!(matches!(end, AcquisitionEnd::RelayClosed(reason) if reason.is_empty()));
     }
 }
