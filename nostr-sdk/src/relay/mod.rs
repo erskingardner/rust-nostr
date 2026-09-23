@@ -523,10 +523,8 @@ async fn receive_count_reply(
                 }
                 _ => {}
             },
-            Ok(RelayNotification::RelayStatus { status })
-                if status.is_terminated() || status.is_banned() || status.is_shutdown() =>
-            {
-                return Err(Error::state_msg("relay stopped before COUNT response"));
+            Ok(RelayNotification::RelayStatus { status }) if status.is_disconnected() => {
+                return Err(Error::not_connected());
             }
             Ok(_) => {}
             Err(error) => return Err(error.into()),
@@ -613,6 +611,26 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::Other);
         assert!(error.to_string().contains("closed"));
+    }
+
+    #[tokio::test]
+    async fn count_disconnect_is_reported_before_timeout() {
+        let id = SubscriptionId::new("interrupted-count");
+        let (tx, mut notifications) = broadcast::channel(2);
+        tx.send(RelayNotification::RelayStatus {
+            status: RelayStatus::Disconnected,
+        })
+        .unwrap();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            receive_count_reply(&mut notifications, &id),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::State);
+        assert!(error.to_string().contains("not connected"));
     }
 
     #[tokio::test]
