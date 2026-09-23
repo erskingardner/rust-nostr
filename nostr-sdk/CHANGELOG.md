@@ -60,6 +60,8 @@
   fails, and clean up request-owned subscriptions on interruption.
 - Report an early unprefixed relay `CLOSED` as incomplete in acquisition and
   outcome streams.
+- Fail reconciliation if a download batch is rejected or closes before its
+  requested events arrive, while retaining partial progress.
 - Preserve reconnect requests made while a terminated connection task is still
   releasing ownership, instead of leaving the relay pending with no task.
 - Restore long-lived subscriptions on immediate reconnect even when both

@@ -300,13 +300,19 @@ async fn req_neg_events(
     relay: &Relay,
     need_ids: &mut Vec<EventId>,
     in_flight_down: &mut bool,
-    down_sub_id: &SubscriptionId,
+    pending_down_ids: &mut HashSet<EventId>,
+    cleanup: &mut SyncCleanup,
     opts: &SyncOptions,
 ) -> Result<(), Error> {
     // Check if it should skip the download
     if !opts.do_down() || need_ids.is_empty() || *in_flight_down {
         return Ok(());
     }
+
+    // Each batch needs its own ID: a relay may send CLOSED after EOSE, and a
+    // late CLOSED from the previous batch must not terminate the next one.
+    cleanup.down_id = SubscriptionId::generate();
+    let down_sub_id = &cleanup.down_id;
 
     let capacity: usize = cmp::min(need_ids.len(), NEGENTROPY_BATCH_SIZE_DOWN);
     let mut ids: Vec<EventId> = Vec::with_capacity(capacity);
@@ -331,6 +337,7 @@ async fn req_neg_events(
         });
     }
 
+    let requested_ids: HashSet<EventId> = ids.iter().copied().collect();
     let filter = Filter::new().ids(ids);
     let msg: ClientMessage = ClientMessage::Req {
         subscription_id: Cow::Borrowed(down_sub_id),
@@ -352,6 +359,7 @@ async fn req_neg_events(
         return Err(e);
     }
 
+    *pending_down_ids = requested_ids;
     *in_flight_down = true;
 
     Ok(())
@@ -410,20 +418,20 @@ pub(super) async fn sync(
 
     // Send the initial negentropy message
     let sub_id: SubscriptionId = SubscriptionId::generate();
-    let down_sub_id: SubscriptionId = SubscriptionId::generate();
     let open_msg: ClientMessage = ClientMessage::NegOpen {
         subscription_id: Cow::Borrowed(&sub_id),
         filter: Cow::Borrowed(filter),
         initial_message: Cow::Owned(faster_hex::hex_string(&initial_message)),
     };
     relay.send_msg(open_msg).await?;
-    let mut cleanup = SyncCleanup::new(relay, sub_id.clone(), down_sub_id.clone());
+    let mut cleanup = SyncCleanup::new(relay, sub_id.clone(), SubscriptionId::generate());
 
     // Check if negentropy is supported
     check_negentropy_support(&sub_id, opts, &mut temp_notifications).await?;
 
     let mut in_flight_up: HashSet<EventId> = HashSet::new();
     let mut in_flight_down: bool = false;
+    let mut pending_down_ids: HashSet<EventId> = HashSet::new();
     let mut sync_done: bool = false;
     let mut have_ids: Vec<EventId> = Vec::new();
     let mut need_ids: Vec<EventId> = Vec::new();
@@ -513,8 +521,9 @@ pub(super) async fn sync(
                         event,
                     } => {
                         #[allow(clippy::collapsible_match)]
-                        if subscription_id.as_ref() == &down_sub_id {
+                        if subscription_id.as_ref() == &cleanup.down_id {
                             output.received.insert(event.id);
+                            pending_down_ids.remove(&event.id);
 
                             // Relevant to this sync
                             true
@@ -525,15 +534,16 @@ pub(super) async fn sync(
                     }
                     RelayMessage::EndOfStoredEvents(subscription_id) => {
                         #[allow(clippy::collapsible_match)]
-                        if subscription_id.as_ref() == &down_sub_id {
+                        if subscription_id.as_ref() == &cleanup.down_id {
                             in_flight_down = false;
+                            pending_down_ids.clear();
 
                             // Remove subscription
-                            relay.inner.remove_subscription(&down_sub_id).await;
+                            relay.inner.remove_subscription(&cleanup.down_id).await;
 
                             // Close subscription
                             relay
-                                .send_msg(ClientMessage::Close(Cow::Borrowed(&down_sub_id)))
+                                .send_msg(ClientMessage::Close(Cow::Borrowed(&cleanup.down_id)))
                                 .await?;
 
                             // Relevant to this sync
@@ -544,19 +554,27 @@ pub(super) async fn sync(
                         }
                     }
                     RelayMessage::Closed {
-                        subscription_id, ..
+                        subscription_id,
+                        message,
                     } => {
                         #[allow(clippy::collapsible_match)]
-                        if subscription_id.as_ref() == &down_sub_id {
-                            in_flight_down = false;
-
-                            // NOTE: the subscription is removed in the `InnerRelay::handle_relay_message` method,
-                            // so there is no need to try to remove it also here.
-
-                            // Relevant to this sync
-                            true
+                        if subscription_id.as_ref() == &cleanup.down_id && in_flight_down {
+                            // An empty CLOSED can end a finite explicit-ID
+                            // batch only after every requested event arrived.
+                            if message.is_empty() && pending_down_ids.is_empty() {
+                                in_flight_down = false;
+                                true
+                            } else {
+                                return Err(if message.is_empty() {
+                                    Error::relay_msg(
+                                        "download subscription closed before all requested events arrived"
+                                            .to_owned(),
+                                    )
+                                } else {
+                                    Error::relay_msg(message.into_owned())
+                                });
+                            }
                         } else {
-                            // Not relevant to this sync
                             false
                         }
                     }
@@ -571,7 +589,8 @@ pub(super) async fn sync(
                     relay,
                     &mut need_ids,
                     &mut in_flight_down,
-                    &down_sub_id,
+                    &mut pending_down_ids,
+                    &mut cleanup,
                     opts,
                 )
                 .await?;
@@ -692,16 +711,46 @@ impl<'relay> IntoFuture for SyncEvents<'relay> {
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
+    use std::future::Future;
+    use std::net::SocketAddr;
+    use std::pin::Pin;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use nostr::message::MachineReadablePrefix;
     use nostr_memory::prelude::*;
     use tokio::sync::broadcast;
 
     use super::*;
+    use crate::client::Client;
     use crate::error::ErrorKind;
-    use crate::local_relay::*;
+    use crate::local_relay::{LocalRelay, MockRelay, QueryPolicy, QueryPolicyResult};
     use crate::relay::{SyncDirection, SyncOptions};
+
+    #[derive(Debug)]
+    struct RejectDownloadAfter {
+        allowed_batches: usize,
+        seen_batches: AtomicUsize,
+    }
+
+    impl QueryPolicy for RejectDownloadAfter {
+        fn admit_query<'a>(
+            &'a self,
+            query: &'a mut Filter,
+            _addr: &'a SocketAddr,
+        ) -> Pin<Box<dyn Future<Output = QueryPolicyResult> + Send + 'a>> {
+            let reject = query.ids.is_some()
+                && self.seen_batches.fetch_add(1, Ordering::SeqCst) >= self.allowed_batches;
+            Box::pin(async move {
+                if reject {
+                    QueryPolicyResult::reject(MachineReadablePrefix::Blocked, "reads denied")
+                } else {
+                    QueryPolicyResult::Accept
+                }
+            })
+        }
+    }
 
     #[tokio::test]
     async fn cancelled_sync_cleans_only_its_subscription() {
@@ -758,6 +807,68 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::Other);
+    }
+
+    #[tokio::test]
+    async fn rejected_final_download_keeps_partial_progress_and_unrelated_subscription() {
+        for (allowed_batches, event_count) in [(0, 1), (1, NEGENTROPY_BATCH_SIZE_DOWN + 1)] {
+            let local = LocalRelay::builder()
+                .query_policy(RejectDownloadAfter {
+                    allowed_batches,
+                    seen_batches: AtomicUsize::new(0),
+                })
+                .build();
+            local.run().await.unwrap();
+            let keys = Keys::generate();
+            for index in 0..event_count {
+                let event = EventBuilder::new(Kind::TextNote, format!("remote {index}"))
+                    .finalize(&keys)
+                    .unwrap();
+                local.add_event(event).await.unwrap();
+            }
+
+            let url = local.url().await;
+            let client = Client::new();
+            client.add_relay(&url).and_connect().await.unwrap();
+            let relay = client.relay(&url).await.unwrap().unwrap();
+            let unrelated_id = SubscriptionId::generate();
+            relay
+                .subscribe(Filter::new().kind(Kind::Metadata))
+                .with_id(unrelated_id.clone())
+                .await
+                .unwrap();
+
+            let output = client
+                .sync(Filter::new().kind(Kind::TextNote))
+                .with([url.clone()])
+                .opts(
+                    SyncOptions::new()
+                        .initial_timeout(Duration::from_secs(2))
+                        .idle_timeout(Duration::from_secs(2)),
+                )
+                .await
+                .unwrap();
+            assert!(output.success.is_empty());
+            assert!(
+                output.failed[&url].contains("blocked: reads denied"),
+                "allowed_batches={allowed_batches}, failed={:?}",
+                output.failed,
+            );
+            assert_eq!(output.remote.len(), event_count);
+            assert_eq!(
+                output.received.len(),
+                allowed_batches * NEGENTROPY_BATCH_SIZE_DOWN
+            );
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while relay.inner.active_subscription_count().await != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(relay.inner.has_subscription(&unrelated_id).await);
+            client.shutdown().await;
+        }
     }
 
     #[tokio::test]
