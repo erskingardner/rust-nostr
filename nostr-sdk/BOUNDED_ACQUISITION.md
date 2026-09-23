@@ -100,3 +100,25 @@ connection text bytes received, and 1,020 connection text bytes sent (7,715
 total). These are local, deterministic inventory and connection-payload
 measurements, not wire bytes or a general discovery result.
 The counters include reacquisition overhead from the first truncated query.
+
+## Saturation qualification
+
+The focused `acquire_events` tests include a 96-event loopback history with
+8 KiB contents and a stalled caller. With a 64 KiB serialized-event budget,
+the request ends as `ByteBudgetExceeded`, retains no more than seven events,
+and reports the first over-budget EVENT in its received counters. A separate
+live metadata subscription actually receives a new event during the test.
+Another test injects 32 duplicate parsed relay notifications for one active
+request: the 16-item budget stops at the seventeenth notification, with one
+retained event and 15 counted duplicates. This injection measures request and
+notification behavior, not WebSocket traffic.
+
+A four-slot relay notification channel is synchronously filled with EVENTs
+and a trailing EOSE. The request must return `ReceiveLoss`, never `Completed`.
+Controlled registration gates and ongoing loopback traffic exercise cancel
+and drop during setup and while EVENTs arrive. Both paths release only their
+own subscriptions; the unrelated live subscription receives an event after
+cleanup. Tests print cancellation and live-delivery elapsed times and the
+request's retained-state high-water counters. These are local latency samples,
+not service-level guarantees. Run them with
+`cargo test -p nostr-sdk --lib acquire_events -- --nocapture`.

@@ -156,6 +156,8 @@ pub(super) struct AtomicPrivateData {
     connection_task: StdMutex<ConnectionTaskOwnership>,
     #[cfg(test)]
     teardown_hook: StdMutex<Option<Arc<TeardownHook>>>,
+    #[cfg(test)]
+    registration_gate: StdMutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
 }
 
 #[derive(Debug, Default)]
@@ -204,6 +206,8 @@ impl InnerRelay {
                 connection_task: StdMutex::new(ConnectionTaskOwnership::default()),
                 #[cfg(test)]
                 teardown_hook: StdMutex::new(None),
+                #[cfg(test)]
+                registration_gate: StdMutex::new(None),
             }),
             capabilities: Arc::new(AtomicRelayCapabilities::new(capabilities)),
             opts,
@@ -335,6 +339,31 @@ impl InnerRelay {
         self.atomic.subscriptions.read().await.len()
     }
 
+    #[cfg(test)]
+    pub(crate) async fn auto_closing_subscription_id(&self) -> Option<SubscriptionId> {
+        self.atomic
+            .subscriptions
+            .read()
+            .await
+            .iter()
+            .find_map(|(id, data)| data.is_auto_closing.then(|| id.clone()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_notification(&self, notification: RelayNotification) {
+        let _ = self.internal_notification_sender.send(notification);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gate_auto_closing_registration(
+        &self,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        *self.atomic.registration_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
     /// Returns all long-lived (non-auto-closing) subscriptions
     pub async fn subscriptions(&self) -> HashMap<SubscriptionId, Vec<Filter>> {
         let subscription = self.atomic.subscriptions.read().await;
@@ -380,6 +409,13 @@ impl InnerRelay {
         id: SubscriptionId,
         filters: Vec<Filter>,
     ) -> Result<(), Error> {
+        #[cfg(test)]
+        let gate = self.atomic.registration_gate.lock().unwrap().take();
+        #[cfg(test)]
+        if let Some((entered, release)) = gate {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
         let mut subscriptions = self.atomic.subscriptions.write().await;
 
         if subscriptions.contains_key(&id) {

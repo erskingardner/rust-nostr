@@ -128,17 +128,20 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::collections::BTreeSet;
     use std::time::{Duration, Instant};
 
+    use futures::StreamExt;
     use nostr::event::{Event, EventBuilder, EventId, FinalizeEvent, Kind};
     use nostr::filter::Filter;
     use nostr::key::Keys;
+    use nostr::message::RelayMessage;
     use tokio::time::{sleep, timeout};
 
     use super::*;
     use crate::local_relay::MockRelay;
-    use crate::relay::{AcquisitionEnd, ReqExitPolicy};
+    use crate::relay::{AcquisitionEnd, RelayNotification, ReqExitPolicy};
     use crate::test_utils::setup_client;
 
     fn limits(items: usize) -> AcquisitionLimits {
@@ -448,5 +451,434 @@ mod tests {
         other_task.await.unwrap();
         assert!(matches!(report.relays[&url].end, AcquisitionEnd::Cancelled));
         assert_eq!(report.relays[&url].events.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn sustained_large_history_keeps_a_stalled_caller_bounded_and_live_delivery_running() {
+        let relay = MockRelay::run().await.unwrap();
+        let events = (0..96)
+            .map(|index| {
+                EventBuilder::new(Kind::TextNote, format!("{index}:{}", "x".repeat(8_192)))
+                    .finalize(&Keys::generate())
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        for event in &events {
+            relay.add_event(event.clone()).await.unwrap();
+        }
+        let url = relay.url().await;
+        let client = setup_client(url.clone()).await;
+        let connection = client.pool().relay(&url).await.unwrap();
+        let live_id = connection
+            .subscribe(Filter::new().kind(Kind::Metadata))
+            .await
+            .unwrap();
+        let mut live = connection.notifications_with_gaps();
+        let byte_budget = 64 * 1024;
+        let handle = client
+            .acquire_events(
+                ReqTarget::single(&url, [Filter::new().kind(Kind::TextNote).limit(96)]),
+                AcquisitionLimits::new(1, 96, byte_budget, Duration::from_secs(5)),
+            )
+            .await
+            .unwrap();
+
+        // The caller does not poll its handle during the history burst.
+        sleep(Duration::from_millis(50)).await;
+        let live_event = EventBuilder::new(Kind::Metadata, "live during acquisition")
+            .finalize(&Keys::generate())
+            .unwrap();
+        let control_started = Instant::now();
+        relay.add_event(live_event.clone()).await.unwrap();
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(crate::stream::NotificationUpdate::Notification(
+                    RelayNotification::Event {
+                        subscription_id,
+                        event,
+                    },
+                )) = live.next().await
+                {
+                    if subscription_id == live_id && event.id == live_event.id {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let control_latency = control_started.elapsed();
+        let report = timeout(Duration::from_secs(2), handle.finish())
+            .await
+            .unwrap()
+            .unwrap();
+        let result = &report.relays[&url];
+        assert!(matches!(result.end, AcquisitionEnd::ByteBudgetExceeded));
+        assert!(result.events.len() < events.len());
+        assert!(result.high_water_event_bytes <= byte_budget);
+        assert!(result.high_water_items <= result.received_items);
+        assert!(result.received_event_bytes > byte_budget);
+        assert!(connection.inner.subscription(&live_id).await.is_some());
+        eprintln!(
+            "large history: received_items={} received_serialized_event_bytes={} retained_items={} retained_serialized_event_bytes={} live_delivery_latency={control_latency:?}",
+            result.received_items,
+            result.received_event_bytes,
+            result.high_water_items,
+            result.high_water_event_bytes,
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_burst_exhausts_item_budget_without_growing_deduplication() {
+        let relay = MockRelay::run().await.unwrap();
+        let url = relay.url().await;
+        let client = setup_client(url.clone()).await;
+        let connection = client.pool().relay(&url).await.unwrap();
+        let handle = client
+            .acquire_events(
+                ReqTarget::single(&url, [Filter::new().kind(Kind::TextNote)]),
+                AcquisitionLimits::new(1, 16, 1_000_000, Duration::from_secs(5))
+                    .policy(ReqExitPolicy::WaitDurationAfterEOSE(Duration::from_secs(5))),
+            )
+            .await
+            .unwrap();
+        let id = timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(id) = connection.inner.auto_closing_subscription_id().await {
+                    break id;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let repeated = EventBuilder::new(Kind::TextNote, "duplicate burst")
+            .finalize(&Keys::generate())
+            .unwrap();
+        let event_bytes = repeated.as_json().len();
+        for _ in 0..32 {
+            connection
+                .inner
+                .inject_notification(RelayNotification::Message {
+                    message: Box::new(RelayMessage::Event {
+                        subscription_id: Cow::Owned(id.clone()),
+                        event: Cow::Owned(repeated.clone()),
+                    }),
+                });
+        }
+        let result = timeout(Duration::from_secs(2), handle.finish())
+            .await
+            .unwrap()
+            .unwrap();
+        let result = &result.relays[&url];
+        assert!(matches!(result.end, AcquisitionEnd::ItemBudgetExceeded));
+        assert_eq!(result.received_items, 17);
+        assert_eq!(result.duplicates, 15);
+        assert_eq!(result.high_water_items, 1);
+        assert_eq!(result.high_water_event_bytes, event_bytes);
+        assert_eq!(result.received_event_bytes, 17 * event_bytes);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn receive_loss_before_eose_cannot_complete_acquisition() {
+        let relay = MockRelay::run().await.unwrap();
+        let url = relay.url().await;
+        let client = Client::new();
+        client
+            .add_relay(&url)
+            .notification_channel_size(4)
+            .await
+            .unwrap();
+        client
+            .try_connect_relay(&url, Duration::from_secs(3))
+            .await
+            .unwrap();
+        let connection = client.pool().relay(&url).await.unwrap();
+        let handle = client
+            .acquire_events(
+                ReqTarget::single(&url, [Filter::new().kind(Kind::TextNote)]),
+                AcquisitionLimits::new(1, 1_000, 1_000_000, Duration::from_secs(5))
+                    .policy(ReqExitPolicy::WaitDurationAfterEOSE(Duration::from_secs(5))),
+            )
+            .await
+            .unwrap();
+        let id = timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(id) = connection.inner.auto_closing_subscription_id().await {
+                    break id;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let repeated = EventBuilder::new(Kind::TextNote, "saturate")
+            .finalize(&Keys::generate())
+            .unwrap();
+        // This current-thread burst cannot be drained until the final EOSE is queued.
+        // Injection is at the parsed relay notification boundary, so no wire-byte
+        // measurement is implied.
+        for _ in 0..64 {
+            connection
+                .inner
+                .inject_notification(RelayNotification::Message {
+                    message: Box::new(RelayMessage::Event {
+                        subscription_id: Cow::Owned(id.clone()),
+                        event: Cow::Owned(repeated.clone()),
+                    }),
+                });
+        }
+        connection
+            .inner
+            .inject_notification(RelayNotification::Message {
+                message: Box::new(RelayMessage::EndOfStoredEvents(Cow::Owned(id))),
+            });
+        let report = timeout(Duration::from_secs(2), handle.finish())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            report.relays[&url].end,
+            AcquisitionEnd::ReceiveLoss(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_drop_during_live_traffic_release_only_their_requests() {
+        let relay = MockRelay::run().await.unwrap();
+        let url = relay.url().await;
+        let client = setup_client(url.clone()).await;
+        let connection = client.pool().relay(&url).await.unwrap();
+        let live_id = connection
+            .subscribe(Filter::new().kind(Kind::Metadata))
+            .await
+            .unwrap();
+        let baseline = connection.inner.active_subscription_count().await;
+        let mut notifications = connection.notifications_with_gaps();
+        let limits = AcquisitionLimits::new(1, 1_000, 2_000_000, Duration::from_secs(5))
+            .policy(ReqExitPolicy::WaitDurationAfterEOSE(Duration::from_secs(5)));
+        let handle = client
+            .acquire_events(
+                ReqTarget::single(&url, [Filter::new().kind(Kind::TextNote)]),
+                limits,
+            )
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            while connection.inner.active_subscription_count().await <= baseline {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let producer = tokio::spawn({
+            let relay = relay.clone();
+            async move {
+                let keys = Keys::generate();
+                for index in 0..128 {
+                    let event = EventBuilder::new(
+                        Kind::TextNote,
+                        format!("traffic-{index}-{}", "x".repeat(512)),
+                    )
+                    .finalize(&keys)
+                    .unwrap();
+                    relay.add_event(event).await.unwrap();
+                    sleep(Duration::from_millis(2)).await;
+                }
+            }
+        });
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(crate::stream::NotificationUpdate::Notification(
+                    RelayNotification::Event { event, .. },
+                )) = notifications.next().await
+                {
+                    if event.kind == Kind::TextNote {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let during_pressure = EventBuilder::new(Kind::Metadata, "live while history flows")
+            .finalize(&Keys::generate())
+            .unwrap();
+        let control_started = Instant::now();
+        relay.add_event(during_pressure.clone()).await.unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(crate::stream::NotificationUpdate::Notification(
+                    RelayNotification::Event {
+                        subscription_id,
+                        event,
+                    },
+                )) = notifications.next().await
+                {
+                    if subscription_id == live_id && event.id == during_pressure.id {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let control_latency = control_started.elapsed();
+        assert!(
+            !producer.is_finished(),
+            "traffic must continue during control delivery"
+        );
+        let started = Instant::now();
+        handle.cancel();
+        let report = timeout(Duration::from_secs(1), handle.finish())
+            .await
+            .unwrap()
+            .unwrap();
+        let cancel_latency = started.elapsed();
+        let result = &report.relays[&url];
+        assert!(matches!(result.end, AcquisitionEnd::Cancelled));
+        assert!(result.received_items > 0);
+        timeout(Duration::from_secs(1), async {
+            while connection.inner.active_subscription_count().await != baseline {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let dropped = client
+            .acquire_events(
+                ReqTarget::single(&url, [Filter::new().kind(Kind::TextNote)]),
+                limits,
+            )
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), async {
+            while connection.inner.active_subscription_count().await <= baseline {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let drop_started = Instant::now();
+        drop(dropped);
+        timeout(Duration::from_secs(1), async {
+            while connection.inner.active_subscription_count().await != baseline {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let drop_latency = drop_started.elapsed();
+        assert!(
+            !producer.is_finished(),
+            "traffic must still be active at cleanup"
+        );
+        let control = EventBuilder::new(Kind::Metadata, "still live")
+            .finalize(&Keys::generate())
+            .unwrap();
+        relay.add_event(control.clone()).await.unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(crate::stream::NotificationUpdate::Notification(
+                    RelayNotification::Event {
+                        subscription_id,
+                        event,
+                    },
+                )) = notifications.next().await
+                {
+                    if subscription_id == live_id && event.id == control.id {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        producer.await.unwrap();
+        eprintln!(
+            "active traffic cleanup: control_latency={control_latency:?} cancel_latency={cancel_latency:?} drop_latency={drop_latency:?} partial_items={} live_delivery=true",
+            result.received_items
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_drop_during_registration_leave_no_request_subscription() {
+        let relay = MockRelay::run().await.unwrap();
+        let url = relay.url().await;
+        let client = setup_client(url.clone()).await;
+        let connection = client.pool().relay(&url).await.unwrap();
+        let live_id = connection
+            .subscribe(Filter::new().kind(Kind::Metadata))
+            .await
+            .unwrap();
+        let baseline = connection.inner.active_subscription_count().await;
+
+        let (entered, release) = connection.inner.gate_auto_closing_registration();
+        let handle = client
+            .acquire_events(
+                ReqTarget::single(&url, [Filter::new().kind(Kind::TextNote)]),
+                limits(10),
+            )
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        let started = Instant::now();
+        handle.cancel();
+        let report = timeout(Duration::from_secs(1), handle.finish())
+            .await
+            .unwrap()
+            .unwrap();
+        let cancel_latency = started.elapsed();
+        assert!(matches!(report.relays[&url].end, AcquisitionEnd::Cancelled));
+        let _ = release.send(());
+        assert_eq!(connection.inner.active_subscription_count().await, baseline);
+
+        let (entered, release) = connection.inner.gate_auto_closing_registration();
+        let handle = client
+            .acquire_events(
+                ReqTarget::single(&url, [Filter::new().kind(Kind::TextNote)]),
+                limits(10),
+            )
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), entered)
+            .await
+            .unwrap()
+            .unwrap();
+        let started = Instant::now();
+        drop(handle);
+        let drop_latency = started.elapsed();
+        let _ = release.send(());
+        assert_eq!(connection.inner.active_subscription_count().await, baseline);
+
+        let mut notifications = connection.notifications_with_gaps();
+        let control = EventBuilder::new(Kind::Metadata, "setup cleanup live")
+            .finalize(&Keys::generate())
+            .unwrap();
+        relay.add_event(control.clone()).await.unwrap();
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(crate::stream::NotificationUpdate::Notification(
+                    RelayNotification::Event {
+                        subscription_id,
+                        event,
+                    },
+                )) = notifications.next().await
+                {
+                    if subscription_id == live_id && event.id == control.id {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        eprintln!(
+            "registration cleanup: cancel_latency={cancel_latency:?} drop_latency={drop_latency:?} live_delivery=true"
+        );
     }
 }
