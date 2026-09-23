@@ -2,8 +2,8 @@ use std::borrow::Cow;
 use std::cmp;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
 use async_utility::{task, time};
@@ -105,12 +105,19 @@ impl RelayChannels {
     pub fn terminate(&self) {
         self.terminate.notify_one()
     }
+
+    fn clear_termination_permit(&self) {
+        let mut notified = std::pin::pin!(self.terminate.notified());
+        // `enable` consumes a stored permit, if any. The old task no longer
+        // waits for it when its replacement is reserved.
+        let _ = notified.as_mut().enable();
+    }
 }
 
 #[derive(Debug)]
 struct SubscriptionData {
     pub filters: Vec<Filter>,
-    pub subscribed_at: Timestamp,
+    pub subscribed_connection: usize,
     pub is_auto_closing: bool,
     /// Received EOSE msg
     pub received_eose: bool,
@@ -122,10 +129,10 @@ struct SubscriptionData {
 
 impl SubscriptionData {
     #[inline]
-    fn long_lived(filters: Vec<Filter>) -> Self {
+    fn long_lived(filters: Vec<Filter>, subscribed_connection: usize) -> Self {
         Self {
             filters,
-            subscribed_at: Timestamp::now(),
+            subscribed_connection,
             is_auto_closing: false,
             received_eose: false,
             received_events: AtomicUsize::new(0),
@@ -137,7 +144,7 @@ impl SubscriptionData {
     fn auto_closing(filters: Vec<Filter>) -> Self {
         Self {
             filters,
-            subscribed_at: Timestamp::zero(),
+            subscribed_connection: 0,
             is_auto_closing: true,
             received_eose: false,
             received_events: AtomicUsize::new(0),
@@ -153,7 +160,26 @@ pub(super) struct AtomicPrivateData {
     status: AtomicRelayStatus,
     channels: RelayChannels,
     subscriptions: RwLock<HashMap<SubscriptionId, SubscriptionData>>,
-    running: AtomicBool,
+    connection_task: StdMutex<ConnectionTaskOwnership>,
+    #[cfg(test)]
+    teardown_hook: StdMutex<Option<Arc<TeardownHook>>>,
+    #[cfg(test)]
+    registration_gate: StdMutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
+}
+
+#[derive(Debug, Default)]
+struct ConnectionTaskOwnership {
+    running: bool,
+    restart_requested: bool,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct TeardownHook {
+    started: Notify,
+    entered: Notify,
+    release: Notify,
+    finished: Notify,
 }
 
 #[derive(Debug, Clone)]
@@ -184,7 +210,11 @@ impl InnerRelay {
                 status: AtomicRelayStatus::default(),
                 channels: RelayChannels::new(),
                 subscriptions: RwLock::new(HashMap::new()),
-                running: AtomicBool::new(false),
+                connection_task: StdMutex::new(ConnectionTaskOwnership::default()),
+                #[cfg(test)]
+                teardown_hook: StdMutex::new(None),
+                #[cfg(test)]
+                registration_gate: StdMutex::new(None),
             }),
             capabilities: Arc::new(AtomicRelayCapabilities::new(capabilities)),
             opts,
@@ -209,8 +239,9 @@ impl InnerRelay {
 
     /// Check if the connection task is running
     #[inline]
+    #[cfg(test)]
     pub(super) fn is_running(&self) -> bool {
-        self.atomic.running.load(Ordering::SeqCst)
+        self.atomic.connection_task.lock().unwrap().running
     }
 
     #[inline]
@@ -310,6 +341,36 @@ impl InnerRelay {
         subscription.contains_key(id)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn active_subscription_count(&self) -> usize {
+        self.atomic.subscriptions.read().await.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn auto_closing_subscription_id(&self) -> Option<SubscriptionId> {
+        self.atomic
+            .subscriptions
+            .read()
+            .await
+            .iter()
+            .find_map(|(id, data)| data.is_auto_closing.then(|| id.clone()))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_notification(&self, notification: RelayNotification) {
+        let _ = self.internal_notification_sender.send(notification);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gate_auto_closing_registration(
+        &self,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        *self.atomic.registration_gate.lock().unwrap() = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
     /// Returns all long-lived (non-auto-closing) subscriptions
     pub async fn subscriptions(&self) -> HashMap<SubscriptionId, Vec<Filter>> {
         let subscription = self.atomic.subscriptions.read().await;
@@ -341,7 +402,10 @@ impl InnerRelay {
             return Err(Error::invalid_msg("subscription ID already exists"));
         }
 
-        subscriptions.insert(id, SubscriptionData::long_lived(filters));
+        subscriptions.insert(
+            id,
+            SubscriptionData::long_lived(filters, self.stats.success()),
+        );
 
         Ok(())
     }
@@ -352,6 +416,13 @@ impl InnerRelay {
         id: SubscriptionId,
         filters: Vec<Filter>,
     ) -> Result<(), Error> {
+        #[cfg(test)]
+        let gate = self.atomic.registration_gate.lock().unwrap().take();
+        #[cfg(test)]
+        if let Some((entered, release)) = gate {
+            let _ = entered.send(());
+            let _ = release.await;
+        }
         let mut subscriptions = self.atomic.subscriptions.write().await;
 
         if subscriptions.contains_key(&id) {
@@ -367,7 +438,7 @@ impl InnerRelay {
         &self,
         id: &SubscriptionId,
         filters: Vec<Filter>,
-        update_subscribed_at: bool,
+        mark_subscribed: bool,
     ) -> Result<(), Error> {
         let mut subscriptions = self.atomic.subscriptions.write().await;
         let data = subscriptions
@@ -375,8 +446,8 @@ impl InnerRelay {
             .ok_or_else(|| Error::not_found("subscription not found"))?;
         data.filters = filters;
 
-        if update_subscribed_at {
-            data.subscribed_at = Timestamp::now();
+        if mark_subscribed {
+            data.subscribed_connection = self.stats.success();
             data.closed = false;
         }
 
@@ -419,20 +490,21 @@ impl InnerRelay {
         let subscriptions = self.atomic.subscriptions.read().await;
         match subscriptions.get(id) {
             Some(SubscriptionData {
-                subscribed_at,
+                subscribed_connection,
                 closed,
                 is_auto_closing: false,
                 ..
             }) => {
                 // Never subscribed -> SHOULD subscribe
                 // Subscription closed by relay -> SHOULD subscribe
-                if subscribed_at.is_zero() || *closed {
+                if *closed {
                     return true;
                 }
 
-                // First connection and subscribed_at != 0 -> SHOULD NOT re-subscribe
-                // Many connections and subscription NOT done in current websocket session -> SHOULD re-subscribe
-                self.stats.connected_at() > *subscribed_at && self.stats.success() > 1
+                // A request queued before the first connection is already in the
+                // outbound channel. Later connections must restore it once.
+                let current_connection = self.stats.success();
+                current_connection > 1 && current_connection > *subscribed_connection
             }
             // NOT subscribe if auto-closing subscription or subscription not found
             Some(SubscriptionData {
@@ -548,47 +620,81 @@ impl InnerRelay {
 
         tracing::debug!(url = %self.url, "Waking up sleeping relay.");
 
-        // Update status to pending
-        // TODO: is this needed here?
-        self.set_status(RelayStatus::Pending, false);
-
-        // Spawn a new connection task
-        self.spawn_connection_task(None);
+        self.request_connect();
 
         // Update the wake-up timestamp
         self.stats.just_woke_up();
     }
 
-    pub(super) fn spawn_connection_task(&self, stream: Option<(WebSocketSink, WebSocketStream)>) {
-        // Check if the connection task is already running
-        // This is checked also later, but it's checked also here to avoid a full-clone if we know that is already running.
-        if self.is_running() {
-            tracing::warn!(url = %self.url, "Connection task is already running.");
+    pub(super) fn reserve_try_connect(&self) -> Result<bool, Error> {
+        let mut ownership = self.atomic.connection_task.lock().unwrap();
+        let status = self.status();
+        if status.is_shutdown() {
+            return Err(Error::shutdown());
+        }
+        if status.is_banned() {
+            return Err(Error::banned());
+        }
+        if !status.can_connect() {
+            return Ok(false);
+        }
+        if ownership.running {
+            ownership.restart_requested = true;
+            self.set_status(RelayStatus::Pending, false);
+            return Err(Error::state_msg(
+                "previous connection task is stopping; reconnect queued",
+            ));
+        }
+        self.atomic.channels.clear_termination_permit();
+        ownership.running = true;
+        self.set_status(RelayStatus::Pending, false);
+        Ok(true)
+    }
+
+    pub(super) fn spawn_reserved_connection_task(&self, stream: (WebSocketSink, WebSocketStream)) {
+        task::spawn(self.clone().connection_task(Some(stream)));
+    }
+
+    pub(super) fn finish_reserved_connection_task(&self) {
+        if self.status() == RelayStatus::Connecting {
+            self.set_status(RelayStatus::Terminated, false);
+        }
+        self.finish_connection_task();
+    }
+
+    pub(super) fn request_connect(&self) {
+        let mut ownership = self.atomic.connection_task.lock().unwrap();
+        if !self.status().can_connect() {
             return;
         }
 
-        // Full-clone
-        let relay: InnerRelay = self.clone();
+        self.set_status(RelayStatus::Pending, false);
+        if ownership.running {
+            ownership.restart_requested = true;
+            return;
+        }
 
-        // Spawn task
-        task::spawn(relay.connection_task(stream));
+        self.atomic.channels.clear_termination_permit();
+        ownership.running = true;
+        drop(ownership);
+        task::spawn(self.clone().connection_task(None));
     }
 
-    /// This **MUST** be called only by the [`InnerRelay::spawn_connection_task`] method!
+    /// This **MUST** be called only after connection-task ownership is reserved.
     async fn connection_task(self, mut stream: Option<(WebSocketSink, WebSocketStream)>) {
-        // Set the connection task as running and get the previous value.
-        let is_running: bool = self.atomic.running.swap(true, Ordering::SeqCst);
-
-        // Re-check if the connection task is already running.
-        // This is required because may happen that two tasks are spawned at the exact same moment.
-        // Not use the "assert" macro since will cause the task to panic.
-        if is_running {
-            tracing::warn!(url = %self.url, "Connection task is already running.");
+        let status = self.status();
+        if status.is_terminated() || status.is_banned() || status.is_shutdown() {
+            self.finish_connection_task();
             return;
         }
 
         // Lock receiver
         let mut rx_nostr = self.atomic.channels.rx_nostr().await;
+
+        #[cfg(test)]
+        if let Some(hook) = self.atomic.teardown_hook.lock().unwrap().as_ref() {
+            hook.started.notify_one();
+        }
 
         // Last websocket error
         // Store it to avoid printing every time the same connection error
@@ -620,6 +726,18 @@ impl InnerRelay {
 
             // Get status
             let status: RelayStatus = self.status();
+
+            // A connect requested during teardown belongs to a replacement
+            // task. Do not turn it into an ordinary delayed retry here.
+            if self
+                .atomic
+                .connection_task
+                .lock()
+                .unwrap()
+                .restart_requested
+            {
+                break;
+            }
 
             // If the relay is terminated, banned or sleeping, break the loop.
             if status.is_terminated()
@@ -664,10 +782,46 @@ impl InnerRelay {
             }
         }
 
-        // Mark the connection task as stopped.
-        self.atomic.running.store(false, Ordering::SeqCst);
+        drop(rx_nostr);
+
+        #[cfg(test)]
+        let hook = self.atomic.teardown_hook.lock().unwrap().take();
+        #[cfg(test)]
+        if let Some(hook) = hook.as_ref() {
+            hook.entered.notify_one();
+            hook.release.notified().await;
+        }
+
+        self.finish_connection_task();
+
+        #[cfg(test)]
+        if let Some(hook) = hook {
+            hook.finished.notify_one();
+        }
 
         tracing::debug!(url = %self.url, "Auto connect loop terminated.");
+    }
+
+    fn finish_connection_task(&self) {
+        let mut ownership = self.atomic.connection_task.lock().unwrap();
+        let status = self.status();
+        let restart = ownership.restart_requested
+            && !status.is_banned()
+            && !status.is_shutdown()
+            && !status.is_sleeping();
+
+        ownership.restart_requested = false;
+        if restart {
+            if status.is_terminated() {
+                self.set_status(RelayStatus::Pending, false);
+            }
+            self.atomic.channels.clear_termination_permit();
+            // Keep ownership reserved until the replacement task starts.
+            drop(ownership);
+            task::spawn(self.clone().connection_task(None));
+        } else {
+            ownership.running = false;
+        }
     }
 
     /// Depending on attempts and success, use default or incremental retry interval
@@ -720,8 +874,18 @@ impl InnerRelay {
         timeout: Duration,
         status_on_failure: RelayStatus,
     ) -> Result<(WebSocketSink, WebSocketStream), Error> {
-        // Update status
-        self.set_status(RelayStatus::Connecting, true);
+        {
+            let ownership = self.atomic.connection_task.lock().unwrap();
+            let status = self.status();
+            if ownership.restart_requested
+                || status.is_terminated()
+                || status.is_banned()
+                || status.is_shutdown()
+            {
+                return Err(Error::state_msg("connection attempt superseded"));
+            }
+            self.set_status(RelayStatus::Connecting, true);
+        }
 
         // Increase the attempts
         self.stats.new_attempt();
@@ -740,7 +904,12 @@ impl InnerRelay {
             // Connect
             res = fut => match res {
                 Some(Ok((ws_tx, ws_rx))) => {
-                    // Update status
+                    // A disconnect or replacement request may have superseded
+                    // this dial while the transport was connecting.
+                    let _ownership = self.atomic.connection_task.lock().unwrap();
+                    if self.status() != RelayStatus::Connecting {
+                        return Err(Error::state_msg("connection attempt superseded"));
+                    }
                     self.set_status(RelayStatus::Connected, true);
 
                     // Increment success stats
@@ -749,15 +918,19 @@ impl InnerRelay {
                     Ok((ws_tx, ws_rx))
                 }
                 Some(Err(e)) => {
-                    // Update status
-                    self.set_status(status_on_failure, false);
+                    let _ownership = self.atomic.connection_task.lock().unwrap();
+                    if self.status() == RelayStatus::Connecting {
+                        self.set_status(status_on_failure, false);
+                    }
 
                     // Return error
                     Err(Error::transport(e))
                 }
                 None => {
-                    // Update status
-                    self.set_status(status_on_failure, false);
+                    let _ownership = self.atomic.connection_task.lock().unwrap();
+                    if self.status() == RelayStatus::Connecting {
+                        self.set_status(status_on_failure, false);
+                    }
 
                     // Return error
                     Err(Error::timeout())
@@ -1331,6 +1504,7 @@ impl InnerRelay {
     }
 
     pub fn disconnect(&self) {
+        let mut ownership = self.atomic.connection_task.lock().unwrap();
         let status = self.status();
 
         // Check if it's already terminated, banned or shutdown
@@ -1343,9 +1517,11 @@ impl InnerRelay {
 
         // Update status
         self.set_status(RelayStatus::Terminated, true);
+        ownership.restart_requested = false;
     }
 
     pub fn ban(&self) {
+        let mut ownership = self.atomic.connection_task.lock().unwrap();
         let status = self.status();
 
         // Check if it's already terminated, banned or shutdown
@@ -1358,9 +1534,11 @@ impl InnerRelay {
 
         // Update status
         self.set_status(RelayStatus::Banned, true);
+        ownership.restart_requested = false;
     }
 
     pub(super) fn shutdown(&self) {
+        let mut ownership = self.atomic.connection_task.lock().unwrap();
         let status = self.status();
 
         // Check if it's already terminated, banned or shutdown
@@ -1373,6 +1551,7 @@ impl InnerRelay {
 
         // Update status
         self.set_status(RelayStatus::Shutdown, true);
+        ownership.restart_requested = false;
     }
 
     #[inline]
@@ -1470,7 +1649,8 @@ impl InnerRelay {
         timeout: Duration,
     ) -> Result<(bool, String), Error> {
         time::timeout(Some(timeout), async {
-            while let Ok(notification) = notifications.recv().await {
+            loop {
+                let notification = notifications.recv().await.map_err(Error::from)?;
                 match notification {
                     RelayNotification::Message { message } => {
                         if let RelayMessage::Ok {
@@ -1491,8 +1671,6 @@ impl InnerRelay {
                     _ => (),
                 }
             }
-
-            Err(Error::state_msg("premature exit"))
         })
         .await
         .ok_or_else(Error::timeout)?
@@ -1569,6 +1747,13 @@ impl InnerRelay {
                 // Timeout
                 None => {
                     tracing::warn!(id = %id, "Timeout reached for subscription, auto-closing.");
+                    if let Some(activity) = &activity {
+                        let _ = activity
+                            .send(SubscriptionActivity::Closed(
+                                SubscriptionAutoClosedReason::TimedOut,
+                            ))
+                            .await;
+                    }
                     true
                 }
             };
@@ -1607,19 +1792,39 @@ impl InnerRelay {
             let mut received_eose: bool = false;
             let mut require_resubscription: bool = false;
             let mut last_event: Option<Instant> = None;
+            let mut exit_reason = SubscriptionAutoClosedReason::Completed;
 
             // Listen to notifications with timeout
-            // If no notification is received within no-events timeout, `None` is returned.
-            while let Ok(notification) =
-                time::timeout(opts.idle_timeout, notifications.recv()).await?
-            {
+            loop {
+                let notification =
+                    match time::timeout(opts.idle_timeout, notifications.recv()).await {
+                        Some(Ok(notification)) => notification,
+                        Some(Err(broadcast::error::RecvError::Lagged(skipped))) => {
+                            return Some(HandleAutoClosing {
+                                to_close: true,
+                                reason: Some(SubscriptionAutoClosedReason::Lagged(skipped)),
+                            });
+                        }
+                        Some(Err(broadcast::error::RecvError::Closed)) => {
+                            return Some(HandleAutoClosing {
+                                to_close: false,
+                                reason: Some(SubscriptionAutoClosedReason::ReceiverClosed),
+                            });
+                        }
+                        None => {
+                            return Some(HandleAutoClosing {
+                                to_close: true,
+                                reason: Some(SubscriptionAutoClosedReason::TimedOut),
+                            });
+                        }
+                    };
                 // Check if no-events timeout is reached
                 if let (Some(idle_timeout), Some(last_event)) = (opts.idle_timeout, last_event) {
                     if last_event.elapsed() > idle_timeout {
                         // Close the subscription
                         return Some(HandleAutoClosing {
                             to_close: true,
-                            reason: None,
+                            reason: Some(SubscriptionAutoClosedReason::TimedOut),
                         });
                     }
                 }
@@ -1648,12 +1853,14 @@ impl InnerRelay {
                                 ReqExitPolicy::WaitForEvents(num) => {
                                     wait_for_events_counter += 1;
                                     if wait_for_events_counter >= num {
+                                        exit_reason = SubscriptionAutoClosedReason::LimitReached;
                                         break;
                                     }
                                 }
                                 ReqExitPolicy::WaitForEventsAfterEOSE(num) if received_eose => {
                                     wait_for_events_after_eose_counter += 1;
                                     if wait_for_events_after_eose_counter >= num {
+                                        exit_reason = SubscriptionAutoClosedReason::LimitReached;
                                         break;
                                     }
                                 }
@@ -1698,11 +1905,10 @@ impl InnerRelay {
                                         )),
                                     });
                                 }
-                                // Mark subscription as completed.
-                                //
-                                // If we are arrived at this point,
-                                // means that no error should be occurred,
-                                // so the subscription can be marked as completed.
+                                // Preserve the legacy early-CLOSED shortcut for
+                                // callers that do not request terminal evidence.
+                                // An unprefixed CLOSED alone does not prove that
+                                // the selected exit policy was satisfied.
                                 //
                                 // # Example
                                 //
@@ -1714,7 +1920,13 @@ impl InnerRelay {
                                 None => {
                                     return Some(HandleAutoClosing {
                                         to_close: false,
-                                        reason: Some(SubscriptionAutoClosedReason::Completed),
+                                        reason: Some(if opts.report_relay_closed {
+                                            SubscriptionAutoClosedReason::RelayClosed(
+                                                message.into_owned(),
+                                            )
+                                        } else {
+                                            SubscriptionAutoClosedReason::Completed
+                                        }),
                                     });
                                 }
                             }
@@ -1758,7 +1970,7 @@ impl InnerRelay {
                     RelayNotification::RelayStatus { status } if status.is_disconnected() => {
                         return Some(HandleAutoClosing {
                             to_close: false, // No need to send CLOSE msg
-                            reason: None,
+                            reason: Some(SubscriptionAutoClosedReason::Disconnected),
                         });
                     }
                     _ => (),
@@ -1766,45 +1978,25 @@ impl InnerRelay {
             }
 
             if let ReqExitPolicy::WaitDurationAfterEOSE(duration) = opts.exit_policy {
-                time::timeout(Some(duration), async {
-                    while let Ok(notification) = notifications.recv().await {
-                        match notification {
-                            RelayNotification::Message { message } => {
-                                if let RelayMessage::Event {
-                                    subscription_id,
-                                    event,
-                                } = *message
-                                {
-                                    if subscription_id.as_ref() == id {
-                                        // Send activity
-                                        if let Some(activity) = activity {
-                                            // TODO: handle error?
-                                            let _ = activity
-                                                .send(SubscriptionActivity::ReceivedEvent(
-                                                    event.into_owned(),
-                                                ))
-                                                .await;
-                                        }
-                                    }
-                                }
-                            }
-                            RelayNotification::RelayStatus { status }
-                                if status.is_disconnected() =>
-                            {
-                                return Ok(());
-                            }
-                            _ => (),
-                        }
-                    }
-
-                    Ok::<(), Error>(())
-                })
-                .await;
+                if let Some(reason) = post_eose_grace(
+                    id,
+                    duration,
+                    &mut notifications,
+                    activity,
+                    opts.report_relay_closed,
+                )
+                .await
+                {
+                    return Some(HandleAutoClosing {
+                        to_close: true,
+                        reason: Some(reason),
+                    });
+                }
             }
 
             Some(HandleAutoClosing {
                 to_close: true, // Need to send CLOSE msg
-                reason: Some(SubscriptionAutoClosedReason::Completed),
+                reason: Some(exit_reason),
             })
         })
         .await?
@@ -1856,6 +2048,55 @@ impl InnerRelay {
     }
 }
 
+async fn post_eose_grace(
+    id: &SubscriptionId,
+    duration: Duration,
+    notifications: &mut broadcast::Receiver<RelayNotification>,
+    activity: &Option<Sender<SubscriptionActivity>>,
+    report_relay_closed: bool,
+) -> Option<SubscriptionAutoClosedReason> {
+    time::timeout(Some(duration), async {
+        loop {
+            match notifications.recv().await {
+                Ok(RelayNotification::Message { message }) => match *message {
+                    RelayMessage::Event {
+                        subscription_id,
+                        event,
+                    } if subscription_id.as_ref() == id => {
+                        if let Some(activity) = activity {
+                            let _ = activity
+                                .send(SubscriptionActivity::ReceivedEvent(event.into_owned()))
+                                .await;
+                        }
+                    }
+                    RelayMessage::Closed {
+                        subscription_id,
+                        message,
+                    } if subscription_id.as_ref() == id && report_relay_closed => {
+                        return if MachineReadablePrefix::parse(&message).is_some() {
+                            SubscriptionAutoClosedReason::Closed(message.into_owned())
+                        } else {
+                            SubscriptionAutoClosedReason::RelayClosed(message.into_owned())
+                        };
+                    }
+                    _ => (),
+                },
+                Ok(RelayNotification::RelayStatus { status }) if status.is_disconnected() => {
+                    return SubscriptionAutoClosedReason::Disconnected;
+                }
+                Ok(_) => {}
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    return SubscriptionAutoClosedReason::Lagged(skipped);
+                }
+                Err(broadcast::error::RecvError::Closed) => {
+                    return SubscriptionAutoClosedReason::ReceiverClosed;
+                }
+            }
+        }
+    })
+    .await
+}
+
 /// Send a WebSocket message with timeout set to [WEBSOCKET_TX_TIMEOUT].
 async fn send_ws_msg(tx: &mut WebSocketSink, msg: Message) -> Result<(), Error> {
     match time::timeout(Some(WEBSOCKET_TX_TIMEOUT), tx.send(msg)).await {
@@ -1875,6 +2116,8 @@ async fn close_ws(tx: &mut WebSocketSink) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+    use std::error::Error as StdError;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -1889,8 +2132,535 @@ mod tests {
     use super::*;
     use crate::authenticator::SignerAuthenticator;
     use crate::error::ErrorKind;
+    use crate::local_relay::MockRelay;
     use crate::policy::{AdmitPolicy, AdmitStatus};
     use crate::relay::{Relay, RelayOptions};
+
+    #[tokio::test]
+    async fn auto_closing_lag_before_eose_is_not_completion() {
+        let relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
+        let id = SubscriptionId::new("lagged-before-eose");
+        let (tx, rx) = broadcast::channel(2);
+        for _ in 0..8 {
+            tx.send(RelayNotification::Authenticated).unwrap();
+        }
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::EndOfStoredEvents(Cow::Owned(id.clone()))),
+        })
+        .unwrap();
+
+        let result = relay
+            .inner
+            .handle_auto_closing(
+                &id,
+                &[Filter::new()],
+                SubscribeAutoCloseOptions::default(),
+                rx,
+                &None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result.reason,
+            Some(SubscriptionAutoClosedReason::Lagged(skipped)) if skipped > 0
+        ));
+    }
+
+    #[tokio::test]
+    async fn auto_closing_receiver_closure_is_not_completion() {
+        let relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
+        let id = SubscriptionId::new("closed-receiver");
+        let (tx, rx) = broadcast::channel(2);
+        drop(tx);
+
+        let result = relay
+            .inner
+            .handle_auto_closing(
+                &id,
+                &[Filter::new()],
+                SubscribeAutoCloseOptions::default(),
+                rx,
+                &None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result.reason,
+            Some(SubscriptionAutoClosedReason::ReceiverClosed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn post_eose_grace_lag_is_not_completion() {
+        let id = SubscriptionId::new("grace-lag");
+        let (tx, mut rx) = broadcast::channel(2);
+        for _ in 0..8 {
+            tx.send(RelayNotification::Authenticated).unwrap();
+        }
+
+        let reason = post_eose_grace(&id, Duration::from_secs(2), &mut rx, &None, true).await;
+        assert!(matches!(
+            reason,
+            Some(SubscriptionAutoClosedReason::Lagged(skipped)) if skipped > 0
+        ));
+    }
+
+    #[tokio::test]
+    async fn auto_closing_eose_and_limit_have_distinct_reasons() {
+        let relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
+        let id = SubscriptionId::new("completed-eose");
+        let (tx, rx) = broadcast::channel(2);
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::EndOfStoredEvents(Cow::Owned(id.clone()))),
+        })
+        .unwrap();
+        let result = relay
+            .inner
+            .handle_auto_closing(
+                &id,
+                &[Filter::new()],
+                SubscribeAutoCloseOptions::default(),
+                rx,
+                &None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result.reason,
+            Some(SubscriptionAutoClosedReason::Completed)
+        ));
+
+        let id = SubscriptionId::new("reached-limit");
+        let (tx, rx) = broadcast::channel(2);
+        let event = EventBuilder::new(Kind::TextNote, "limit")
+            .finalize(&Keys::generate())
+            .unwrap();
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::Event {
+                subscription_id: Cow::Owned(id.clone()),
+                event: Cow::Owned(event),
+            }),
+        })
+        .unwrap();
+        let result = relay
+            .inner
+            .handle_auto_closing(
+                &id,
+                &[Filter::new()],
+                SubscribeAutoCloseOptions::default().exit_policy(ReqExitPolicy::WaitForEvents(1)),
+                rx,
+                &None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result.reason,
+            Some(SubscriptionAutoClosedReason::LimitReached)
+        ));
+    }
+
+    #[tokio::test]
+    async fn reporting_request_does_not_complete_on_early_unprefixed_closed() {
+        let relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
+        for (policy, message) in [
+            (ReqExitPolicy::ExitOnEOSE, "temporarily unavailable"),
+            (ReqExitPolicy::WaitForEvents(2), ""),
+        ] {
+            let id = SubscriptionId::generate();
+            let (tx, rx) = broadcast::channel(2);
+            tx.send(RelayNotification::Message {
+                message: Box::new(RelayMessage::Closed {
+                    subscription_id: Cow::Owned(id.clone()),
+                    message: Cow::Borrowed(message),
+                }),
+            })
+            .unwrap();
+            let result = relay
+                .inner
+                .handle_auto_closing(
+                    &id,
+                    &[Filter::new()],
+                    SubscribeAutoCloseOptions::default()
+                        .exit_policy(policy)
+                        .report_relay_closed(true),
+                    rx,
+                    &None,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                result.reason,
+                Some(SubscriptionAutoClosedReason::RelayClosed(ref reason)) if reason == message
+            ));
+        }
+
+        let id = SubscriptionId::generate();
+        let (tx, rx) = broadcast::channel(2);
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::Closed {
+                subscription_id: Cow::Owned(id.clone()),
+                message: Cow::Borrowed("legacy shortcut"),
+            }),
+        })
+        .unwrap();
+        let result = relay
+            .inner
+            .handle_auto_closing(
+                &id,
+                &[Filter::new()],
+                SubscribeAutoCloseOptions::default(),
+                rx,
+                &None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result.reason,
+            Some(SubscriptionAutoClosedReason::Completed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn reporting_grace_does_not_complete_on_matching_closed() {
+        let relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
+        let id = SubscriptionId::generate();
+        let (tx, rx) = broadcast::channel(4);
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::EndOfStoredEvents(Cow::Owned(id.clone()))),
+        })
+        .unwrap();
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::Closed {
+                subscription_id: Cow::Owned(SubscriptionId::generate()),
+                message: Cow::Borrowed("unrelated"),
+            }),
+        })
+        .unwrap();
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::Closed {
+                subscription_id: Cow::Owned(id.clone()),
+                message: Cow::Borrowed("grace interrupted"),
+            }),
+        })
+        .unwrap();
+        let result = relay
+            .inner
+            .handle_auto_closing(
+                &id,
+                &[Filter::new()],
+                SubscribeAutoCloseOptions::default()
+                    .exit_policy(ReqExitPolicy::WaitDurationAfterEOSE(Duration::from_secs(2)))
+                    .report_relay_closed(true),
+                rx,
+                &None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result.reason,
+            Some(SubscriptionAutoClosedReason::RelayClosed(ref reason)) if reason == "grace interrupted"
+        ));
+    }
+
+    #[tokio::test]
+    async fn ok_waiter_requires_matching_reply_and_preserves_receive_failure() {
+        let relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
+        let wanted = EventId::from_byte_array([0; 32]);
+        let other = EventId::from_byte_array([1; 32]);
+        let (tx, mut rx) = broadcast::channel(2);
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::Ok {
+                event_id: other,
+                status: true,
+                message: Cow::Borrowed("unrelated"),
+            }),
+        })
+        .unwrap();
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::Ok {
+                event_id: wanted,
+                status: false,
+                message: Cow::Borrowed("rejected"),
+            }),
+        })
+        .unwrap();
+        let (accepted, message) = relay
+            .inner
+            .wait_for_ok(&mut rx, &wanted, Duration::from_secs(1))
+            .await
+            .unwrap();
+        assert!(!accepted);
+        assert_eq!(message, "rejected");
+
+        let (_silent_tx, mut silent_rx) = broadcast::channel(2);
+        let error = relay
+            .inner
+            .wait_for_ok(&mut silent_rx, &wanted, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), crate::error::ErrorKind::Timeout);
+
+        let (lag_tx, _) = broadcast::channel(2);
+        let mut lagged = lag_tx.subscribe();
+        for _ in 0..8 {
+            lag_tx.send(RelayNotification::Authenticated).unwrap();
+        }
+        let error = relay
+            .inner
+            .wait_for_ok(&mut lagged, &wanted, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(
+            StdError::source(&error)
+                .and_then(|source| source.downcast_ref::<broadcast::error::RecvError>())
+                .is_some_and(|source| matches!(source, broadcast::error::RecvError::Lagged(_)))
+        );
+
+        let (closed_tx, mut closed_rx) = broadcast::channel(2);
+        drop(closed_tx);
+        let error = relay
+            .inner
+            .wait_for_ok(&mut closed_rx, &wanted, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+        assert!(
+            StdError::source(&error)
+                .and_then(|source| source.downcast_ref::<broadcast::error::RecvError>())
+                .is_some_and(|source| matches!(source, broadcast::error::RecvError::Closed))
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_requested_during_task_teardown_is_not_lost() {
+        reconnect_during_teardown(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn explicit_reconnect_during_teardown_works_without_automatic_reconnect() {
+        reconnect_during_teardown(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn queued_reconnect_ignores_stale_termination_permit() {
+        reconnect_during_teardown(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn connect_after_idle_disconnect_ignores_stored_termination() {
+        let local = MockRelay::run().await.unwrap();
+        let relay = Relay::builder(local.url().await)
+            .opts(RelayOptions::default().reconnect(false))
+            .build();
+        relay.disconnect();
+        assert_eq!(relay.status(), RelayStatus::Terminated);
+
+        relay.connect();
+        relay.wait_for_connection(Duration::from_secs(2)).await;
+        assert_eq!(relay.status(), RelayStatus::Connected);
+        assert_eq!(relay.stats().success(), 1);
+    }
+
+    async fn reconnect_during_teardown(automatic_reconnect: bool, stale_termination: bool) {
+        let local = MockRelay::run().await.unwrap();
+        let relay = Relay::builder(local.url().await)
+            .opts(RelayOptions::default().reconnect(automatic_reconnect))
+            .build();
+        let hook = Arc::new(TeardownHook::default());
+        *relay.inner.atomic.teardown_hook.lock().unwrap() = Some(hook.clone());
+        relay
+            .try_connect()
+            .timeout(Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), hook.started.notified())
+            .await
+            .unwrap();
+        let mut notifications = relay.notifications();
+        let keys = Keys::generate();
+        let subscription_id = relay
+            .subscribe(Filter::new().author(keys.public_key()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let notification = notifications
+                    .next()
+                    .await
+                    .expect("notification stream closed before EOSE");
+                if matches!(notification, RelayNotification::Message { message } if matches!(*message, RelayMessage::EndOfStoredEvents(ref id) if id.as_ref() == &subscription_id)) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        relay.disconnect();
+        tokio::time::timeout(Duration::from_secs(2), hook.entered.notified())
+            .await
+            .unwrap();
+        assert_eq!(relay.status(), RelayStatus::Terminated);
+        assert!(relay.inner.is_running());
+
+        if stale_termination {
+            // The old task no longer polls the termination Notify at this gate.
+            relay.inner.atomic.channels.terminate();
+        }
+
+        let ((), ()) = tokio::join!(async { relay.connect() }, async { relay.connect() });
+        assert_eq!(relay.status(), RelayStatus::Pending);
+        hook.release.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let notification = notifications
+                    .next()
+                    .await
+                    .expect("notification stream closed before reconnect");
+                if matches!(
+                    notification,
+                    RelayNotification::RelayStatus {
+                        status: RelayStatus::Connected
+                    }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(relay.status(), RelayStatus::Connected);
+        assert!(relay.inner.is_running());
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let notification = notifications
+                    .next()
+                    .await
+                    .expect("notification stream closed before restored EOSE");
+                if matches!(notification, RelayNotification::Message { message } if matches!(*message, RelayMessage::EndOfStoredEvents(ref id) if id.as_ref() == &subscription_id)) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        let event = EventBuilder::new(Kind::TextNote, "after reconnect")
+            .finalize(&keys)
+            .unwrap();
+        local.add_event(event.clone()).await.unwrap();
+        let received = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let notification = notifications
+                    .next()
+                    .await
+                    .expect("notification stream closed");
+                if let RelayNotification::Event {
+                    subscription_id: received_id,
+                    event,
+                } = notification
+                {
+                    if received_id == subscription_id {
+                        break event.id;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(received, event.id);
+    }
+
+    #[tokio::test]
+    async fn shutdown_cancels_a_queued_reconnect() {
+        let local = MockRelay::run().await.unwrap();
+        let relay = Relay::new(local.url().await);
+        let hook = Arc::new(TeardownHook::default());
+        *relay.inner.atomic.teardown_hook.lock().unwrap() = Some(hook.clone());
+        relay
+            .try_connect()
+            .timeout(Duration::from_secs(2))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), hook.started.notified())
+            .await
+            .unwrap();
+
+        relay.disconnect();
+        tokio::time::timeout(Duration::from_secs(2), hook.entered.notified())
+            .await
+            .unwrap();
+        relay.connect();
+        relay.shutdown();
+        hook.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), hook.finished.notified())
+            .await
+            .unwrap();
+
+        assert_eq!(relay.status(), RelayStatus::Shutdown);
+        assert!(!relay.inner.is_running());
+    }
+
+    #[tokio::test]
+    async fn try_connect_reports_when_old_task_still_owns_connection() {
+        let local = MockRelay::run().await.unwrap();
+        let relay = Relay::new(local.url().await);
+        let hook = Arc::new(TeardownHook::default());
+        *relay.inner.atomic.teardown_hook.lock().unwrap() = Some(hook.clone());
+        relay
+            .try_connect()
+            .timeout(Duration::from_secs(2))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), hook.started.notified())
+            .await
+            .unwrap();
+
+        relay.disconnect();
+        tokio::time::timeout(Duration::from_secs(2), hook.entered.notified())
+            .await
+            .unwrap();
+
+        let success_before = relay.stats().success();
+        let mut status_updates = relay.inner.internal_notification_sender.subscribe();
+        let error = relay
+            .try_connect()
+            .timeout(Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::State);
+        assert_eq!(relay.status(), RelayStatus::Pending);
+        assert_eq!(relay.stats().success(), success_before);
+        loop {
+            match status_updates.try_recv() {
+                Ok(RelayNotification::RelayStatus {
+                    status: RelayStatus::Connected,
+                }) => panic!("discarded try_connect socket reported Connected"),
+                Ok(_) => {}
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(error) => panic!("unexpected status receiver error: {error}"),
+            }
+        }
+        let mut notifications = relay.notifications();
+        hook.release.notify_one();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(notification) = notifications.next().await {
+                if matches!(
+                    notification,
+                    RelayNotification::RelayStatus {
+                        status: RelayStatus::Connected
+                    }
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     #[derive(Debug)]
     struct CountingAdmitPolicy(Arc<AtomicUsize>);

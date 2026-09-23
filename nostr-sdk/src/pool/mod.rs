@@ -706,7 +706,7 @@ impl RelayPool {
                     .sync(filter)
                     .items(items)
                     .opts(opts.clone())
-                    .into_future(),
+                    .with_outcomes(),
             );
         }
 
@@ -717,9 +717,12 @@ impl RelayPool {
         for (url, result) in urls.into_iter().zip(list) {
             match result {
                 Ok(reconciliation) => {
-                    // Success, insert relay url in 'success' set result
-                    output.success.insert(url.clone(), ());
-                    output.merge_relay_summary(url, reconciliation);
+                    if let Some(error) = reconciliation.error {
+                        output.failed.insert(url.clone(), error.to_string());
+                    } else {
+                        output.success.insert(url.clone(), ());
+                    }
+                    output.merge_relay_summary(url, reconciliation.summary);
                 }
                 Err(e) => {
                     output.failed.insert(url, e.to_string());
@@ -736,6 +739,7 @@ impl RelayPool {
         id: Option<SubscriptionId>,
         timeout: Option<Duration>,
         policy: ReqExitPolicy,
+        report_terminal_errors: bool,
     ) -> Result<ReceiverStream<(RelayUrl, RelayStreamEvent)>, Error> {
         // Check if `targets` map is empty
         if filters.is_empty() {
@@ -771,7 +775,7 @@ impl RelayPool {
                     .with_id(id.clone())
                     .maybe_timeout(timeout)
                     .policy(policy)
-                    .into_relay_event_stream(),
+                    .into_relay_event_stream(report_terminal_errors),
             );
         }
 
@@ -836,6 +840,12 @@ impl RelayPool {
                                             }
                                             Some(RelayStreamEvent::Completed) => {
                                                 if tx.send((url.clone(), RelayStreamEvent::Completed)).await.is_err() {
+                                                    break;
+                                                }
+                                                break;
+                                            }
+                                            Some(RelayStreamEvent::LimitReached) => {
+                                                if tx.send((url.clone(), RelayStreamEvent::LimitReached)).await.is_err() {
                                                     break;
                                                 }
                                                 break;

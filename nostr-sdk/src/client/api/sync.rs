@@ -13,7 +13,10 @@ use crate::relay::{RelayCapabilities, SyncOptions, SyncSummary as RelaySyncSumma
 
 /// Client negentropy reconciliation summary
 ///
-/// This includes the summary for all relays involved in the reconciliation process.
+/// This includes observed progress from all relays involved in reconciliation,
+/// including relays listed as failed in the operation's `Output::failed` map.
+/// A failed relay's progress does not establish completion for the selected
+/// filter/window or downstream durable admission.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SyncSummary {
     /// Events that were stored locally (missing on relay)
@@ -200,10 +203,51 @@ where
 
 #[cfg(test)]
 mod tests {
-    use nostr::event::Kind;
+    use std::time::Duration;
+
+    use nostr::event::{EventBuilder, FinalizeEvent, Kind};
+    use nostr::key::Keys;
 
     use super::*;
     use crate::error::ErrorKind;
+    use crate::local_relay::LocalRelay;
+    use crate::relay::SyncOptions;
+
+    #[tokio::test]
+    async fn sync_keeps_healthy_endpoint_when_another_rejects() {
+        let healthy = LocalRelay::new();
+        healthy.run().await.unwrap();
+        let failing = LocalRelay::builder().max_negentropy_items(0).build();
+        failing.run().await.unwrap();
+
+        let expected = EventBuilder::new(Kind::TextNote, "remote")
+            .finalize(&Keys::generate())
+            .unwrap();
+        healthy.add_event(expected.clone()).await.unwrap();
+        failing.add_event(expected.clone()).await.unwrap();
+
+        let healthy_url = healthy.url().await;
+        let failing_url = failing.url().await;
+        let client = Client::new();
+        client.add_relay(&healthy_url).and_connect().await.unwrap();
+        client.add_relay(&failing_url).and_connect().await.unwrap();
+
+        let output = client
+            .sync(Filter::new().kind(Kind::TextNote))
+            .opts(SyncOptions::new().initial_timeout(Duration::from_secs(2)))
+            .await
+            .unwrap();
+
+        assert!(output.success.contains_key(&healthy_url));
+        assert!(output.failed.contains_key(&failing_url));
+        assert!(
+            output
+                .remote
+                .get(&expected.id)
+                .unwrap()
+                .contains(&healthy_url)
+        );
+    }
 
     #[tokio::test]
     async fn test_sync_with_empty_list_of_relays() {

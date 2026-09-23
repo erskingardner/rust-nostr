@@ -1,3 +1,4 @@
+mod acquire_events;
 mod add;
 mod connect;
 mod fetch_events;
@@ -16,6 +17,7 @@ mod unsubscribe;
 mod unsubscribe_all;
 mod util;
 
+pub use self::acquire_events::*;
 pub use self::add::*;
 pub use self::connect::*;
 pub use self::fetch_events::*;

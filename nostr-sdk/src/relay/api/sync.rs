@@ -3,7 +3,7 @@ use std::cmp;
 use std::collections::{HashMap, HashSet};
 use std::future::IntoFuture;
 
-use async_utility::time;
+use async_utility::{task, time};
 use negentropy::{Id, Negentropy, NegentropyStorageVector};
 use nostr::event::EventId;
 use nostr::filter::Filter;
@@ -37,9 +37,24 @@ pub struct SyncSummary {
     // pub receive: HashMap<EventId, Vec<String>>,
 }
 
+/// Reconciliation progress and its terminal result for one relay.
+///
+/// Progress may be useful after failure, but only `error == None` means the
+/// selected filter/window completed. Received events are not evidence of
+/// downstream durable admission.
+#[derive(Debug)]
+pub struct RelaySyncOutcome {
+    /// Progress observed before completion or failure.
+    pub summary: SyncSummary,
+    /// Failure that interrupted reconciliation, if any.
+    pub error: Option<Error>,
+}
+
 /// Sync events with relay
 ///
 /// <https://github.com/nostr-protocol/nips/blob/master/77.md>
+/// Use [`SyncEvents::with_outcomes`] to retain partial progress when this relay
+/// fails. Completion only concerns the selected filter/window.
 #[must_use = "Does nothing unless you await!"]
 pub struct SyncEvents<'relay> {
     relay: &'relay Relay,
@@ -77,6 +92,30 @@ impl<'relay> SyncEvents<'relay> {
         self.opts = opts;
         self
     }
+
+    /// Reconcile while retaining partial progress if the operation fails.
+    ///
+    /// Preflight errors still return `Err` before reconciliation begins.
+    pub async fn with_outcomes(self) -> Result<RelaySyncOutcome, Error> {
+        self.relay.inner.ensure_operational()?;
+        if !self.relay.inner.capabilities.can_read() {
+            return Err(Error::read_disabled());
+        }
+
+        let items: Vec<(EventId, Timestamp)> = match self.items {
+            Some(items) => items,
+            None => {
+                let database = self.relay.inner.state.database();
+                database.negentropy_items(self.filter.clone()).await?
+            }
+        };
+
+        let mut summary = SyncSummary::default();
+        let error = sync(self.relay, &self.filter, items, &self.opts, &mut summary)
+            .await
+            .err();
+        Ok(RelaySyncOutcome { summary, error })
+    }
 }
 
 #[inline]
@@ -101,6 +140,49 @@ async fn send_neg_close(relay: &Relay, id: &SubscriptionId) -> Result<(), Error>
 #[inline]
 fn neg_id_to_event_id(id: Id) -> EventId {
     EventId::from_byte_array(id.to_bytes())
+}
+
+// A dropped sync future must not keep its request-owned subscription registered.
+// Network CLOSE is best effort because the relay may already be disconnected.
+struct SyncCleanup {
+    relay: Relay,
+    neg_id: SubscriptionId,
+    down_id: SubscriptionId,
+    armed: bool,
+}
+
+impl SyncCleanup {
+    fn new(relay: &Relay, neg_id: SubscriptionId, down_id: SubscriptionId) -> Self {
+        Self {
+            relay: relay.clone(),
+            neg_id,
+            down_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for SyncCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+
+        let relay = self.relay.clone();
+        let neg_id = self.neg_id.clone();
+        let down_id = self.down_id.clone();
+        task::spawn(async move {
+            relay.inner.remove_subscription(&down_id).await;
+            let _ = relay
+                .send_msg(ClientMessage::Close(Cow::Borrowed(&down_id)))
+                .await;
+            let _ = send_neg_close(&relay, &neg_id).await;
+        });
+    }
 }
 
 #[inline(never)]
@@ -218,13 +300,19 @@ async fn req_neg_events(
     relay: &Relay,
     need_ids: &mut Vec<EventId>,
     in_flight_down: &mut bool,
-    down_sub_id: &SubscriptionId,
+    pending_down_ids: &mut HashSet<EventId>,
+    cleanup: &mut SyncCleanup,
     opts: &SyncOptions,
 ) -> Result<(), Error> {
     // Check if it should skip the download
     if !opts.do_down() || need_ids.is_empty() || *in_flight_down {
         return Ok(());
     }
+
+    // Each batch needs its own ID: a relay may send CLOSED after EOSE, and a
+    // late CLOSED from the previous batch must not terminate the next one.
+    cleanup.down_id = SubscriptionId::generate();
+    let down_sub_id = &cleanup.down_id;
 
     let capacity: usize = cmp::min(need_ids.len(), NEGENTROPY_BATCH_SIZE_DOWN);
     let mut ids: Vec<EventId> = Vec::with_capacity(capacity);
@@ -249,6 +337,7 @@ async fn req_neg_events(
         });
     }
 
+    let requested_ids: HashSet<EventId> = ids.iter().copied().collect();
     let filter = Filter::new().ids(ids);
     let msg: ClientMessage = ClientMessage::Req {
         subscription_id: Cow::Borrowed(down_sub_id),
@@ -270,6 +359,7 @@ async fn req_neg_events(
         return Err(e);
     }
 
+    *pending_down_ids = requested_ids;
     *in_flight_down = true;
 
     Ok(())
@@ -334,16 +424,17 @@ pub(super) async fn sync(
         initial_message: Cow::Owned(faster_hex::hex_string(&initial_message)),
     };
     relay.send_msg(open_msg).await?;
+    let mut cleanup = SyncCleanup::new(relay, sub_id.clone(), SubscriptionId::generate());
 
     // Check if negentropy is supported
     check_negentropy_support(&sub_id, opts, &mut temp_notifications).await?;
 
     let mut in_flight_up: HashSet<EventId> = HashSet::new();
     let mut in_flight_down: bool = false;
+    let mut pending_down_ids: HashSet<EventId> = HashSet::new();
     let mut sync_done: bool = false;
     let mut have_ids: Vec<EventId> = Vec::new();
     let mut need_ids: Vec<EventId> = Vec::new();
-    let down_sub_id: SubscriptionId = SubscriptionId::generate();
     let mut last_relevant_msg: Instant = Instant::now();
 
     // Start reconciliation
@@ -430,8 +521,9 @@ pub(super) async fn sync(
                         event,
                     } => {
                         #[allow(clippy::collapsible_match)]
-                        if subscription_id.as_ref() == &down_sub_id {
+                        if subscription_id.as_ref() == &cleanup.down_id {
                             output.received.insert(event.id);
+                            pending_down_ids.remove(&event.id);
 
                             // Relevant to this sync
                             true
@@ -442,15 +534,16 @@ pub(super) async fn sync(
                     }
                     RelayMessage::EndOfStoredEvents(subscription_id) => {
                         #[allow(clippy::collapsible_match)]
-                        if subscription_id.as_ref() == &down_sub_id {
+                        if subscription_id.as_ref() == &cleanup.down_id {
                             in_flight_down = false;
+                            pending_down_ids.clear();
 
                             // Remove subscription
-                            relay.inner.remove_subscription(&down_sub_id).await;
+                            relay.inner.remove_subscription(&cleanup.down_id).await;
 
                             // Close subscription
                             relay
-                                .send_msg(ClientMessage::Close(Cow::Borrowed(&down_sub_id)))
+                                .send_msg(ClientMessage::Close(Cow::Borrowed(&cleanup.down_id)))
                                 .await?;
 
                             // Relevant to this sync
@@ -461,19 +554,27 @@ pub(super) async fn sync(
                         }
                     }
                     RelayMessage::Closed {
-                        subscription_id, ..
+                        subscription_id,
+                        message,
                     } => {
                         #[allow(clippy::collapsible_match)]
-                        if subscription_id.as_ref() == &down_sub_id {
-                            in_flight_down = false;
-
-                            // NOTE: the subscription is removed in the `InnerRelay::handle_relay_message` method,
-                            // so there is no need to try to remove it also here.
-
-                            // Relevant to this sync
-                            true
+                        if subscription_id.as_ref() == &cleanup.down_id && in_flight_down {
+                            // An empty CLOSED can end a finite explicit-ID
+                            // batch only after every requested event arrived.
+                            if message.is_empty() && pending_down_ids.is_empty() {
+                                in_flight_down = false;
+                                true
+                            } else {
+                                return Err(if message.is_empty() {
+                                    Error::relay_msg(
+                                        "download subscription closed before all requested events arrived"
+                                            .to_owned(),
+                                    )
+                                } else {
+                                    Error::relay_msg(message.into_owned())
+                                });
+                            }
                         } else {
-                            // Not relevant to this sync
                             false
                         }
                     }
@@ -488,7 +589,8 @@ pub(super) async fn sync(
                     relay,
                     &mut need_ids,
                     &mut in_flight_down,
-                    &down_sub_id,
+                    &mut pending_down_ids,
+                    &mut cleanup,
                     opts,
                 )
                 .await?;
@@ -515,6 +617,8 @@ pub(super) async fn sync(
     }
 
     tracing::info!(url = %relay.url(), "Negentropy reconciliation terminated.");
+
+    cleanup.disarm();
 
     Ok(())
 }
@@ -595,35 +699,11 @@ impl<'relay> IntoFuture for SyncEvents<'relay> {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            // Check if relay is operational
-            self.relay.inner.ensure_operational()?;
-
-            // Check if relay can read
-            if !self.relay.inner.capabilities.can_read() {
-                return Err(Error::read_disabled());
+            let outcome = self.with_outcomes().await?;
+            match outcome.error {
+                Some(error) => Err(error),
+                None => Ok(outcome.summary),
             }
-
-            let items: Vec<(EventId, Timestamp)> = match self.items {
-                Some(items) => items,
-                None => {
-                    // Get negentropy items
-                    let database = self.relay.inner.state.database();
-                    database.negentropy_items(self.filter.clone()).await?
-                }
-            };
-
-            let mut output: SyncSummary = SyncSummary::default();
-
-            sync(
-                self.relay,
-                &self.filter,
-                items.clone(),
-                &self.opts,
-                &mut output,
-            )
-            .await?;
-
-            Ok(output)
         })
     }
 }
@@ -631,16 +711,75 @@ impl<'relay> IntoFuture for SyncEvents<'relay> {
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
+    use std::future::Future;
+    use std::net::SocketAddr;
+    use std::pin::Pin;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use nostr::message::MachineReadablePrefix;
     use nostr_memory::prelude::*;
     use tokio::sync::broadcast;
 
     use super::*;
+    use crate::client::Client;
     use crate::error::ErrorKind;
-    use crate::local_relay::*;
+    use crate::local_relay::{LocalRelay, MockRelay, QueryPolicy, QueryPolicyResult};
     use crate::relay::{SyncDirection, SyncOptions};
+
+    #[derive(Debug)]
+    struct RejectDownloadAfter {
+        allowed_batches: usize,
+        seen_batches: AtomicUsize,
+    }
+
+    impl QueryPolicy for RejectDownloadAfter {
+        fn admit_query<'a>(
+            &'a self,
+            query: &'a mut Filter,
+            _addr: &'a SocketAddr,
+        ) -> Pin<Box<dyn Future<Output = QueryPolicyResult> + Send + 'a>> {
+            let reject = query.ids.is_some()
+                && self.seen_batches.fetch_add(1, Ordering::SeqCst) >= self.allowed_batches;
+            Box::pin(async move {
+                if reject {
+                    QueryPolicyResult::reject(MachineReadablePrefix::Blocked, "reads denied")
+                } else {
+                    QueryPolicyResult::Accept
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_sync_cleans_only_its_subscription() {
+        let relay = Relay::new("wss://relay.example.com".parse().unwrap());
+        let down_id = SubscriptionId::new("sync-download");
+        let unrelated_id = SubscriptionId::new("unrelated-live");
+        relay
+            .inner
+            .add_auto_closing_subscription(down_id.clone(), vec![Filter::new()])
+            .await
+            .unwrap();
+        relay
+            .inner
+            .add_long_lived_subscription(unrelated_id.clone(), vec![Filter::new()])
+            .await
+            .unwrap();
+
+        let cleanup = SyncCleanup::new(&relay, SubscriptionId::new("sync-neg"), down_id.clone());
+        drop(cleanup);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while relay.inner.has_subscription(&down_id).await {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(relay.inner.has_subscription(&unrelated_id).await);
+    }
 
     #[tokio::test]
     async fn test_check_negentropy_support_times_out() {
@@ -668,6 +807,68 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.kind(), ErrorKind::Other);
+    }
+
+    #[tokio::test]
+    async fn rejected_final_download_keeps_partial_progress_and_unrelated_subscription() {
+        for (allowed_batches, event_count) in [(0, 1), (1, NEGENTROPY_BATCH_SIZE_DOWN + 1)] {
+            let local = LocalRelay::builder()
+                .query_policy(RejectDownloadAfter {
+                    allowed_batches,
+                    seen_batches: AtomicUsize::new(0),
+                })
+                .build();
+            local.run().await.unwrap();
+            let keys = Keys::generate();
+            for index in 0..event_count {
+                let event = EventBuilder::new(Kind::TextNote, format!("remote {index}"))
+                    .finalize(&keys)
+                    .unwrap();
+                local.add_event(event).await.unwrap();
+            }
+
+            let url = local.url().await;
+            let client = Client::new();
+            client.add_relay(&url).and_connect().await.unwrap();
+            let relay = client.relay(&url).await.unwrap().unwrap();
+            let unrelated_id = SubscriptionId::generate();
+            relay
+                .subscribe(Filter::new().kind(Kind::Metadata))
+                .with_id(unrelated_id.clone())
+                .await
+                .unwrap();
+
+            let output = client
+                .sync(Filter::new().kind(Kind::TextNote))
+                .with([url.clone()])
+                .opts(
+                    SyncOptions::new()
+                        .initial_timeout(Duration::from_secs(2))
+                        .idle_timeout(Duration::from_secs(2)),
+                )
+                .await
+                .unwrap();
+            assert!(output.success.is_empty());
+            assert!(
+                output.failed[&url].contains("blocked: reads denied"),
+                "allowed_batches={allowed_batches}, failed={:?}",
+                output.failed,
+            );
+            assert_eq!(output.remote.len(), event_count);
+            assert_eq!(
+                output.received.len(),
+                allowed_batches * NEGENTROPY_BATCH_SIZE_DOWN
+            );
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while relay.inner.active_subscription_count().await != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(relay.inner.has_subscription(&unrelated_id).await);
+            client.shutdown().await;
+        }
     }
 
     #[tokio::test]

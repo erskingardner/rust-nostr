@@ -19,10 +19,19 @@ use crate::relay::{
 
 type EventStream = Pin<Box<dyn Stream<Item = Result<Event, Error>> + Send>>;
 
-pub(crate) enum RelayStreamEvent {
+/// An event or endpoint outcome from an auto-closing relay request.
+#[derive(Debug)]
+pub enum RelayStreamEvent {
+    /// An event received from this relay.
     Event(Event),
+    /// The request failed before its exit policy was satisfied.
     Error(Error),
+    /// The relay completed the request according to its exit policy.
+    ///
+    /// This does not establish global or downstream durable completeness.
     Completed,
+    /// The configured event count was reached; more matching events may exist.
+    LimitReached,
 }
 
 /// Stream events
@@ -77,6 +86,7 @@ impl<'relay> StreamEvents<'relay> {
 
     pub(crate) async fn into_relay_event_stream(
         self,
+        report_terminal_errors: bool,
     ) -> Result<SubscriptionActivityEventStream, Error> {
         // Create channels
         let (tx, rx) = mpsc::channel(512);
@@ -84,7 +94,8 @@ impl<'relay> StreamEvents<'relay> {
         // Compose auto-closing options
         let opts: SubscribeAutoCloseOptions = SubscribeAutoCloseOptions::default()
             .exit_policy(self.policy)
-            .timeout(self.timeout);
+            .timeout(self.timeout)
+            .report_relay_closed(report_terminal_errors);
 
         // Get or generate a subscription ID
         let id: SubscriptionId = self.id.unwrap_or_else(SubscriptionId::generate);
@@ -101,7 +112,22 @@ impl<'relay> StreamEvents<'relay> {
         )
         .await?;
 
-        Ok(SubscriptionActivityEventStream::new(rx, cancel_tx))
+        Ok(SubscriptionActivityEventStream::new(
+            rx,
+            cancel_tx,
+            report_terminal_errors,
+        ))
+    }
+
+    /// Stream events together with the relay's terminal outcome.
+    ///
+    /// Unlike awaiting this builder, this method preserves completion and
+    /// limit-reached markers. Dropping the returned stream cancels only this
+    /// request and asks the relay to close its subscription.
+    pub async fn with_outcomes(
+        self,
+    ) -> Result<Pin<Box<dyn Stream<Item = RelayStreamEvent> + Send>>, Error> {
+        Ok(Box::pin(self.into_relay_event_stream(true).await?))
     }
 }
 
@@ -111,12 +137,12 @@ impl<'relay> IntoFuture for StreamEvents<'relay> {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let stream = self.into_relay_event_stream().await?;
+            let stream = self.into_relay_event_stream(false).await?;
 
             Ok(Box::pin(stream.filter_map(async |e| match e {
                 RelayStreamEvent::Event(event) => Some(Ok(event)),
                 RelayStreamEvent::Error(e) => Some(Err(e)),
-                RelayStreamEvent::Completed => None,
+                RelayStreamEvent::Completed | RelayStreamEvent::LimitReached => None,
             })) as EventStream)
         })
     }
@@ -126,14 +152,20 @@ pub(crate) struct SubscriptionActivityEventStream {
     rx: mpsc::Receiver<SubscriptionActivity>,
     done: bool,
     cancel: Option<oneshot::Sender<()>>,
+    report_terminal_errors: bool,
 }
 
 impl SubscriptionActivityEventStream {
-    fn new(rx: mpsc::Receiver<SubscriptionActivity>, cancel: oneshot::Sender<()>) -> Self {
+    fn new(
+        rx: mpsc::Receiver<SubscriptionActivity>,
+        cancel: oneshot::Sender<()>,
+        report_terminal_errors: bool,
+    ) -> Self {
         Self {
             rx,
             done: false,
             cancel: Some(cancel),
+            report_terminal_errors,
         }
     }
 }
@@ -170,13 +202,54 @@ impl Stream for SubscriptionActivityEventStream {
                         self.done = true;
                         Poll::Ready(Some(RelayStreamEvent::Error(Error::relay_msg(message))))
                     }
+                    SubscriptionAutoClosedReason::RelayClosed(message) => {
+                        self.done = true;
+                        Poll::Ready(Some(RelayStreamEvent::Error(Error::relay_msg(message))))
+                    }
+                    SubscriptionAutoClosedReason::Lagged(skipped) => {
+                        self.done = true;
+                        Poll::Ready(Some(RelayStreamEvent::Error(
+                            tokio::sync::broadcast::error::RecvError::Lagged(skipped).into(),
+                        )))
+                    }
+                    SubscriptionAutoClosedReason::ReceiverClosed => {
+                        self.done = true;
+                        Poll::Ready(Some(RelayStreamEvent::Error(
+                            tokio::sync::broadcast::error::RecvError::Closed.into(),
+                        )))
+                    }
+                    SubscriptionAutoClosedReason::TimedOut => {
+                        self.done = true;
+                        if self.report_terminal_errors {
+                            Poll::Ready(Some(RelayStreamEvent::Error(Error::timeout())))
+                        } else {
+                            Poll::Ready(None)
+                        }
+                    }
+                    SubscriptionAutoClosedReason::Disconnected => {
+                        self.done = true;
+                        if self.report_terminal_errors {
+                            Poll::Ready(Some(RelayStreamEvent::Error(Error::not_connected())))
+                        } else {
+                            Poll::Ready(None)
+                        }
+                    }
+                    SubscriptionAutoClosedReason::LimitReached => {
+                        self.done = true;
+                        Poll::Ready(Some(RelayStreamEvent::LimitReached))
+                    }
                     SubscriptionAutoClosedReason::Completed => {
                         self.done = true;
                         Poll::Ready(Some(RelayStreamEvent::Completed))
                     }
                 },
             },
-            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Ready(None) => {
+                self.done = true;
+                Poll::Ready(Some(RelayStreamEvent::Error(Error::state_msg(
+                    "stream ended without an outcome",
+                ))))
+            }
             Poll::Pending => Poll::Pending,
         }
     }
@@ -192,12 +265,78 @@ mod tests {
     use nostr::key::Keys;
     use nostr::message::{MachineReadablePrefix, SubscriptionId};
 
+    use super::*;
     use crate::authenticator::SignerAuthenticator;
     use crate::local_relay::*;
     use crate::relay::{Relay, RelayOptions, ReqExitPolicy};
     use crate::test_utils::{
         setup_nip42_read_local_relay, setup_relay, setup_relay_with_authenticator,
     };
+
+    #[tokio::test]
+    async fn reporting_stream_preserves_limit_and_receiver_failure() {
+        let (tx, rx) = mpsc::channel(2);
+        let (cancel_tx, _cancel_rx) = oneshot::channel();
+        let mut stream = SubscriptionActivityEventStream::new(rx, cancel_tx, true);
+
+        tx.send(SubscriptionActivity::Closed(
+            SubscriptionAutoClosedReason::LimitReached,
+        ))
+        .await
+        .unwrap();
+        assert!(matches!(
+            stream.next().await,
+            Some(RelayStreamEvent::LimitReached)
+        ));
+        assert!(stream.next().await.is_none());
+
+        let (tx, rx) = mpsc::channel(2);
+        let (cancel_tx, _cancel_rx) = oneshot::channel();
+        let mut stream = SubscriptionActivityEventStream::new(rx, cancel_tx, true);
+        tx.send(SubscriptionActivity::Closed(
+            SubscriptionAutoClosedReason::Lagged(6),
+        ))
+        .await
+        .unwrap();
+        match stream.next().await {
+            Some(RelayStreamEvent::Error(error)) => {
+                assert!(error.to_string().contains("lagged"));
+            }
+            other => panic!("expected receiver loss, got {other:?}"),
+        }
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_stream_ends_quietly_on_timeout_and_disconnect() {
+        for reason in [
+            SubscriptionAutoClosedReason::TimedOut,
+            SubscriptionAutoClosedReason::Disconnected,
+        ] {
+            let (tx, rx) = mpsc::channel(1);
+            let (cancel_tx, _cancel_rx) = oneshot::channel();
+            let mut stream = SubscriptionActivityEventStream::new(rx, cancel_tx, false);
+            tx.send(SubscriptionActivity::Closed(reason)).await.unwrap();
+            assert!(stream.next().await.is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn reporting_stream_does_not_complete_on_early_relay_closed() {
+        let (tx, rx) = mpsc::channel(1);
+        let (cancel_tx, _cancel_rx) = oneshot::channel();
+        let mut stream = SubscriptionActivityEventStream::new(rx, cancel_tx, true);
+        tx.send(SubscriptionActivity::Closed(
+            SubscriptionAutoClosedReason::RelayClosed("temporarily unavailable".to_owned()),
+        ))
+        .await
+        .unwrap();
+        assert!(matches!(
+            stream.next().await,
+            Some(RelayStreamEvent::Error(error)) if error.to_string().contains("temporarily unavailable")
+        ));
+        assert!(stream.next().await.is_none());
+    }
 
     #[tokio::test]
     async fn test_stream_terminates_on_drop() {
