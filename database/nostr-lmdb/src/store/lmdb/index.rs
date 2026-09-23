@@ -280,3 +280,12 @@ pub fn make_coordinate_index_key(coordinate: &Coordinate) -> Vec<u8> {
 
     key
 }
+
+/// Author-scoped ID deletion key. Its length distinguishes it from a confirmed
+/// ID-only tombstone in the same database.
+pub(super) fn make_author_deletion_key(event_id: &EventId, author: &PublicKey) -> [u8; 64] {
+    let mut key = [0; 64];
+    key[..32].copy_from_slice(event_id.as_bytes());
+    key[32..].copy_from_slice(author.as_bytes());
+    key
+}

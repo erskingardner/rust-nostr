@@ -27,6 +27,12 @@
 
 -->
 
+## Unreleased
+
+### Fixed
+
+- Reject deleted events
+
 ## v0.45.3 - 2026/09/11
 
 ### Fixed

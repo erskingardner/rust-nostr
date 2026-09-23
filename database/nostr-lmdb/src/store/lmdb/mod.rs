@@ -27,7 +27,7 @@ const EVENT_ID_ALL_ZEROS: [u8; 32] = [0; 32];
 const EVENT_ID_ALL_255: [u8; 32] = [255; 32];
 
 /// Current database schema version
-const DB_VERSION: u64 = 2;
+const DB_VERSION: u64 = 3;
 const DB_VERSION_KEY: &[u8] = b"db_version";
 
 #[derive(Debug)]
@@ -103,8 +103,10 @@ pub(crate) struct Lmdb {
     kc_index: Database<Bytes, Bytes>, // <Index>, Event ID
     /// Kind + Tag + CreatedAt + ID index
     ktc_index: Database<Bytes, Bytes>, // <Index>, Event ID
-    /// Deleted IDs
-    deleted_ids: Database<Bytes, Unit>, // Event ID
+    /// Confirmed deletions (32-byte ID)
+    deleted_ids: Database<Bytes, Unit>,
+    /// Author-scoped claims (32-byte ID + 32-byte public key)
+    deleted_ids_by_author: Database<Bytes, Unit>,
     /// Deleted coordinates
     deleted_coordinates: Database<Bytes, U64<NativeEndian>>, // Coordinate, UNIX timestamp
     /// Vanished public keys
@@ -119,7 +121,7 @@ impl Lmdb {
         let env: Env = unsafe {
             EnvOpenOptions::new()
                 .flags(EnvFlags::NO_TLS)
-                .max_dbs(12 + builder.additional_dbs)
+                .max_dbs(13 + builder.additional_dbs)
                 .max_readers(builder.max_readers)
                 .map_size(builder.map_size)
                 .open(builder.path)?
@@ -173,6 +175,11 @@ impl Lmdb {
             .types::<Bytes, Unit>()
             .name("deleted-ids")
             .create(&mut txn)?;
+        let deleted_ids_by_author = env
+            .database_options()
+            .types::<Bytes, Unit>()
+            .name("deleted-ids-by-author")
+            .create(&mut txn)?;
         let deleted_coordinates = env
             .database_options()
             .types::<Bytes, U64<NativeEndian>>()
@@ -210,6 +217,7 @@ impl Lmdb {
             kc_index,
             ktc_index,
             deleted_ids,
+            deleted_ids_by_author,
             deleted_coordinates,
             vanished_public_keys,
             metadata,
@@ -239,6 +247,10 @@ impl Lmdb {
                 // Run migrations sequentially
                 if current_version < 2 {
                     self.migrate_v1_to_v2(&mut txn)?;
+                }
+
+                if current_version < 3 {
+                    self.migrate_v2_to_v3(&mut txn)?;
                 }
 
                 // Update version
@@ -293,6 +305,33 @@ impl Lmdb {
         }
 
         tracing::info!("kc_index built successfully");
+        Ok(())
+    }
+
+    /// Backfill author-scoped tombstones from retained deletion requests.
+    fn migrate_v2_to_v3(&self, txn: &mut RwTxn) -> Result<(), StoreError> {
+        // The write transaction excludes concurrent writers. A read snapshot
+        // lets us stream existing events while writing the separate ID index.
+        let snapshot = self.read_txn()?;
+        for result in self.events.iter(&snapshot)? {
+            let (_, bytes) = result?;
+            // The unnamed database also contains LMDB's named-map entries.
+            let Ok(event) = DatabaseEvent::from_flatbuf(bytes) else {
+                continue;
+            };
+
+            if event.kind == Kind::EventDeletion.as_u16() {
+                let public_key: PublicKey = PublicKey::from_byte_array(*event.pubkey);
+
+                for id in event.event_ids() {
+                    if self.is_deleted(txn, &id)? {
+                        continue;
+                    }
+
+                    self.mark_deleted_by_author(txn, &id, &public_key)?;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -395,6 +434,7 @@ impl Lmdb {
         self.atc_index.clear(txn)?;
         self.ktc_index.clear(txn)?;
         self.deleted_ids.clear(txn)?;
+        self.deleted_ids_by_author.clear(txn)?;
         self.deleted_coordinates.clear(txn)?;
         self.vanished_public_keys.clear(txn)?;
         Ok(())
@@ -450,6 +490,16 @@ impl Lmdb {
 
         // Reject event if ID was deleted
         if self.is_deleted(txn, &event.id)? {
+            return Ok(SaveEventStatus::Rejected(RejectedReason::Deleted));
+        }
+
+        // Unknown targets have author-scoped tombstones until their author
+        // can be verified. Check before a deleted version replaces a live one.
+        if self.options.process_nip09
+            && event.kind != Kind::EventDeletion
+            && self.is_deleted_by_author(txn, &event.id, &event.pubkey)?
+        {
+            self.mark_deleted(txn, &event.id)?;
             return Ok(SaveEventStatus::Rejected(RejectedReason::Deleted));
         }
 
@@ -1165,6 +1215,27 @@ impl Lmdb {
         Ok(())
     }
 
+    fn is_deleted_by_author(
+        &self,
+        txn: &RoTxn,
+        event_id: &EventId,
+        author: &PublicKey,
+    ) -> Result<bool, StoreError> {
+        let key = index::make_author_deletion_key(event_id, author);
+        Ok(self.deleted_ids_by_author.get(txn, &key)?.is_some())
+    }
+
+    fn mark_deleted_by_author(
+        &self,
+        txn: &mut RwTxn,
+        event_id: &EventId,
+        author: &PublicKey,
+    ) -> Result<(), StoreError> {
+        let key = index::make_author_deletion_key(event_id, author);
+        self.deleted_ids_by_author.put(txn, &key, &())?;
+        Ok(())
+    }
+
     pub(crate) fn mark_coordinate_deleted(
         &self,
         txn: &mut RwTxn,
@@ -1334,18 +1405,37 @@ impl Lmdb {
     }
 
     fn handle_deletion_event(&self, txn: &mut RwTxn, event: &Event) -> Result<bool, StoreError> {
-        // Collect DeletionInfo and EventIds for all valid targets first
-        let mut deletions_to_process = Vec::new();
+        // Validate all coordinates and referenced IDs before writing any
+        // tombstones. A rejected request must not affect other saves in the
+        // ingester's transaction.
+        for coordinate in event.tags.coordinates() {
+            if coordinate.public_key != event.pubkey {
+                return Ok(true);
+            }
+        }
+
+        let mut deletions_to_process: Vec<(EventId, EventIndexKeys)> = Vec::new();
+        let mut unknown_ids: Vec<EventId> = Vec::new();
 
         for id in event.tags.event_ids() {
-            if let Some(target) = self.get_event_by_id(txn, id.as_bytes())? {
-                // Author must match
-                if target.pubkey != event.pubkey.as_bytes() {
-                    return Ok(true);
-                }
+            match self.get_event_by_id(txn, id.as_bytes())? {
+                Some(target) => {
+                    // Author must match
+                    if target.pubkey != event.pubkey.as_bytes() {
+                        return Ok(true);
+                    }
 
-                deletions_to_process.push((id, EventIndexKeys::new(target)));
+                    let info: EventIndexKeys = EventIndexKeys::new(target);
+                    deletions_to_process.push((id, info));
+                }
+                // Unknown targets are scoped to the requester, so another author's
+                // request cannot prevent their eventual insertion.
+                None => unknown_ids.push(id),
             }
+        }
+
+        for id in unknown_ids {
+            self.mark_deleted_by_author(txn, &id, &event.pubkey)?;
         }
 
         // Now process all deletions
@@ -1358,11 +1448,6 @@ impl Lmdb {
         }
 
         for coordinate in event.tags.coordinates() {
-            // Author must match
-            if coordinate.public_key != event.pubkey {
-                return Ok(true);
-            }
-
             // Mark deleted
             self.mark_coordinate_deleted(txn, &coordinate, event.created_at)?;
 
@@ -1428,6 +1513,387 @@ mod tests {
             .custom_created_at(Timestamp::from_secs(created_at))
             .finalize(&keys)
             .unwrap()
+    }
+
+    fn save_event(lmdb: &Lmdb, event: &Event) -> SaveEventStatus {
+        let mut txn = lmdb.write_txn().unwrap();
+        let status = lmdb
+            .save_event_with_txn(&mut txn, &mut FlatBufferBuilder::new(), event)
+            .unwrap();
+        txn.commit().unwrap();
+        status
+    }
+
+    #[test]
+    fn test_id_deletion_arrival_order() {
+        let keys = Keys::generate();
+        for kind in [Kind::TextNote, Kind::Metadata, Kind::Custom(30001)] {
+            for deletion_first in [false, true] {
+                let dir = TempDir::new().unwrap();
+                let builder = NostrLmdbBuilder::new(dir.path());
+                let target = EventBuilder::new(kind, "target")
+                    .tags([Tag::identifier("test")])
+                    .finalize(&keys)
+                    .unwrap();
+                let deletion = EventBuilder::new(Kind::EventDeletion, "")
+                    .tags([Tag::event(target.id)])
+                    .finalize(&keys)
+                    .unwrap();
+                {
+                    let lmdb = Lmdb::from_builder(builder.clone()).unwrap();
+                    let mut txn = lmdb.write_txn().unwrap();
+                    let mut fbb = FlatBufferBuilder::new();
+                    let events = match deletion_first {
+                        true => [&deletion, &target],
+                        false => [&target, &deletion],
+                    };
+                    for event in events {
+                        let status = lmdb.save_event_with_txn(&mut txn, &mut fbb, event).unwrap();
+                        let expected = match deletion_first && event.id == target.id {
+                            true => SaveEventStatus::Rejected(RejectedReason::Deleted),
+                            false => SaveEventStatus::Success,
+                        };
+                        assert_eq!(status, expected);
+                    }
+                    assert!(!lmdb.has_event(&txn, &target.id).unwrap());
+                    assert!(lmdb.is_deleted(&txn, &target.id).unwrap());
+                    txn.commit().unwrap();
+                }
+                let lmdb = Lmdb::from_builder(builder).unwrap();
+                assert_eq!(
+                    save_event(&lmdb, &target),
+                    SaveEventStatus::Rejected(RejectedReason::Deleted)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_retained_id_deletion_after_reopening() {
+        let dir = TempDir::new().unwrap();
+        let builder = NostrLmdbBuilder::new(dir.path());
+        let keys = Keys::generate();
+        let target = EventBuilder::new(Kind::TextNote, "target")
+            .finalize(&keys)
+            .unwrap();
+        let deletion = EventBuilder::new(Kind::EventDeletion, "")
+            .tags([Tag::event(target.id)])
+            .finalize(&keys)
+            .unwrap();
+        {
+            let lmdb = Lmdb::from_builder(builder.clone()).unwrap();
+            assert_eq!(save_event(&lmdb, &deletion), SaveEventStatus::Success);
+            assert!(
+                !lmdb
+                    .is_deleted(&lmdb.read_txn().unwrap(), &target.id)
+                    .unwrap()
+            );
+        }
+        let lmdb = Lmdb::from_builder(builder).unwrap();
+        assert_eq!(
+            save_event(&lmdb, &target),
+            SaveEventStatus::Rejected(RejectedReason::Deleted)
+        );
+        // Once the author is verified, the existing tombstone survives removal
+        // of the request itself.
+        {
+            let mut txn = lmdb.write_txn().unwrap();
+            lmdb.delete(&mut txn, Filter::new().id(deletion.id))
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        assert_eq!(
+            save_event(&lmdb, &target),
+            SaveEventStatus::Rejected(RejectedReason::Deleted)
+        );
+    }
+
+    #[test]
+    fn test_foreign_id_deletion_cannot_poison_target() {
+        let keys = Keys::generate();
+        let stranger = Keys::generate();
+        let target = EventBuilder::new(Kind::TextNote, "target")
+            .finalize(&keys)
+            .unwrap();
+        for deletion_first in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let lmdb = Lmdb::from_builder(NostrLmdbBuilder::new(dir.path())).unwrap();
+            let deletion = EventBuilder::new(Kind::EventDeletion, "")
+                .tags([Tag::event(target.id)])
+                .finalize(&stranger)
+                .unwrap();
+            if !deletion_first {
+                assert_eq!(save_event(&lmdb, &target), SaveEventStatus::Success);
+            }
+            let expected = match deletion_first {
+                true => SaveEventStatus::Success,
+                false => SaveEventStatus::Rejected(RejectedReason::InvalidDelete),
+            };
+            assert_eq!(save_event(&lmdb, &deletion), expected);
+            if deletion_first {
+                assert_eq!(save_event(&lmdb, &target), SaveEventStatus::Success);
+            }
+            let txn = lmdb.read_txn().unwrap();
+            assert!(lmdb.has_event(&txn, &target.id).unwrap());
+            assert!(!lmdb.is_deleted(&txn, &target.id).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_deleted_version_cannot_replace_live_version() {
+        let keys = Keys::generate();
+        for kind in [Kind::Metadata, Kind::Custom(30001)] {
+            let dir = TempDir::new().unwrap();
+            let lmdb = Lmdb::from_builder(NostrLmdbBuilder::new(dir.path())).unwrap();
+            let older = EventBuilder::new(kind, "live")
+                .tags([Tag::identifier("test")])
+                .custom_created_at(Timestamp::from_secs(10))
+                .finalize(&keys)
+                .unwrap();
+            let target = EventBuilder::new(kind, "deleted")
+                .tags([Tag::identifier("test")])
+                .custom_created_at(Timestamp::from_secs(20))
+                .finalize(&keys)
+                .unwrap();
+            let deletion = EventBuilder::new(Kind::EventDeletion, "")
+                .tags([Tag::event(target.id)])
+                .finalize(&keys)
+                .unwrap();
+            assert_eq!(save_event(&lmdb, &older), SaveEventStatus::Success);
+            assert_eq!(save_event(&lmdb, &deletion), SaveEventStatus::Success);
+            assert_eq!(
+                save_event(&lmdb, &target),
+                SaveEventStatus::Rejected(RejectedReason::Deleted)
+            );
+            let txn = lmdb.read_txn().unwrap();
+            assert!(lmdb.has_event(&txn, &older.id).unwrap());
+            assert!(!lmdb.has_event(&txn, &target.id).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_id_deletion_requires_exact_tag_and_kind() {
+        let dir = TempDir::new().unwrap();
+        let lmdb = Lmdb::from_builder(NostrLmdbBuilder::new(dir.path())).unwrap();
+        let keys = Keys::generate();
+        let target = EventBuilder::new(Kind::TextNote, "target")
+            .finalize(&keys)
+            .unwrap();
+        for (kind, tag_name, tag_value) in [
+            (Kind::TextNote, "e", target.id.to_hex()),
+            (Kind::EventDeletion, "E", target.id.to_hex()),
+            // The tag index pads values with zero bytes. A malformed value
+            // must not be treated as a valid event ID because its key matches.
+            (
+                Kind::EventDeletion,
+                "e",
+                format!("{}\0", target.id.to_hex()),
+            ),
+        ] {
+            let request = EventBuilder::new(kind, "")
+                .tags([Tag::parse([tag_name, tag_value.as_str()]).unwrap()])
+                .finalize(&keys)
+                .unwrap();
+            assert_eq!(save_event(&lmdb, &request), SaveEventStatus::Success);
+        }
+        assert_eq!(save_event(&lmdb, &target), SaveEventStatus::Success);
+    }
+
+    #[test]
+    fn test_retained_id_deletion_respects_process_nip09() {
+        let dir = TempDir::new().unwrap();
+        let lmdb =
+            Lmdb::from_builder(NostrLmdbBuilder::new(dir.path()).process_nip09(false)).unwrap();
+        let keys = Keys::generate();
+        let target = EventBuilder::new(Kind::TextNote, "target")
+            .finalize(&keys)
+            .unwrap();
+        let deletion = EventBuilder::new(Kind::EventDeletion, "")
+            .tags([Tag::event(target.id)])
+            .finalize(&keys)
+            .unwrap();
+        assert_eq!(save_event(&lmdb, &deletion), SaveEventStatus::Success);
+        {
+            let mut txn = lmdb.write_txn().unwrap();
+            lmdb.mark_deleted_by_author(&mut txn, &target.id, &keys.public_key())
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        assert_eq!(save_event(&lmdb, &target), SaveEventStatus::Success);
+    }
+
+    #[test]
+    fn test_multi_target_deletion_tombstones_unknown_target() {
+        let dir = TempDir::new().unwrap();
+        let lmdb = Lmdb::from_builder(NostrLmdbBuilder::new(dir.path())).unwrap();
+        let keys = Keys::generate();
+        let known = EventBuilder::new(Kind::TextNote, "known")
+            .finalize(&keys)
+            .unwrap();
+        let unknown = EventBuilder::new(Kind::TextNote, "unknown")
+            .finalize(&keys)
+            .unwrap();
+        let deletion = EventBuilder::new(Kind::EventDeletion, "")
+            .tags([Tag::event(known.id), Tag::event(unknown.id)])
+            .finalize(&keys)
+            .unwrap();
+        assert_eq!(save_event(&lmdb, &known), SaveEventStatus::Success);
+        assert_eq!(save_event(&lmdb, &deletion), SaveEventStatus::Success);
+        {
+            let mut txn = lmdb.write_txn().unwrap();
+            assert!(!lmdb.has_event(&txn, &known.id).unwrap());
+            assert!(!lmdb.is_deleted(&txn, &unknown.id).unwrap());
+            assert!(
+                lmdb.is_deleted_by_author(&txn, &unknown.id, &keys.public_key())
+                    .unwrap()
+            );
+            // Tombstones survive removal of the request itself.
+            lmdb.delete(&mut txn, Filter::new().id(deletion.id))
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        for event in [&known, &unknown] {
+            assert_eq!(
+                save_event(&lmdb, event),
+                SaveEventStatus::Rejected(RejectedReason::Deleted)
+            );
+        }
+        {
+            let mut txn = lmdb.write_txn().unwrap();
+            lmdb.wipe(&mut txn).unwrap();
+            txn.commit().unwrap();
+        }
+        assert_eq!(save_event(&lmdb, &unknown), SaveEventStatus::Success);
+    }
+
+    #[test]
+    fn test_multiple_deletion_authors_do_not_overwrite_each_other() {
+        let keys = Keys::generate();
+        let stranger = Keys::generate();
+        let target = EventBuilder::new(Kind::TextNote, "target")
+            .finalize(&keys)
+            .unwrap();
+        for foreign_first in [false, true] {
+            let dir = TempDir::new().unwrap();
+            let lmdb = Lmdb::from_builder(NostrLmdbBuilder::new(dir.path())).unwrap();
+            let authors = match foreign_first {
+                true => [&stranger, &keys],
+                false => [&keys, &stranger],
+            };
+            for author in authors {
+                let deletion = EventBuilder::new(Kind::EventDeletion, "")
+                    .tags([Tag::event(target.id)])
+                    .finalize(author)
+                    .unwrap();
+                assert_eq!(save_event(&lmdb, &deletion), SaveEventStatus::Success);
+            }
+            assert_eq!(
+                save_event(&lmdb, &target),
+                SaveEventStatus::Rejected(RejectedReason::Deleted)
+            );
+        }
+    }
+
+    #[test]
+    fn test_invalid_deletion_does_not_leave_tombstones() {
+        let dir = TempDir::new().unwrap();
+        let lmdb = Lmdb::from_builder(NostrLmdbBuilder::new(dir.path())).unwrap();
+        let keys = Keys::generate();
+        let stranger = Keys::generate();
+        let known = EventBuilder::new(Kind::TextNote, "known")
+            .finalize(&keys)
+            .unwrap();
+        let unknown = EventBuilder::new(Kind::TextNote, "unknown")
+            .finalize(&keys)
+            .unwrap();
+        let foreign = EventBuilder::new(Kind::TextNote, "foreign")
+            .finalize(&stranger)
+            .unwrap();
+        assert_eq!(save_event(&lmdb, &known), SaveEventStatus::Success);
+        assert_eq!(save_event(&lmdb, &foreign), SaveEventStatus::Success);
+        let foreign_coordinate = Coordinate::new(Kind::Metadata, stranger.public_key()).to_string();
+        for invalid_tag in [
+            Tag::event(foreign.id),
+            Tag::parse(["a", &foreign_coordinate]).unwrap(),
+        ] {
+            let deletion = EventBuilder::new(Kind::EventDeletion, "")
+                .tags([Tag::event(known.id), Tag::event(unknown.id), invalid_tag])
+                .finalize(&keys)
+                .unwrap();
+            assert_eq!(
+                save_event(&lmdb, &deletion),
+                SaveEventStatus::Rejected(RejectedReason::InvalidDelete)
+            );
+            let txn = lmdb.read_txn().unwrap();
+            assert!(lmdb.has_event(&txn, &known.id).unwrap());
+            assert!(!lmdb.is_deleted(&txn, &known.id).unwrap());
+            assert!(
+                !lmdb
+                    .is_deleted_by_author(&txn, &unknown.id, &keys.public_key())
+                    .unwrap()
+            );
+        }
+        assert_eq!(save_event(&lmdb, &unknown), SaveEventStatus::Success);
+    }
+
+    #[test]
+    fn test_migration_v2_to_v3_preserves_and_backfills_tombstones() {
+        let dir = TempDir::new().unwrap();
+        let builder = NostrLmdbBuilder::new(dir.path());
+        let keys = Keys::generate();
+        let stranger = Keys::generate();
+        let known = EventBuilder::new(Kind::TextNote, "known")
+            .finalize(&keys)
+            .unwrap();
+        let unknown = EventBuilder::new(Kind::TextNote, "unknown")
+            .finalize(&keys)
+            .unwrap();
+        let foreign = EventBuilder::new(Kind::TextNote, "foreign")
+            .finalize(&stranger)
+            .unwrap();
+        let deletion = EventBuilder::new(Kind::EventDeletion, "")
+            .tags([
+                Tag::event(known.id),
+                Tag::event(unknown.id),
+                Tag::event(foreign.id),
+            ])
+            .finalize(&keys)
+            .unwrap();
+        {
+            let lmdb = Lmdb::from_builder(builder.clone()).unwrap();
+            assert_eq!(save_event(&lmdb, &known), SaveEventStatus::Success);
+            assert_eq!(save_event(&lmdb, &deletion), SaveEventStatus::Success);
+            let mut txn = lmdb.write_txn().unwrap();
+            // Model v2: only the known target has an ID-only tombstone.
+            lmdb.deleted_ids.clear(&mut txn).unwrap();
+            lmdb.mark_deleted(&mut txn, &known.id).unwrap();
+            lmdb.metadata.put(&mut txn, DB_VERSION_KEY, &2).unwrap();
+            txn.commit().unwrap();
+        }
+        let lmdb = Lmdb::from_builder(builder).unwrap();
+        {
+            let mut txn = lmdb.write_txn().unwrap();
+            assert_eq!(lmdb.metadata.get(&txn, DB_VERSION_KEY).unwrap(), Some(3));
+            assert!(lmdb.is_deleted(&txn, &known.id).unwrap());
+            assert!(!lmdb.is_deleted(&txn, &unknown.id).unwrap());
+            assert!(
+                lmdb.is_deleted_by_author(&txn, &unknown.id, &keys.public_key())
+                    .unwrap()
+            );
+            // Backfilled tombstones do not depend on keeping the source event.
+            lmdb.delete(&mut txn, Filter::new().id(deletion.id))
+                .unwrap();
+            txn.commit().unwrap();
+        }
+        assert_eq!(
+            save_event(&lmdb, &known),
+            SaveEventStatus::Rejected(RejectedReason::Deleted)
+        );
+        assert_eq!(
+            save_event(&lmdb, &unknown),
+            SaveEventStatus::Rejected(RejectedReason::Deleted)
+        );
+        assert_eq!(save_event(&lmdb, &foreign), SaveEventStatus::Success);
     }
 
     #[test]
