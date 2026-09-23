@@ -443,8 +443,9 @@ impl Relay {
 
     /// Stream events from relay.
     ///
-    /// Awaiting the builder omits successful terminal markers. Use
-    /// [`StreamEvents::with_outcomes`] to inspect completion or a reached limit.
+    /// Awaiting the builder preserves the legacy event stream behavior: timeout
+    /// and disconnection end the stream without a terminal item. Use
+    /// [`StreamEvents::with_outcomes`] to inspect completion, limits, and failures.
     #[inline]
     pub fn stream_events<F>(&self, filters: F) -> StreamEvents<'_>
     where
@@ -453,7 +454,9 @@ impl Relay {
         StreamEvents::new(self, filters.into())
     }
 
-    /// Fetch events
+    /// Fetch events. Awaiting this builder can return partial events after a
+    /// timeout or disconnect; use [`StreamEvents::with_outcomes`] for a terminal
+    /// outcome when that distinction matters.
     #[inline]
     pub fn fetch_events<F>(&self, filters: F) -> FetchEvents<'_>
     where

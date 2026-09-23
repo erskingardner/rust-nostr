@@ -22,6 +22,8 @@ use crate::relay::{
 /// producer and collector may each hold one additional event, which can be
 /// larger than the budget. It does not bound Rust object overhead, temporary
 /// serialization, shared connection queues, WebSocket frames, or parser allocations.
+/// Every received event is serialized again to measure its JSON length, including
+/// duplicates; callers should budget CPU as well as retained data for heavy traffic.
 #[derive(Debug, Clone, Copy)]
 pub struct AcquisitionLimits {
     /// Maximum received EVENT notifications per relay, including duplicates.

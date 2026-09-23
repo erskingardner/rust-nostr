@@ -280,6 +280,7 @@ impl Client {
                     None,
                     Some(self.config().gossip_config.fetch_timeout),
                     ReqExitPolicy::ExitOnEOSE,
+                    true,
                 )
                 .await?;
 
@@ -342,6 +343,7 @@ impl Client {
                 None,
                 Some(self.config().gossip_config.fetch_timeout),
                 ReqExitPolicy::ExitOnEOSE,
+                true,
             )
             .await?;
 

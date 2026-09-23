@@ -858,6 +858,8 @@ impl Client {
     ///
     /// Network or relay-specific errors are reported **inside the stream**
     /// as `Err(relay::Error)` items.
+    /// The legacy awaited stream ends quietly on a request timeout or relay
+    /// disconnect; use `with_outcomes` to distinguish those terminal states.
     ///
     /// # Examples
     ///
@@ -930,7 +932,8 @@ impl Client {
     /// Creates a short-lived event subscription and returns a list of events.
     /// Compared to [`Client::stream_events`], this buffers events internally and returns them only after the stream terminates.
     /// Awaiting the builder returns events from healthy relays even if another
-    /// relay fails, without returning endpoint outcomes. Use
+    /// relay fails, without returning endpoint outcomes. It can contain partial
+    /// history after a timeout or disconnect. Use
     /// [`FetchEvents::with_outcomes`] to retain partial events together with
     /// each selected relay's outcome and buffer truncation status.
     ///

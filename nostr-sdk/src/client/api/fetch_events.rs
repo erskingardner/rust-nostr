@@ -103,7 +103,7 @@ impl<'client, 'url> FetchEvents<'client, 'url> {
             stream = stream.timeout(timeout);
         }
 
-        let (urls, mut stream) = stream.into_outcome_stream_with_targets().await?;
+        let (urls, mut stream) = stream.into_outcome_stream_with_targets(true).await?;
         let mut result = FetchEventsOutcome {
             events: BTreeSet::new(),
             relays: urls

@@ -86,6 +86,7 @@ impl<'relay> StreamEvents<'relay> {
 
     pub(crate) async fn into_relay_event_stream(
         self,
+        report_terminal_errors: bool,
     ) -> Result<SubscriptionActivityEventStream, Error> {
         // Create channels
         let (tx, rx) = mpsc::channel(512);
@@ -110,7 +111,11 @@ impl<'relay> StreamEvents<'relay> {
         )
         .await?;
 
-        Ok(SubscriptionActivityEventStream::new(rx, cancel_tx))
+        Ok(SubscriptionActivityEventStream::new(
+            rx,
+            cancel_tx,
+            report_terminal_errors,
+        ))
     }
 
     /// Stream events together with the relay's terminal outcome.
@@ -121,7 +126,7 @@ impl<'relay> StreamEvents<'relay> {
     pub async fn with_outcomes(
         self,
     ) -> Result<Pin<Box<dyn Stream<Item = RelayStreamEvent> + Send>>, Error> {
-        Ok(Box::pin(self.into_relay_event_stream().await?))
+        Ok(Box::pin(self.into_relay_event_stream(true).await?))
     }
 }
 
@@ -131,7 +136,7 @@ impl<'relay> IntoFuture for StreamEvents<'relay> {
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let stream = self.into_relay_event_stream().await?;
+            let stream = self.into_relay_event_stream(false).await?;
 
             Ok(Box::pin(stream.filter_map(async |e| match e {
                 RelayStreamEvent::Event(event) => Some(Ok(event)),
@@ -146,14 +151,20 @@ pub(crate) struct SubscriptionActivityEventStream {
     rx: mpsc::Receiver<SubscriptionActivity>,
     done: bool,
     cancel: Option<oneshot::Sender<()>>,
+    report_terminal_errors: bool,
 }
 
 impl SubscriptionActivityEventStream {
-    fn new(rx: mpsc::Receiver<SubscriptionActivity>, cancel: oneshot::Sender<()>) -> Self {
+    fn new(
+        rx: mpsc::Receiver<SubscriptionActivity>,
+        cancel: oneshot::Sender<()>,
+        report_terminal_errors: bool,
+    ) -> Self {
         Self {
             rx,
             done: false,
             cancel: Some(cancel),
+            report_terminal_errors,
         }
     }
 }
@@ -204,11 +215,19 @@ impl Stream for SubscriptionActivityEventStream {
                     }
                     SubscriptionAutoClosedReason::TimedOut => {
                         self.done = true;
-                        Poll::Ready(Some(RelayStreamEvent::Error(Error::timeout())))
+                        if self.report_terminal_errors {
+                            Poll::Ready(Some(RelayStreamEvent::Error(Error::timeout())))
+                        } else {
+                            Poll::Ready(None)
+                        }
                     }
                     SubscriptionAutoClosedReason::Disconnected => {
                         self.done = true;
-                        Poll::Ready(Some(RelayStreamEvent::Error(Error::not_connected())))
+                        if self.report_terminal_errors {
+                            Poll::Ready(Some(RelayStreamEvent::Error(Error::not_connected())))
+                        } else {
+                            Poll::Ready(None)
+                        }
                     }
                     SubscriptionAutoClosedReason::LimitReached => {
                         self.done = true;
@@ -253,7 +272,7 @@ mod tests {
     async fn reporting_stream_preserves_limit_and_receiver_failure() {
         let (tx, rx) = mpsc::channel(2);
         let (cancel_tx, _cancel_rx) = oneshot::channel();
-        let mut stream = SubscriptionActivityEventStream::new(rx, cancel_tx);
+        let mut stream = SubscriptionActivityEventStream::new(rx, cancel_tx, true);
 
         tx.send(SubscriptionActivity::Closed(
             SubscriptionAutoClosedReason::LimitReached,
@@ -268,7 +287,7 @@ mod tests {
 
         let (tx, rx) = mpsc::channel(2);
         let (cancel_tx, _cancel_rx) = oneshot::channel();
-        let mut stream = SubscriptionActivityEventStream::new(rx, cancel_tx);
+        let mut stream = SubscriptionActivityEventStream::new(rx, cancel_tx, true);
         tx.send(SubscriptionActivity::Closed(
             SubscriptionAutoClosedReason::Lagged(6),
         ))
@@ -281,6 +300,20 @@ mod tests {
             other => panic!("expected receiver loss, got {other:?}"),
         }
         assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_stream_ends_quietly_on_timeout_and_disconnect() {
+        for reason in [
+            SubscriptionAutoClosedReason::TimedOut,
+            SubscriptionAutoClosedReason::Disconnected,
+        ] {
+            let (tx, rx) = mpsc::channel(1);
+            let (cancel_tx, _cancel_rx) = oneshot::channel();
+            let mut stream = SubscriptionActivityEventStream::new(rx, cancel_tx, false);
+            tx.send(SubscriptionActivity::Closed(reason)).await.unwrap();
+            assert!(stream.next().await.is_none());
+        }
     }
 
     #[tokio::test]

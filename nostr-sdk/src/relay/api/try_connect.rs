@@ -14,6 +14,19 @@ pub struct TryConnect<'relay> {
     timeout: Duration,
 }
 
+struct ReservedConnection<'relay> {
+    relay: &'relay Relay,
+    transferred: bool,
+}
+
+impl Drop for ReservedConnection<'_> {
+    fn drop(&mut self) {
+        if !self.transferred {
+            self.relay.inner.finish_reserved_connection_task();
+        }
+    }
+}
+
 impl<'relay> TryConnect<'relay> {
     #[inline]
     pub(crate) fn new(relay: &'relay Relay) -> Self {
@@ -63,6 +76,16 @@ impl<'relay> IntoFuture for TryConnect<'relay> {
                 return Err(Error::connection_rejected(reason));
             }
 
+            // Reserve the relay before dialing. Otherwise a retiring task can
+            // still own it after the handshake publishes Connected.
+            if !self.relay.inner.reserve_try_connect()? {
+                return Ok(());
+            }
+            let mut reservation = ReservedConnection {
+                relay: self.relay,
+                transferred: false,
+            };
+
             // Try to connect
             // This will set the status to "terminated" if the connection fails
             let stream: (WebSocketSink, WebSocketStream) = self
@@ -71,12 +94,8 @@ impl<'relay> IntoFuture for TryConnect<'relay> {
                 ._try_connect(self.timeout, RelayStatus::Terminated)
                 .await?;
 
-            // Spawn connection task
-            if !self.relay.inner.spawn_connection_task(Some(stream)) {
-                return Err(Error::state_msg(
-                    "previous connection task is stopping; reconnect queued",
-                ));
-            }
+            self.relay.inner.spawn_reserved_connection_task(stream);
+            reservation.transferred = true;
 
             Ok(())
         })

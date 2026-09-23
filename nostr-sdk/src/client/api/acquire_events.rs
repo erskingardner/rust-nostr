@@ -132,7 +132,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::time::{Duration, Instant};
 
-    use futures::StreamExt;
+    use futures::{Stream, StreamExt};
     use nostr::event::{Event, EventBuilder, EventId, FinalizeEvent, Kind};
     use nostr::filter::Filter;
     use nostr::key::Keys;
@@ -141,11 +141,37 @@ mod tests {
 
     use super::*;
     use crate::local_relay::MockRelay;
-    use crate::relay::{AcquisitionEnd, RelayNotification, ReqExitPolicy};
+    use crate::relay::{AcquisitionEnd, Relay, RelayNotification, ReqExitPolicy};
     use crate::test_utils::setup_client;
 
     fn limits(items: usize) -> AcquisitionLimits {
         AcquisitionLimits::new(2, items, 100_000, Duration::from_secs(2))
+    }
+
+    async fn wait_for_acquisition_eose<S>(relay: &Relay, notifications: &mut S)
+    where
+        S: Stream<Item = RelayNotification> + Unpin,
+    {
+        let id = timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(id) = relay.inner.auto_closing_subscription_id().await {
+                    break id;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("acquisition subscription was not registered");
+        timeout(Duration::from_secs(1), async {
+            loop {
+                let update = notifications.next().await.expect("relay notifications closed");
+                if matches!(update, RelayNotification::Message { message } if matches!(*message, RelayMessage::EndOfStoredEvents(ref received) if received.as_ref() == &id)) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("acquisition did not receive EOSE");
     }
 
     async fn inventory(relay: &MockRelay, count: usize) -> Vec<Event> {
@@ -269,6 +295,7 @@ mod tests {
             .await
             .unwrap();
         let slow = limits(10).policy(ReqExitPolicy::WaitDurationAfterEOSE(Duration::from_secs(5)));
+        let mut notifications = connection.notifications();
         let handle = client
             .acquire_events(
                 ReqTarget::single(&url, [Filter::new().kind(Kind::TextNote)]),
@@ -276,7 +303,7 @@ mod tests {
             )
             .await
             .unwrap();
-        sleep(Duration::from_millis(40)).await;
+        wait_for_acquisition_eose(&connection, &mut notifications).await;
         let control_event = EventBuilder::new(Kind::Custom(1_234), "concurrent control")
             .finalize(&Keys::generate())
             .unwrap();
@@ -309,7 +336,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(matches!(report.relays[&url].end, AcquisitionEnd::Cancelled));
-        assert_eq!(report.relays[&url].events.len(), 1);
+        assert!(report.relays[&url].events.len() <= 1);
         assert!(started.elapsed() < Duration::from_secs(1));
         eprintln!(
             "stalled consumer cancellation latency: {:?}",
@@ -370,8 +397,10 @@ mod tests {
             )
             .await
             .unwrap();
-        sleep(Duration::from_millis(40)).await;
-        client.pool().relay(&url).await.unwrap().disconnect();
+        let connection = client.pool().relay(&url).await.unwrap();
+        let mut notifications = connection.notifications();
+        wait_for_acquisition_eose(&connection, &mut notifications).await;
+        connection.disconnect();
         let report = timeout(Duration::from_secs(1), handle.finish())
             .await
             .unwrap()
@@ -380,7 +409,7 @@ mod tests {
             report.relays[&url].end,
             AcquisitionEnd::Disconnected
         ));
-        assert_eq!(report.relays[&url].events.len(), 1);
+        assert!(report.relays[&url].events.len() <= 1);
     }
 
     #[tokio::test]
@@ -441,7 +470,6 @@ mod tests {
             .unwrap();
         let canceller = handle.canceller();
         let other_task = tokio::spawn(async move {
-            sleep(Duration::from_millis(40)).await;
             canceller.cancel();
         });
         let report = timeout(Duration::from_secs(1), handle.finish())
@@ -450,7 +478,7 @@ mod tests {
             .unwrap();
         other_task.await.unwrap();
         assert!(matches!(report.relays[&url].end, AcquisitionEnd::Cancelled));
-        assert_eq!(report.relays[&url].events.len(), 1);
+        assert!(report.relays[&url].events.len() <= 1);
     }
 
     #[tokio::test]

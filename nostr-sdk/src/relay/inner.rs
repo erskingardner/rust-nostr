@@ -105,6 +105,13 @@ impl RelayChannels {
     pub fn terminate(&self) {
         self.terminate.notify_one()
     }
+
+    fn clear_termination_permit(&self) {
+        let mut notified = std::pin::pin!(self.terminate.notified());
+        // `enable` consumes a stored permit, if any. The old task no longer
+        // waits for it when its replacement is reserved.
+        let _ = notified.as_mut().enable();
+    }
 }
 
 #[derive(Debug)]
@@ -619,27 +626,40 @@ impl InnerRelay {
         self.stats.just_woke_up();
     }
 
-    pub(super) fn spawn_connection_task(
-        &self,
-        stream: Option<(WebSocketSink, WebSocketStream)>,
-    ) -> bool {
+    pub(super) fn reserve_try_connect(&self) -> Result<bool, Error> {
         let mut ownership = self.atomic.connection_task.lock().unwrap();
         let status = self.status();
-        if status.is_terminated() || status.is_banned() || status.is_shutdown() {
-            return false;
+        if status.is_shutdown() {
+            return Err(Error::shutdown());
+        }
+        if status.is_banned() {
+            return Err(Error::banned());
+        }
+        if !status.can_connect() {
+            return Ok(false);
         }
         if ownership.running {
             ownership.restart_requested = true;
-            if stream.is_some() {
-                self.set_status(RelayStatus::Pending, false);
-            }
-            return false;
+            self.set_status(RelayStatus::Pending, false);
+            return Err(Error::state_msg(
+                "previous connection task is stopping; reconnect queued",
+            ));
         }
+        self.atomic.channels.clear_termination_permit();
         ownership.running = true;
-        drop(ownership);
+        self.set_status(RelayStatus::Pending, false);
+        Ok(true)
+    }
 
-        task::spawn(self.clone().connection_task(stream));
-        true
+    pub(super) fn spawn_reserved_connection_task(&self, stream: (WebSocketSink, WebSocketStream)) {
+        task::spawn(self.clone().connection_task(Some(stream)));
+    }
+
+    pub(super) fn finish_reserved_connection_task(&self) {
+        if self.status() == RelayStatus::Connecting {
+            self.set_status(RelayStatus::Terminated, false);
+        }
+        self.finish_connection_task();
     }
 
     pub(super) fn request_connect(&self) {
@@ -654,6 +674,7 @@ impl InnerRelay {
             return;
         }
 
+        self.atomic.channels.clear_termination_permit();
         ownership.running = true;
         drop(ownership);
         task::spawn(self.clone().connection_task(None));
@@ -794,6 +815,7 @@ impl InnerRelay {
             if status.is_terminated() {
                 self.set_status(RelayStatus::Pending, false);
             }
+            self.atomic.channels.clear_termination_permit();
             // Keep ownership reserved until the replacement task starts.
             drop(ownership);
             task::spawn(self.clone().connection_task(None));
@@ -852,8 +874,18 @@ impl InnerRelay {
         timeout: Duration,
         status_on_failure: RelayStatus,
     ) -> Result<(WebSocketSink, WebSocketStream), Error> {
-        // Update status
-        self.set_status(RelayStatus::Connecting, true);
+        {
+            let ownership = self.atomic.connection_task.lock().unwrap();
+            let status = self.status();
+            if ownership.restart_requested
+                || status.is_terminated()
+                || status.is_banned()
+                || status.is_shutdown()
+            {
+                return Err(Error::state_msg("connection attempt superseded"));
+            }
+            self.set_status(RelayStatus::Connecting, true);
+        }
 
         // Increase the attempts
         self.stats.new_attempt();
@@ -872,7 +904,12 @@ impl InnerRelay {
             // Connect
             res = fut => match res {
                 Some(Ok((ws_tx, ws_rx))) => {
-                    // Update status
+                    // A disconnect or replacement request may have superseded
+                    // this dial while the transport was connecting.
+                    let _ownership = self.atomic.connection_task.lock().unwrap();
+                    if self.status() != RelayStatus::Connecting {
+                        return Err(Error::state_msg("connection attempt superseded"));
+                    }
                     self.set_status(RelayStatus::Connected, true);
 
                     // Increment success stats
@@ -881,15 +918,19 @@ impl InnerRelay {
                     Ok((ws_tx, ws_rx))
                 }
                 Some(Err(e)) => {
-                    // Update status
-                    self.set_status(status_on_failure, false);
+                    let _ownership = self.atomic.connection_task.lock().unwrap();
+                    if self.status() == RelayStatus::Connecting {
+                        self.set_status(status_on_failure, false);
+                    }
 
                     // Return error
                     Err(Error::transport(e))
                 }
                 None => {
-                    // Update status
-                    self.set_status(status_on_failure, false);
+                    let _ownership = self.atomic.connection_task.lock().unwrap();
+                    if self.status() == RelayStatus::Connecting {
+                        self.set_status(status_on_failure, false);
+                    }
 
                     // Return error
                     Err(Error::timeout())
@@ -2268,15 +2309,35 @@ mod tests {
 
     #[tokio::test]
     async fn reconnect_requested_during_task_teardown_is_not_lost() {
-        reconnect_during_teardown(true).await;
+        reconnect_during_teardown(true, false).await;
     }
 
     #[tokio::test]
     async fn explicit_reconnect_during_teardown_works_without_automatic_reconnect() {
-        reconnect_during_teardown(false).await;
+        reconnect_during_teardown(false, false).await;
     }
 
-    async fn reconnect_during_teardown(automatic_reconnect: bool) {
+    #[tokio::test]
+    async fn queued_reconnect_ignores_stale_termination_permit() {
+        reconnect_during_teardown(false, true).await;
+    }
+
+    #[tokio::test]
+    async fn connect_after_idle_disconnect_ignores_stored_termination() {
+        let local = MockRelay::run().await.unwrap();
+        let relay = Relay::builder(local.url().await)
+            .opts(RelayOptions::default().reconnect(false))
+            .build();
+        relay.disconnect();
+        assert_eq!(relay.status(), RelayStatus::Terminated);
+
+        relay.connect();
+        relay.wait_for_connection(Duration::from_secs(2)).await;
+        assert_eq!(relay.status(), RelayStatus::Connected);
+        assert_eq!(relay.stats().success(), 1);
+    }
+
+    async fn reconnect_during_teardown(automatic_reconnect: bool, stale_termination: bool) {
         let local = MockRelay::run().await.unwrap();
         let relay = Relay::builder(local.url().await)
             .opts(RelayOptions::default().reconnect(automatic_reconnect))
@@ -2318,6 +2379,11 @@ mod tests {
             .unwrap();
         assert_eq!(relay.status(), RelayStatus::Terminated);
         assert!(relay.inner.is_running());
+
+        if stale_termination {
+            // The old task no longer polls the termination Notify at this gate.
+            relay.inner.atomic.channels.terminate();
+        }
 
         let ((), ()) = tokio::join!(async { relay.connect() }, async { relay.connect() });
         assert_eq!(relay.status(), RelayStatus::Pending);
@@ -2434,6 +2500,8 @@ mod tests {
             .await
             .unwrap();
 
+        let success_before = relay.stats().success();
+        let mut status_updates = relay.inner.internal_notification_sender.subscribe();
         let error = relay
             .try_connect()
             .timeout(Duration::from_secs(2))
@@ -2441,6 +2509,17 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::State);
         assert_eq!(relay.status(), RelayStatus::Pending);
+        assert_eq!(relay.stats().success(), success_before);
+        loop {
+            match status_updates.try_recv() {
+                Ok(RelayNotification::RelayStatus {
+                    status: RelayStatus::Connected,
+                }) => panic!("discarded try_connect socket reported Connected"),
+                Ok(_) => {}
+                Err(broadcast::error::TryRecvError::Empty) => break,
+                Err(error) => panic!("unexpected status receiver error: {error}"),
+            }
+        }
         let mut notifications = relay.notifications();
         hook.release.notify_one();
 

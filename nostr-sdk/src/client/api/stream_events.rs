@@ -76,12 +76,13 @@ impl<'client, 'url> StreamEvents<'client, 'url> {
     pub async fn with_outcomes(
         self,
     ) -> Result<Pin<Box<dyn Stream<Item = (RelayUrl, RelayStreamEvent)> + Send>>, Error> {
-        let (_, stream) = self.into_outcome_stream_with_targets().await?;
+        let (_, stream) = self.into_outcome_stream_with_targets(true).await?;
         Ok(stream)
     }
 
     pub(crate) async fn into_outcome_stream_with_targets(
         self,
+        report_terminal_errors: bool,
     ) -> Result<
         (
             Vec<RelayUrl>,
@@ -95,7 +96,13 @@ impl<'client, 'url> StreamEvents<'client, 'url> {
         let stream = self
             .client
             .pool()
-            .stream_events(targets, self.id, self.timeout, self.policy)
+            .stream_events(
+                targets,
+                self.id,
+                self.timeout,
+                self.policy,
+                report_terminal_errors,
+            )
             .await?;
         Ok((urls, Box::pin(stream)))
     }
@@ -110,7 +117,7 @@ where
 
     fn into_future(self) -> Self::IntoFuture {
         Box::pin(async move {
-            let stream = self.with_outcomes().await?;
+            let (_, stream) = self.into_outcome_stream_with_targets(false).await?;
 
             Ok(Box::pin(stream.filter_map(|(url, item)| async move {
                 match item {

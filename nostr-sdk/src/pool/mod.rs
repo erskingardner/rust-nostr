@@ -739,6 +739,7 @@ impl RelayPool {
         id: Option<SubscriptionId>,
         timeout: Option<Duration>,
         policy: ReqExitPolicy,
+        report_terminal_errors: bool,
     ) -> Result<ReceiverStream<(RelayUrl, RelayStreamEvent)>, Error> {
         // Check if `targets` map is empty
         if filters.is_empty() {
@@ -774,7 +775,7 @@ impl RelayPool {
                     .with_id(id.clone())
                     .maybe_timeout(timeout)
                     .policy(policy)
-                    .into_relay_event_stream(),
+                    .into_relay_event_stream(report_terminal_errors),
             );
         }
 
