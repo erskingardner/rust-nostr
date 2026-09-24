@@ -9,8 +9,13 @@ It does not persist events or maintain recovery obligations.
 Acquisition REQs use request-local subscription IDs. Valid events still reach
 the bounded per-relay result, but the acquisition does not save a first-seen
 event into the client's shared event database, update shared gossip routing, or
-emit an ordinary live `Event` notification. A later copy on an active live subscription retains its normal
-first-delivery behavior. The SDK recognizes only its own relay-instance
+emit an ordinary live `Event` notification. A later copy on an active live
+subscription retains its normal first-delivery behavior. Acquisition input
+still passes signature, expiry, configured subscription/admission checks, and
+the database's ID-level deletion check. It does not pass `save_event` rules for
+coordinate deletion, replacement, vanish, or other storage rejection before
+being returned. Callers must apply their own durable admission rules before
+treating a report as state. The SDK recognizes only its own relay-instance
 acquisition ID namespace after a request closes, so a late reply cannot enter
 the shared cache; unrelated caller-issued raw REQ IDs keep their behavior.
 Callers must not deliberately reuse an in-flight acquisition ID for a live

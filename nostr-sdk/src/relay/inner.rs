@@ -1395,6 +1395,22 @@ impl InnerRelay {
         subscription_id: SubscriptionId,
         event: Event,
     ) -> Result<Option<RelayMessage<'static>>, Error> {
+        let own_acquisition_id = subscription_id
+            .as_str()
+            .starts_with(&self.atomic.acquisition_namespace);
+        // A relay may send queued frames after CLOSE. Discard a closed
+        // request before size checks, which would otherwise log raw EVENT JSON.
+        if own_acquisition_id
+            && !self
+                .atomic
+                .subscriptions
+                .read()
+                .await
+                .contains_key(&subscription_id)
+        {
+            return Ok(None);
+        }
+
         // Check event size
         if let Some(max_size) = self.opts.limits.events.get_max_size(&event.kind) {
             let size: usize = event.as_json().len();
@@ -1413,18 +1429,17 @@ impl InnerRelay {
             }
         }
 
-        let is_acquisition = {
+        let is_acquisition = if own_acquisition_id
+            || self.opts.verify_subscriptions
+            || self.opts.ban_relay_on_mismatch
+        {
             let subscriptions = self.atomic.subscriptions.read().await;
             let subscription = subscriptions.get(&subscription_id);
             // Raw REQs sent through send_msg have never been registered here
-            // and retain their existing behavior. Only this relay instance's
-            // own generated acquisition IDs are rejected after teardown.
-            if subscription.is_none()
-                && subscription_id
-                    .as_str()
-                    .starts_with(&self.atomic.acquisition_namespace)
-            {
-                return Err(Error::not_found("acquisition subscription not found"));
+            // and retain their existing behavior. Late replies for our own
+            // closed acquisition are expected until the relay sees CLOSE.
+            if subscription.is_none() && own_acquisition_id {
+                return Ok(None);
             }
 
             // Check if subscription must be verified. Keep the lock during
@@ -1482,6 +1497,10 @@ impl InnerRelay {
                 }
             }
             subscription.is_some_and(|data| data.is_acquisition)
+        } else {
+            // All generated acquisition IDs have the private prefix. Ordinary
+            // traffic keeps the default no-lock path when verification is off.
+            false
         };
 
         // Check if the event is expired
@@ -2191,7 +2210,7 @@ mod tests {
     use crate::error::ErrorKind;
     use crate::local_relay::MockRelay;
     use crate::policy::{AdmitPolicy, AdmitStatus};
-    use crate::relay::{Relay, RelayOptions};
+    use crate::relay::{Relay, RelayLimits, RelayOptions};
 
     #[tokio::test]
     async fn acquisition_first_does_not_steal_live_first_sighting() {
@@ -2273,9 +2292,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn late_acquisition_id_is_rejected_without_changing_raw_req_ids() {
+    async fn late_acquisition_id_is_discarded_without_changing_raw_req_ids() {
         let url = RelayUrl::parse("wss://relay.example.com").unwrap();
-        let relay = Relay::new(url.clone());
+        let mut relay = Relay::new(url.clone());
+        let (sender, mut notifications) = broadcast::channel(8);
+        relay.set_notification_sender(sender);
         let other = Relay::new(url);
         let event = EventBuilder::new(Kind::TextNote, "late")
             .finalize(&Keys::generate())
@@ -2292,7 +2313,8 @@ mod tests {
                 .inner
                 .handle_event_msg(id.clone(), event.clone())
                 .await
-                .is_err()
+                .unwrap()
+                .is_none()
         );
         assert_eq!(
             relay
@@ -2304,6 +2326,10 @@ mod tests {
                 .unwrap(),
             DatabaseEventStatus::NotExistent
         );
+        assert!(matches!(
+            notifications.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
         // The namespace belongs to one relay instance, including its clones
         // and reconnects. Another relay's raw REQ retains prior behavior.
         assert!(matches!(
@@ -2341,6 +2367,63 @@ mod tests {
                 .await
                 .unwrap(),
             DatabaseEventStatus::Saved
+        );
+        assert!(matches!(
+            notifications.try_recv(),
+            Ok(ClientNotification::Event { event: received, .. }) if received.id == raw.id
+        ));
+
+        // A registered caller auto-close using a colliding private-prefix ID
+        // retains its ordinary behavior; registration, not spelling, owns it.
+        let caller = EventBuilder::new(Kind::TextNote, "caller registration")
+            .finalize(&Keys::generate())
+            .unwrap();
+        let caller_id = relay.inner.acquisition_subscription_id();
+        relay
+            .inner
+            .add_auto_closing_subscription(caller_id.clone(), vec![Filter::new().id(caller.id)])
+            .await
+            .unwrap();
+        relay
+            .inner
+            .handle_event_msg(caller_id.clone(), caller.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            relay
+                .inner
+                .state
+                .database()
+                .check_id(&caller.id)
+                .await
+                .unwrap(),
+            DatabaseEventStatus::Saved
+        );
+        assert!(matches!(
+            notifications.try_recv(),
+            Ok(ClientNotification::Event { subscription_id, event: received, .. })
+                if subscription_id == caller_id && received.id == caller.id
+        ));
+
+        let mut limits = RelayLimits::default();
+        limits.events.max_size = Some(1);
+        let limited = Relay::builder(RelayUrl::parse("wss://limited.example.com").unwrap())
+            .opts(RelayOptions::default().limits(limits))
+            .build();
+        let late_id = limited.inner.acquisition_subscription_id();
+        limited
+            .inner
+            .add_acquisition_subscription(late_id.clone(), vec![Filter::new().id(event.id)])
+            .await
+            .unwrap();
+        limited.inner.remove_subscription(&late_id).await;
+        assert!(
+            limited
+                .inner
+                .handle_event_msg(late_id, event)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 
