@@ -78,7 +78,9 @@ impl Client {
     /// Shared connection buffers, parsed events, and temporary serialization
     /// are additional allocations outside this request budget. Completion
     /// only satisfies the chosen request exit policy and says nothing about
-    /// durable admission or complete historical coverage.
+    /// durable admission or complete historical coverage. Acquisition events
+    /// are not saved to the client's shared event database or forwarded as
+    /// ordinary live Event notifications; the returned report owns them.
     pub async fn acquire_events<'url, F>(
         &self,
         target: F,
@@ -143,6 +145,139 @@ mod tests {
     use crate::local_relay::MockRelay;
     use crate::relay::{AcquisitionEnd, Relay, RelayNotification, ReqExitPolicy};
     use crate::test_utils::setup_client;
+
+    #[tokio::test]
+    async fn byte_rejected_acquisition_does_not_preempt_later_live_subscription() {
+        let relay = MockRelay::run().await.unwrap();
+        let event = EventBuilder::new(Kind::TextNote, "x".repeat(4_096))
+            .finalize(&Keys::generate())
+            .unwrap();
+        relay.add_event(event.clone()).await.unwrap();
+        let url = relay.url().await;
+        let client = setup_client(url.clone()).await;
+        let connection = client.pool().relay(&url).await.unwrap();
+        let mut notifications = client.notifications();
+        let report = client
+            .acquire_events(
+                ReqTarget::single(&url, [Filter::new().id(event.id)]),
+                AcquisitionLimits::new(1, 4, event.as_json().len() - 1, Duration::from_secs(2)),
+            )
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        let result = &report.relays[&url];
+        assert!(matches!(result.end, AcquisitionEnd::ByteBudgetExceeded));
+        assert_eq!(result.received_items, 1);
+        assert!(result.events.is_empty());
+        assert_eq!(
+            client.database().check_id(&event.id).await.unwrap(),
+            nostr_database::DatabaseEventStatus::NotExistent
+        );
+        // Raw Message::Event remains observable for request accounting, but
+        // the first-seen delivery notification must belong to the live REQ.
+        while let Ok(Some(notification)) =
+            timeout(Duration::from_millis(10), notifications.next()).await
+        {
+            assert!(!matches!(
+                notification,
+                crate::client::ClientNotification::Event { .. }
+            ));
+        }
+        let live_id = connection
+            .subscribe(Filter::new().id(event.id))
+            .await
+            .unwrap();
+        let received = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(crate::client::ClientNotification::Event {
+                    subscription_id,
+                    event: received,
+                    ..
+                }) = notifications.next().await
+                {
+                    break (subscription_id, received.id);
+                }
+            }
+        })
+        .await
+        .expect("live REQ receives the event after acquisition rejected its byte budget");
+        assert_eq!(received, (live_id, event.id));
+    }
+
+    #[tokio::test]
+    async fn two_relay_acquisition_keeps_shared_cache_free_until_live_delivery() {
+        let left = MockRelay::run().await.unwrap();
+        let right = MockRelay::run().await.unwrap();
+        let event = EventBuilder::new(Kind::TextNote, "cross-relay copy")
+            .finalize(&Keys::generate())
+            .unwrap();
+        left.add_event(event.clone()).await.unwrap();
+        right.add_event(event.clone()).await.unwrap();
+        let left_url = left.url().await;
+        let right_url = right.url().await;
+        let client = setup_client(left_url.clone()).await;
+        client.add_relay(&right_url).await.unwrap();
+        client
+            .try_connect_relay(right_url.clone(), Duration::from_secs(3))
+            .await
+            .unwrap();
+        let mut notifications = client.notifications();
+        let result = client
+            .acquire_events(
+                ReqTarget::manual(vec![
+                    (left_url.clone(), vec![Filter::new().id(event.id)]),
+                    (right_url.clone(), vec![Filter::new().id(event.id)]),
+                ]),
+                limits(4),
+            )
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        for url in [&left_url, &right_url] {
+            let endpoint = &result.relays[url];
+            assert!(matches!(endpoint.end, AcquisitionEnd::Completed));
+            assert_eq!(endpoint.events.len(), 1);
+        }
+        assert_eq!(
+            client.database().check_id(&event.id).await.unwrap(),
+            nostr_database::DatabaseEventStatus::NotExistent
+        );
+        while let Ok(Some(notification)) =
+            timeout(Duration::from_millis(10), notifications.next()).await
+        {
+            assert!(!matches!(
+                notification,
+                crate::client::ClientNotification::Event { .. }
+            ));
+        }
+        let live_id = client
+            .pool()
+            .relay(&left_url)
+            .await
+            .unwrap()
+            .subscribe(Filter::new().id(event.id))
+            .await
+            .unwrap();
+        let delivered = timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(crate::client::ClientNotification::Event {
+                    subscription_id,
+                    event: received,
+                    ..
+                }) = notifications.next().await
+                {
+                    break (subscription_id, received.id);
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(delivered, (live_id, event.id));
+    }
 
     fn limits(items: usize) -> AcquisitionLimits {
         AcquisitionLimits::new(2, items, 100_000, Duration::from_secs(2))
@@ -699,6 +834,11 @@ mod tests {
         })
         .await
         .unwrap();
+        let acquisition_id = connection
+            .inner
+            .auto_closing_subscription_id()
+            .await
+            .expect("acquisition request remains registered");
         let producer = tokio::spawn({
             let relay = relay.clone();
             async move {
@@ -718,10 +858,12 @@ mod tests {
         timeout(Duration::from_secs(1), async {
             loop {
                 if let Some(crate::stream::NotificationUpdate::Notification(
-                    RelayNotification::Event { event, .. },
+                    RelayNotification::Message { message },
                 )) = notifications.next().await
                 {
-                    if event.kind == Kind::TextNote {
+                    if matches!(*message, RelayMessage::Event { ref subscription_id, ref event }
+                        if subscription_id.as_ref() == &acquisition_id && event.kind == Kind::TextNote)
+                    {
                         break;
                     }
                 }

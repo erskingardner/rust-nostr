@@ -6,6 +6,15 @@ and outcome. A batch is preferable here to a stream because it can keep draining
 relay traffic while its caller is stalled, retain a bounded partial result, and
 make the terminal outcome available later through `AcquisitionHandle::finish`.
 It does not persist events or maintain recovery obligations.
+Acquisition REQs use request-local subscription IDs. Valid events still reach
+the bounded per-relay result, but the acquisition does not save a first-seen
+event into the client's shared event database, update shared gossip routing, or
+emit an ordinary live `Event` notification. A later copy on an active live subscription retains its normal
+first-delivery behavior. The SDK recognizes only its own relay-instance
+acquisition ID namespace after a request closes, so a late reply cannot enter
+the shared cache; unrelated caller-issued raw REQ IDs keep their behavior.
+Callers must not deliberately reuse an in-flight acquisition ID for a live
+REQ: the Nostr wire ID alone cannot distinguish two owners of the same ID.
 
 ```rust,no_run
 use std::time::Duration;
@@ -78,6 +87,9 @@ and removes its subscription. Setup cancellation has an asynchronous cleanup
 guard that removes the generated subscription ID and attempts CLOSE. If the
 connection is gone, CLOSE is best effort; local removal still proceeds.
 Unrelated subscriptions on the connection remain registered.
+An EVENT already in processing when teardown begins remains classified as
+acquisition input. After local removal, late replies on that generated ID are
+rejected without a retained tombstone or connection-wide teardown.
 
 Each relay reports `Completed`, `ExitLimitReached`, `ItemBudgetExceeded`,
 `ByteBudgetExceeded`, `Cancelled`, `TimedOut`, `Disconnected`, `ReceiveLoss`,
