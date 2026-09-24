@@ -48,6 +48,9 @@
 
 ### Fixed
 
+- Keep request-local `acquire_events` input out of ordinary live Event
+  notifications and the shared seen-event database, preserving later live
+  delivery and rejecting late replies after request cleanup.
 - Require a correlated COUNT response before `Relay::count_events` returns a
   count; report receive loss, closure, and rejection instead of returning zero.
 - Report receive lag and closure from auto-closing event requests. Reporting

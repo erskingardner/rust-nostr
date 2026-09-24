@@ -244,7 +244,7 @@ pub(crate) async fn acquire_relay(
 
     let (activity_tx, mut activity_rx) = mpsc::channel(1);
     let (cancel_tx, cancel_rx) = oneshot::channel();
-    let id = SubscriptionId::generate();
+    let id = relay.inner.acquisition_subscription_id();
     if filters.is_empty() {
         result.end = AcquisitionEnd::Failed(Error::invalid_msg("filters cannot be empty"));
         return result;
@@ -252,7 +252,7 @@ pub(crate) async fn acquire_relay(
     let notifications = relay.inner.internal_notification_sender.subscribe();
     let register = relay
         .inner
-        .add_auto_closing_subscription(id.clone(), filters.clone());
+        .add_acquisition_subscription(id.clone(), filters.clone());
     tokio::pin!(register);
     let register_result = tokio::select! {
         biased;

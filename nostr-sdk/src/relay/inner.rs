@@ -119,6 +119,8 @@ struct SubscriptionData {
     pub filters: Vec<Filter>,
     pub subscribed_connection: usize,
     pub is_auto_closing: bool,
+    /// Request-local acquisitions do not publish into the shared event cache.
+    pub is_acquisition: bool,
     /// Received EOSE msg
     pub received_eose: bool,
     /// Number of received events
@@ -134,6 +136,7 @@ impl SubscriptionData {
             filters,
             subscribed_connection,
             is_auto_closing: false,
+            is_acquisition: false,
             received_eose: false,
             received_events: AtomicUsize::new(0),
             closed: false,
@@ -141,11 +144,12 @@ impl SubscriptionData {
     }
 
     #[inline]
-    fn auto_closing(filters: Vec<Filter>) -> Self {
+    fn auto_closing(filters: Vec<Filter>, is_acquisition: bool) -> Self {
         Self {
             filters,
             subscribed_connection: 0,
             is_auto_closing: true,
+            is_acquisition,
             received_eose: false,
             received_events: AtomicUsize::new(0),
             closed: false,
@@ -160,6 +164,9 @@ pub(super) struct AtomicPrivateData {
     status: AtomicRelayStatus,
     channels: RelayChannels,
     subscriptions: RwLock<HashMap<SubscriptionId, SubscriptionData>>,
+    /// Immutable across clones and reconnects; classifies late acquisition
+    /// replies without retaining an unbounded set of closed request IDs.
+    acquisition_namespace: String,
     connection_task: StdMutex<ConnectionTaskOwnership>,
     #[cfg(test)]
     teardown_hook: StdMutex<Option<Arc<TeardownHook>>>,
@@ -210,6 +217,7 @@ impl InnerRelay {
                 status: AtomicRelayStatus::default(),
                 channels: RelayChannels::new(),
                 subscriptions: RwLock::new(HashMap::new()),
+                acquisition_namespace: format!("a{}", SubscriptionId::generate()),
                 connection_task: StdMutex::new(ConnectionTaskOwnership::default()),
                 #[cfg(test)]
                 teardown_hook: StdMutex::new(None),
@@ -416,6 +424,36 @@ impl InnerRelay {
         id: SubscriptionId,
         filters: Vec<Filter>,
     ) -> Result<(), Error> {
+        self.register_auto_closing_subscription(id, filters, false)
+            .await
+    }
+
+    /// Register a request-local acquisition before its REQ can receive data.
+    pub(crate) async fn add_acquisition_subscription(
+        &self,
+        id: SubscriptionId,
+        filters: Vec<Filter>,
+    ) -> Result<(), Error> {
+        self.register_auto_closing_subscription(id, filters, true)
+            .await
+    }
+
+    pub(crate) fn acquisition_subscription_id(&self) -> SubscriptionId {
+        let random = SubscriptionId::generate();
+        // 1 prefix + 32 namespace hex + 30 request hex = 63 bytes.
+        SubscriptionId::new(format!(
+            "{}{}",
+            self.atomic.acquisition_namespace,
+            &random.as_str()[..30]
+        ))
+    }
+
+    async fn register_auto_closing_subscription(
+        &self,
+        id: SubscriptionId,
+        filters: Vec<Filter>,
+        is_acquisition: bool,
+    ) -> Result<(), Error> {
         #[cfg(test)]
         let gate = self.atomic.registration_gate.lock().unwrap().take();
         #[cfg(test)]
@@ -429,7 +467,7 @@ impl InnerRelay {
             return Err(Error::invalid_msg("subscription ID already exists"));
         }
 
-        subscriptions.insert(id, SubscriptionData::auto_closing(filters));
+        subscriptions.insert(id, SubscriptionData::auto_closing(filters, is_acquisition));
 
         Ok(())
     }
@@ -464,7 +502,7 @@ impl InnerRelay {
             .get_mut(id)
             .ok_or_else(|| Error::not_found("subscription not found"))?;
 
-        *data = SubscriptionData::auto_closing(filters);
+        *data = SubscriptionData::auto_closing(filters, data.is_acquisition);
 
         Ok(())
     }
@@ -1357,6 +1395,22 @@ impl InnerRelay {
         subscription_id: SubscriptionId,
         event: Event,
     ) -> Result<Option<RelayMessage<'static>>, Error> {
+        let own_acquisition_id = subscription_id
+            .as_str()
+            .starts_with(&self.atomic.acquisition_namespace);
+        // A relay may send queued frames after CLOSE. Discard a closed
+        // request before size checks, which would otherwise log raw EVENT JSON.
+        if own_acquisition_id
+            && !self
+                .atomic
+                .subscriptions
+                .read()
+                .await
+                .contains_key(&subscription_id)
+        {
+            return Ok(None);
+        }
+
         // Check event size
         if let Some(max_size) = self.opts.limits.events.get_max_size(&event.kind) {
             let size: usize = event.as_json().len();
@@ -1375,64 +1429,79 @@ impl InnerRelay {
             }
         }
 
-        // Check if subscription must be verified
-        if self.opts.verify_subscriptions || self.opts.ban_relay_on_mismatch {
-            // NOTE: here we don't use the `self.subscription(id)` to avoid an unnecessary clone of the filter!
-
-            // Acquire read lock
+        let is_acquisition = if own_acquisition_id
+            || self.opts.verify_subscriptions
+            || self.opts.ban_relay_on_mismatch
+        {
             let subscriptions = self.atomic.subscriptions.read().await;
+            let subscription = subscriptions.get(&subscription_id);
+            // Raw REQs sent through send_msg have never been registered here
+            // and retain their existing behavior. Late replies for our own
+            // closed acquisition are expected until the relay sees CLOSE.
+            if subscription.is_none() && own_acquisition_id {
+                return Ok(None);
+            }
 
-            // Check if the subscription id exist and verify if the event matches the subscription filter.
-            let SubscriptionData {
-                filters,
-                received_eose,
-                received_events,
-                ..
-            } = subscriptions
-                .get(&subscription_id)
-                .ok_or_else(|| Error::not_found("subscription not found"))?;
+            // Check if subscription must be verified. Keep the lock during
+            // filter checks so cancellation cannot remove their source.
+            if self.opts.verify_subscriptions || self.opts.ban_relay_on_mismatch {
+                // NOTE: don't use `self.subscription(id)` here: it clones filters.
 
-            // Check filter limit ONLY if EOSE is not received yet and if there is only ONE filter.
-            // We can't ensure that limit is respected if there is more than one filter.
-            if !received_eose && filters.len() == 1 {
-                // SAFETY: we've checked above that exists one filter.
-                let filter: &Filter = &filters[0];
+                // Check if the subscription id exists and matches its filter.
+                let SubscriptionData {
+                    filters,
+                    received_eose,
+                    received_events,
+                    ..
+                } = subscription.ok_or_else(|| Error::not_found("subscription not found"))?;
 
-                // Check if the filter has a limit
-                if let Some(limit) = filter.limit {
-                    // Update number of received events
-                    let prev: usize = received_events.fetch_add(1, Ordering::SeqCst);
-                    let received_events: usize = prev.saturating_add(1);
+                // Check filter limit ONLY if EOSE is not received yet and if there is only ONE filter.
+                // We can't ensure that limit is respected if there is more than one filter.
+                if !received_eose && filters.len() == 1 {
+                    // SAFETY: we've checked above that exists one filter.
+                    let filter: &Filter = &filters[0];
 
-                    // Check if received more that requested
-                    if received_events > limit {
-                        // Ban the relay
-                        if self.opts.ban_relay_on_mismatch {
-                            self.ban();
+                    // Check if the filter has a limit
+                    if let Some(limit) = filter.limit {
+                        // Update number of received events
+                        let prev: usize = received_events.fetch_add(1, Ordering::SeqCst);
+                        let received_events: usize = prev.saturating_add(1);
+
+                        // Check if received more that requested
+                        if received_events > limit {
+                            // Ban the relay
+                            if self.opts.ban_relay_on_mismatch {
+                                self.ban();
+                            }
+
+                            return Err(Error::limit_exceeded("too many events"));
                         }
-
-                        return Err(Error::limit_exceeded("too many events"));
                     }
                 }
-            }
 
-            // NIP-01 treats multiple filters in the same REQ as OR: an event is
-            // valid for the subscription if it matches at least one filter. Requiring every
-            // filter to match would reject valid events and may incorrectly ban the relay.
-            if !filters
-                .iter()
-                .any(|f| f.match_event(&event, MATCH_EVENT_OPTS))
-            {
-                // Ban the relay
-                if self.opts.ban_relay_on_mismatch {
-                    self.ban();
+                // NIP-01 treats multiple filters in the same REQ as OR: an event is
+                // valid for the subscription if it matches at least one filter. Requiring every
+                // filter to match would reject valid events and may incorrectly ban the relay.
+                if !filters
+                    .iter()
+                    .any(|f| f.match_event(&event, MATCH_EVENT_OPTS))
+                {
+                    // Ban the relay
+                    if self.opts.ban_relay_on_mismatch {
+                        self.ban();
+                    }
+
+                    return Err(Error::protocol_msg(
+                        "event doesn't match the subscription filter",
+                    ));
                 }
-
-                return Err(Error::protocol_msg(
-                    "event doesn't match the subscription filter",
-                ));
             }
-        }
+            subscription.is_some_and(|data| data.is_acquisition)
+        } else {
+            // All generated acquisition IDs have the private prefix. Ordinary
+            // traffic keeps the default no-lock path when verification is off.
+            false
+        };
 
         // Check if the event is expired
         if event.is_expired() {
@@ -1459,7 +1528,7 @@ impl InnerRelay {
             // Deleted, immediately return
             DatabaseEventStatus::Deleted => return Ok(None),
             // Not existent, try to save it to the database
-            DatabaseEventStatus::NotExistent => {
+            DatabaseEventStatus::NotExistent if !is_acquisition => {
                 // Save into the database
                 let send_notification: bool = match self.state.database().save_event(&event).await?
                 {
@@ -1490,11 +1559,18 @@ impl InnerRelay {
                     true,
                 );
             }
+            // Acquisition results own their events. Publishing this first
+            // sighting would bypass the caller's item/byte budget and would
+            // also suppress a later copy on a real live subscription.
+            DatabaseEventStatus::NotExistent => {}
         }
 
-        // Process event for gossip
-        if let Some(gossip) = &self.state.gossip {
-            gossip.process(&event, Some(&self.url)).await?;
+        // Acquisition results are request-local until their caller admits
+        // them; do not update shared gossip routing from unadmitted input.
+        if !is_acquisition {
+            if let Some(gossip) = &self.state.gossip {
+                gossip.process(&event, Some(&self.url)).await?;
+            }
         }
 
         Ok(Some(RelayMessage::Event {
@@ -2134,7 +2210,269 @@ mod tests {
     use crate::error::ErrorKind;
     use crate::local_relay::MockRelay;
     use crate::policy::{AdmitPolicy, AdmitStatus};
-    use crate::relay::{Relay, RelayOptions};
+    use crate::relay::{Relay, RelayLimits, RelayOptions};
+
+    #[tokio::test]
+    async fn acquisition_first_does_not_steal_live_first_sighting() {
+        let url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let mut relay = Relay::builder(url)
+            .opts(RelayOptions::default().verify_subscriptions(true))
+            .build();
+        let (sender, mut notifications) = broadcast::channel(8);
+        relay.set_notification_sender(sender);
+        let event = EventBuilder::new(Kind::TextNote, "acquired then live")
+            .finalize(&Keys::generate())
+            .unwrap();
+        let filter = Filter::new().id(event.id);
+        let acquire_id = relay.inner.acquisition_subscription_id();
+        relay
+            .inner
+            .add_acquisition_subscription(acquire_id.clone(), vec![filter.clone()])
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            relay
+                .inner
+                .handle_event_msg(acquire_id.clone(), event.clone())
+                .await
+                .unwrap(),
+            Some(RelayMessage::Event { .. })
+        ));
+        assert_eq!(
+            relay
+                .inner
+                .state
+                .database()
+                .check_id(&event.id)
+                .await
+                .unwrap(),
+            DatabaseEventStatus::NotExistent
+        );
+        assert!(matches!(
+            notifications.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        let live_id = SubscriptionId::new("live");
+        relay
+            .inner
+            .add_long_lived_subscription(live_id.clone(), vec![filter])
+            .await
+            .unwrap();
+        relay
+            .inner
+            .handle_event_msg(live_id.clone(), event.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            relay
+                .inner
+                .state
+                .database()
+                .check_id(&event.id)
+                .await
+                .unwrap(),
+            DatabaseEventStatus::Saved
+        );
+        assert!(matches!(
+            notifications.try_recv(),
+            Ok(ClientNotification::Event { subscription_id, event: received, .. })
+                if subscription_id == live_id && received.id == event.id
+        ));
+        relay
+            .inner
+            .handle_event_msg(acquire_id, event)
+            .await
+            .unwrap();
+        assert!(matches!(
+            notifications.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn late_acquisition_id_is_discarded_without_changing_raw_req_ids() {
+        let url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let mut relay = Relay::new(url.clone());
+        let (sender, mut notifications) = broadcast::channel(8);
+        relay.set_notification_sender(sender);
+        let other = Relay::new(url);
+        let event = EventBuilder::new(Kind::TextNote, "late")
+            .finalize(&Keys::generate())
+            .unwrap();
+        let id = relay.inner.acquisition_subscription_id();
+        relay
+            .inner
+            .add_acquisition_subscription(id.clone(), vec![Filter::new().id(event.id)])
+            .await
+            .unwrap();
+        relay.inner.remove_subscription(&id).await;
+        assert!(
+            relay
+                .inner
+                .handle_event_msg(id.clone(), event.clone())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            relay
+                .inner
+                .state
+                .database()
+                .check_id(&event.id)
+                .await
+                .unwrap(),
+            DatabaseEventStatus::NotExistent
+        );
+        assert!(matches!(
+            notifications.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        // The namespace belongs to one relay instance, including its clones
+        // and reconnects. Another relay's raw REQ retains prior behavior.
+        assert!(matches!(
+            other
+                .inner
+                .handle_event_msg(id, event.clone())
+                .await
+                .unwrap(),
+            Some(RelayMessage::Event { .. })
+        ));
+        assert_eq!(
+            other
+                .inner
+                .state
+                .database()
+                .check_id(&event.id)
+                .await
+                .unwrap(),
+            DatabaseEventStatus::Saved
+        );
+        let raw = EventBuilder::new(Kind::TextNote, "raw request")
+            .finalize(&Keys::generate())
+            .unwrap();
+        relay
+            .inner
+            .handle_event_msg(SubscriptionId::new("sdk-acq-user-chosen"), raw.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            relay
+                .inner
+                .state
+                .database()
+                .check_id(&raw.id)
+                .await
+                .unwrap(),
+            DatabaseEventStatus::Saved
+        );
+        assert!(matches!(
+            notifications.try_recv(),
+            Ok(ClientNotification::Event { event: received, .. }) if received.id == raw.id
+        ));
+
+        // A registered caller auto-close using a colliding private-prefix ID
+        // retains its ordinary behavior; registration, not spelling, owns it.
+        let caller = EventBuilder::new(Kind::TextNote, "caller registration")
+            .finalize(&Keys::generate())
+            .unwrap();
+        let caller_id = relay.inner.acquisition_subscription_id();
+        relay
+            .inner
+            .add_auto_closing_subscription(caller_id.clone(), vec![Filter::new().id(caller.id)])
+            .await
+            .unwrap();
+        relay
+            .inner
+            .handle_event_msg(caller_id.clone(), caller.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            relay
+                .inner
+                .state
+                .database()
+                .check_id(&caller.id)
+                .await
+                .unwrap(),
+            DatabaseEventStatus::Saved
+        );
+        assert!(matches!(
+            notifications.try_recv(),
+            Ok(ClientNotification::Event { subscription_id, event: received, .. })
+                if subscription_id == caller_id && received.id == caller.id
+        ));
+
+        let mut limits = RelayLimits::default();
+        limits.events.max_size = Some(1);
+        let limited = Relay::builder(RelayUrl::parse("wss://limited.example.com").unwrap())
+            .opts(RelayOptions::default().limits(limits))
+            .build();
+        let late_id = limited.inner.acquisition_subscription_id();
+        limited
+            .inner
+            .add_acquisition_subscription(late_id.clone(), vec![Filter::new().id(event.id)])
+            .await
+            .unwrap();
+        limited.inner.remove_subscription(&late_id).await;
+        assert!(
+            limited
+                .inner
+                .handle_event_msg(late_id, event)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn acquisition_still_rejects_invalid_signature_and_filter_mismatch() {
+        let relay = Relay::builder(RelayUrl::parse("wss://relay.example.com").unwrap())
+            .opts(RelayOptions::default().verify_subscriptions(true))
+            .build();
+        let event = EventBuilder::new(Kind::TextNote, "valid")
+            .finalize(&Keys::generate())
+            .unwrap();
+        let id = relay.inner.acquisition_subscription_id();
+        relay
+            .inner
+            .add_acquisition_subscription(id.clone(), vec![Filter::new().id(event.id)])
+            .await
+            .unwrap();
+        let mut forged = event.clone();
+        forged.content = "forged".into();
+        assert!(
+            relay
+                .inner
+                .handle_event_msg(id.clone(), forged)
+                .await
+                .is_err()
+        );
+        let unrelated = EventBuilder::new(Kind::TextNote, "unrelated")
+            .finalize(&Keys::generate())
+            .unwrap();
+        assert!(
+            relay
+                .inner
+                .handle_event_msg(id.clone(), unrelated.clone())
+                .await
+                .is_err()
+        );
+        for event in [event, unrelated] {
+            assert_eq!(
+                relay
+                    .inner
+                    .state
+                    .database()
+                    .check_id(&event.id)
+                    .await
+                    .unwrap(),
+                DatabaseEventStatus::NotExistent
+            );
+        }
+    }
 
     #[tokio::test]
     async fn auto_closing_lag_before_eose_is_not_completion() {
