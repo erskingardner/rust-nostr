@@ -45,6 +45,11 @@
 - Add `LocalRelay::connections_left` (https://github.com/nostrdevkit/nostr/pull/1459)
 - Add `LocalRelayBuilderNip42::relay_url` to make it possible to configure a custom `relay_url` for the nip42 challenge validation (https://github.com/nostrdevkit/nostr/pull/1476)
 - Add `LocalRelayBuilder::new_event_channel_size` for customizing the size of the channel used to notify new received events
+- Add `Relay::batch_msg` to queue several messages on one relay connection
+  atomically: every message is queued in order, or none is.
+- Add `Relay::subscription_received_eose` to read whether a subscription got
+  `EOSE` for its current `REQ`. The flag resets whenever the `REQ` is re-sent,
+  such as on resubscription after a reconnection or a filter update.
 
 ### Fixed
 

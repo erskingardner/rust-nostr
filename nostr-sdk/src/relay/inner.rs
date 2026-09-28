@@ -92,6 +92,25 @@ impl RelayChannels {
             .map_err(|_| Error::state_msg("can't send message to the transport dispatcher"))
     }
 
+    /// Queue every message in order, or none of them.
+    fn send_client_msgs(&self, msgs: Vec<ClientMessageJson>) -> Result<(), Error> {
+        // Reserve every slot first, so a full queue can't split the batch.
+        let permits = self
+            .nostr
+            .0
+            .try_reserve_many(msgs.len())
+            .map_err(|_| Error::state_msg("can't send message to the transport dispatcher"))?;
+
+        for (permit, json) in permits.zip(msgs) {
+            permit.send(JsonMessageItem {
+                json,
+                confirmation: None,
+            });
+        }
+
+        Ok(())
+    }
+
     #[inline]
     pub async fn rx_nostr(&self) -> MutexGuard<'_, Receiver<JsonMessageItem>> {
         self.nostr.1.lock().await
@@ -484,6 +503,10 @@ impl InnerRelay {
             .ok_or_else(|| Error::not_found("subscription not found"))?;
         data.filters = filters;
 
+        // A changed or re-sent REQ starts a new stored-events phase.
+        data.received_eose = false;
+        data.received_events.store(0, Ordering::SeqCst);
+
         if mark_subscribed {
             data.subscribed_connection = self.stats.success();
             data.closed = false;
@@ -521,6 +544,14 @@ impl InnerRelay {
         if let Some(data) = subscriptions.get_mut(id) {
             data.received_eose = true;
         }
+    }
+
+    /// Whether EOSE was received for the subscription's current REQ.
+    ///
+    /// Returns `None` if the subscription isn't registered.
+    pub async fn subscription_received_eose(&self, id: &SubscriptionId) -> Option<bool> {
+        let subscriptions = self.atomic.subscriptions.read().await;
+        subscriptions.get(id).map(|data| data.received_eose)
     }
 
     /// Check if it should subscribe for current websocket session
@@ -1638,16 +1669,7 @@ impl InnerRelay {
     ) -> Result<(), Error> {
         // Check if relay is operational
         self.ensure_operational()?;
-
-        // If it can't write, check if there are "write" messages
-        if !self.capabilities.can_write() && msg.is_event() {
-            return Err(Error::write_disabled());
-        }
-
-        // If it can't read, check if there are "read" messages
-        if !self.capabilities.can_read() && (msg.is_req() || msg.is_close()) {
-            return Err(Error::read_disabled());
-        }
+        self.ensure_msg_allowed(&msg)?;
 
         match wait_until_sent {
             Some(timeout) => {
@@ -1670,6 +1692,33 @@ impl InnerRelay {
                 confirmation: None,
             }),
         }
+    }
+
+    /// Queue every message in order on this connection, or none of them.
+    pub(super) fn send_msgs(&self, msgs: Vec<ClientMessage<'_>>) -> Result<(), Error> {
+        // Check every message before reserving, so a rejected one queues nothing
+        self.ensure_operational()?;
+        for msg in msgs.iter() {
+            self.ensure_msg_allowed(msg)?;
+        }
+
+        self.atomic
+            .channels
+            .send_client_msgs(msgs.iter().map(|msg| msg.as_json()).collect())
+    }
+
+    fn ensure_msg_allowed(&self, msg: &ClientMessage<'_>) -> Result<(), Error> {
+        // If it can't write, check if there are "write" messages
+        if !self.capabilities.can_write() && msg.is_event() {
+            return Err(Error::write_disabled());
+        }
+
+        // If it can't read, check if there are "read" messages
+        if !self.capabilities.can_read() && (msg.is_req() || msg.is_close()) {
+            return Err(Error::read_disabled());
+        }
+
+        Ok(())
     }
 
     async fn auth(&self, challenge: String) -> Result<(), Error> {
@@ -2210,7 +2259,7 @@ mod tests {
     use crate::error::ErrorKind;
     use crate::local_relay::MockRelay;
     use crate::policy::{AdmitPolicy, AdmitStatus};
-    use crate::relay::{Relay, RelayLimits, RelayOptions};
+    use crate::relay::{Relay, RelayCapabilities, RelayLimits, RelayOptions};
 
     #[tokio::test]
     async fn acquisition_first_does_not_steal_live_first_sighting() {
@@ -3346,6 +3395,174 @@ mod tests {
         assert!(data.is_auto_closing);
         assert_eq!(data.filters, vec![second_filter]);
         assert!(!data.closed);
+        assert!(!data.received_eose);
+        assert_eq!(data.received_events.load(Ordering::SeqCst), 0);
+    }
+
+    /// A relay that accepts messages into its outbound queue without connecting.
+    fn queueing_relay() -> Relay {
+        let url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let relay = Relay::new(url);
+        relay.inner.set_status(RelayStatus::Disconnected, false);
+        relay
+    }
+
+    fn outbound_capacity(relay: &Relay) -> usize {
+        relay.inner.atomic.channels.nostr.0.capacity()
+    }
+
+    #[tokio::test]
+    async fn test_batch_msg_queues_messages_in_order() {
+        let relay = queueing_relay();
+        let id = SubscriptionId::new("test");
+        let close = ClientMessage::close(id.clone());
+        let req = ClientMessage::req(id, Filter::new().kind(Kind::TextNote));
+        let expected = vec![close.as_json(), req.as_json()];
+
+        relay.batch_msg(vec![close, req]).unwrap();
+
+        let mut rx = relay.inner.atomic.channels.rx_nostr().await;
+        let queued: Vec<String> = vec![rx.try_recv().unwrap().json, rx.try_recv().unwrap().json];
+        assert_eq!(queued, expected);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn test_batch_msg_queues_nothing_when_queue_cannot_fit_batch() {
+        let relay = queueing_relay();
+        let filler = ClientMessage::close(SubscriptionId::new("filler"));
+
+        // Leave the queue one slot short of the batch.
+        while outbound_capacity(&relay) > 1 {
+            relay.send_msg(filler.clone()).await.unwrap();
+        }
+
+        let id = SubscriptionId::new("test");
+        let batch = vec![
+            ClientMessage::close(id.clone()),
+            ClientMessage::req(id, Filter::new().kind(Kind::TextNote)),
+        ];
+        let err = relay.batch_msg(batch).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::State);
+        assert_eq!(
+            err.to_string(),
+            "can't send message to the transport dispatcher"
+        );
+        assert_eq!(outbound_capacity(&relay), 1);
+
+        let mut rx = relay.inner.atomic.channels.rx_nostr().await;
+        while let Ok(item) = rx.try_recv() {
+            assert_eq!(item.json, filler.as_json());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_batch_msg_capability_failure_queues_nothing() {
+        let event = EventBuilder::new(Kind::TextNote, "batch")
+            .finalize(&Keys::generate())
+            .unwrap();
+        let req = ClientMessage::req(
+            SubscriptionId::new("test"),
+            Filter::new().kind(Kind::TextNote),
+        );
+        let close = ClientMessage::close(SubscriptionId::new("test"));
+
+        // Write disabled: the trailing EVENT rejects the whole batch.
+        let relay = queueing_relay();
+        relay.capabilities().remove(RelayCapabilities::WRITE);
+        let err = relay
+            .batch_msg(vec![req.clone(), ClientMessage::event(event.clone())])
+            .unwrap_err();
+        assert_eq!(err.to_string(), Error::write_disabled().to_string());
+        assert_eq!(outbound_capacity(&relay), 1024);
+
+        // Read disabled: the trailing CLOSE rejects the whole batch.
+        let relay = queueing_relay();
+        relay.capabilities().remove(RelayCapabilities::READ);
+        let err = relay
+            .batch_msg(vec![ClientMessage::event(event), close])
+            .unwrap_err();
+        assert_eq!(err.to_string(), Error::read_disabled().to_string());
+        assert_eq!(outbound_capacity(&relay), 1024);
+    }
+
+    #[tokio::test]
+    async fn test_subscription_received_eose_tracks_current_req() {
+        let relay = queueing_relay();
+        let id = SubscriptionId::new("test");
+        let filter = Filter::new().kind(Kind::TextNote);
+        let (tx, _rx) = watch::channel(None);
+        let eose = r#"["EOSE","test"]"#;
+
+        assert_eq!(relay.subscription_received_eose(&id).await, None);
+
+        relay
+            .inner
+            .add_long_lived_subscription(id.clone(), vec![filter.clone()])
+            .await
+            .unwrap();
+        assert_eq!(relay.subscription_received_eose(&id).await, Some(false));
+
+        relay.inner.handle_relay_message(eose, &tx).await;
+        assert_eq!(relay.subscription_received_eose(&id).await, Some(true));
+
+        // A reconnection re-sends the REQ: the flag waits for the new EOSE.
+        relay.inner.stats.new_success();
+        relay.inner.stats.new_success();
+        relay.inner.resubscribe().await.unwrap();
+        assert_eq!(relay.subscription_received_eose(&id).await, Some(false));
+
+        relay.inner.handle_relay_message(eose, &tx).await;
+        assert_eq!(relay.subscription_received_eose(&id).await, Some(true));
+
+        // Updating the filters under the same ID clears it too.
+        relay
+            .inner
+            .update_subscription(&id, vec![filter.limit(10)], false)
+            .await
+            .unwrap();
+        assert_eq!(relay.subscription_received_eose(&id).await, Some(false));
+
+        relay.inner.handle_relay_message(eose, &tx).await;
+        assert_eq!(relay.subscription_received_eose(&id).await, Some(true));
+
+        // The relay removes the subscription on CLOSED.
+        relay
+            .inner
+            .handle_relay_message(r#"["CLOSED","test",""]"#, &tx)
+            .await;
+        assert_eq!(relay.subscription_received_eose(&id).await, None);
+    }
+
+    #[tokio::test]
+    async fn test_resubscribe_restarts_limit_verification() {
+        let relay = queueing_relay();
+        let id = SubscriptionId::new("test");
+        let filter = Filter::new().kind(Kind::TextNote).limit(1);
+        let (tx, _rx) = watch::channel(None);
+
+        relay
+            .inner
+            .add_long_lived_subscription(id.clone(), vec![filter])
+            .await
+            .unwrap();
+        {
+            let subscriptions = relay.inner.atomic.subscriptions.read().await;
+            let data = subscriptions.get(&id).unwrap();
+            data.received_events.store(1, Ordering::SeqCst);
+        }
+        relay
+            .inner
+            .handle_relay_message(r#"["EOSE","test"]"#, &tx)
+            .await;
+
+        relay.inner.stats.new_success();
+        relay.inner.stats.new_success();
+        relay.inner.resubscribe().await.unwrap();
+
+        // The re-sent REQ may return `limit` events again.
+        let subscriptions = relay.inner.atomic.subscriptions.read().await;
+        let data = subscriptions.get(&id).unwrap();
         assert!(!data.received_eose);
         assert_eq!(data.received_events.load(Ordering::SeqCst), 0);
     }
