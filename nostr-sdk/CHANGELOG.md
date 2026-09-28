@@ -53,6 +53,9 @@
 
 ### Fixed
 
+- Don't re-send a subscription's `REQ` on reconnect while a `REQ` for the same ID
+  is still queued from before the disconnect, which relays may reject as a duplicate
+  and close the subscription.
 - Keep request-local `acquire_events` input out of ordinary live Event
   notifications and the shared seen-event database, preserving later live
   delivery and rejecting late replies after request cleanup.

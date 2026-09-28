@@ -64,11 +64,35 @@ struct HandleAutoClosing {
 struct JsonMessageItem {
     json: ClientMessageJson,
     confirmation: Option<oneshot::Sender<()>>,
+    /// Subscription ID, if this is a `REQ`
+    req_id: Option<SubscriptionId>,
+}
+
+impl JsonMessageItem {
+    fn new(msg: &ClientMessage<'_>, confirmation: Option<oneshot::Sender<()>>) -> Self {
+        let req_id = match msg {
+            ClientMessage::Req {
+                subscription_id, ..
+            } => Some(subscription_id.clone().into_owned()),
+            _ => None,
+        };
+
+        Self {
+            json: msg.as_json(),
+            confirmation,
+            req_id,
+        }
+    }
 }
 
 #[derive(Debug)]
 struct RelayChannels {
     nostr: (Sender<JsonMessageItem>, Mutex<Receiver<JsonMessageItem>>),
+    /// Number of `REQ`s per subscription ID in the outbound queue.
+    ///
+    /// Queued frames survive a disconnect, so a reconnect must not queue
+    /// another `REQ` for an ID that still has one waiting.
+    queued_reqs: StdMutex<HashMap<SubscriptionId, usize>>,
     ping: Notify,
     terminate: Notify,
 }
@@ -79,21 +103,45 @@ impl RelayChannels {
 
         Self {
             nostr: (tx_nostr, Mutex::new(rx_nostr)),
+            queued_reqs: StdMutex::new(HashMap::new()),
             ping: Notify::new(),
             terminate: Notify::new(),
         }
     }
 
-    #[inline]
     fn send_client_msg(&self, msg: JsonMessageItem) -> Result<(), Error> {
-        self.nostr
-            .0
-            .try_send(msg)
-            .map_err(|_| Error::state_msg("can't send message to the transport dispatcher"))
+        let Some(id) = msg.req_id.clone() else {
+            return self.try_send(msg);
+        };
+
+        let mut queued_reqs = self.queued_reqs.lock().unwrap();
+        self.try_send(msg)?;
+        *queued_reqs.entry(id).or_default() += 1;
+        Ok(())
+    }
+
+    /// Queue a `REQ` unless one for the same subscription ID is still queued.
+    ///
+    /// Returns `false` if the `REQ` was skipped.
+    fn send_req_unless_queued(&self, msg: JsonMessageItem) -> Result<bool, Error> {
+        let Some(id) = msg.req_id.clone() else {
+            return Err(Error::invalid_msg("not a REQ message"));
+        };
+
+        let mut queued_reqs = self.queued_reqs.lock().unwrap();
+        if queued_reqs.contains_key(&id) {
+            return Ok(false);
+        }
+
+        self.try_send(msg)?;
+        queued_reqs.insert(id, 1);
+        Ok(true)
     }
 
     /// Queue every message in order, or none of them.
-    fn send_client_msgs(&self, msgs: Vec<ClientMessageJson>) -> Result<(), Error> {
+    fn send_client_msgs(&self, msgs: Vec<JsonMessageItem>) -> Result<(), Error> {
+        let mut queued_reqs = self.queued_reqs.lock().unwrap();
+
         // Reserve every slot first, so a full queue can't split the batch.
         let permits = self
             .nostr
@@ -101,14 +149,37 @@ impl RelayChannels {
             .try_reserve_many(msgs.len())
             .map_err(|_| Error::state_msg("can't send message to the transport dispatcher"))?;
 
-        for (permit, json) in permits.zip(msgs) {
-            permit.send(JsonMessageItem {
-                json,
-                confirmation: None,
-            });
+        for (permit, msg) in permits.zip(msgs) {
+            if let Some(id) = &msg.req_id {
+                *queued_reqs.entry(id.clone()).or_default() += 1;
+            }
+            permit.send(msg);
         }
 
         Ok(())
+    }
+
+    #[inline]
+    fn try_send(&self, msg: JsonMessageItem) -> Result<(), Error> {
+        self.nostr
+            .0
+            .try_send(msg)
+            .map_err(|_| Error::state_msg("can't send message to the transport dispatcher"))
+    }
+
+    /// Record that a frame left the outbound queue.
+    fn dequeued(&self, msg: &JsonMessageItem) {
+        let Some(id) = &msg.req_id else {
+            return;
+        };
+
+        let mut queued_reqs = self.queued_reqs.lock().unwrap();
+        if let Some(count) = queued_reqs.get_mut(id) {
+            *count -= 1;
+            if *count == 0 {
+                queued_reqs.remove(id);
+            }
+        }
     }
 
     #[inline]
@@ -1118,7 +1189,10 @@ impl InnerRelay {
         loop {
             tokio::select! {
                 // Nostr channel receiver
-                Some(JsonMessageItem { json, confirmation }) = rx_nostr.recv() => {
+                Some(item) = rx_nostr.recv() => {
+                    self.atomic.channels.dequeued(&item);
+                    let JsonMessageItem { json, confirmation, .. } = item;
+
                     // Get messages size
                     let size: usize = json.len();
 
@@ -1677,20 +1751,19 @@ impl InnerRelay {
                 let (tx, rx) = oneshot::channel();
 
                 // Send the item
-                self.atomic.channels.send_client_msg(JsonMessageItem {
-                    json: msg.as_json(),
-                    confirmation: Some(tx),
-                })?;
+                self.atomic
+                    .channels
+                    .send_client_msg(JsonMessageItem::new(&msg, Some(tx)))?;
 
                 // Wait for confirmation
                 Ok(time::timeout(Some(timeout), rx)
                     .await
                     .ok_or_else(Error::timeout)??)
             }
-            None => self.atomic.channels.send_client_msg(JsonMessageItem {
-                json: msg.as_json(),
-                confirmation: None,
-            }),
+            None => self
+                .atomic
+                .channels
+                .send_client_msg(JsonMessageItem::new(&msg, None)),
         }
     }
 
@@ -1702,9 +1775,19 @@ impl InnerRelay {
             self.ensure_msg_allowed(msg)?;
         }
 
+        self.atomic.channels.send_client_msgs(
+            msgs.iter()
+                .map(|msg| JsonMessageItem::new(msg, None))
+                .collect(),
+        )
+    }
+
+    fn send_resubscription(&self, msg: &ClientMessage<'_>) -> Result<bool, Error> {
+        self.ensure_operational()?;
+        self.ensure_msg_allowed(msg)?;
         self.atomic
             .channels
-            .send_client_msgs(msgs.iter().map(|msg| msg.as_json()).collect())
+            .send_req_unless_queued(JsonMessageItem::new(msg, None))
     }
 
     fn ensure_msg_allowed(&self, msg: &ClientMessage<'_>) -> Result<(), Error> {
@@ -1813,9 +1896,17 @@ impl InnerRelay {
                     filters: filters.into_iter().map(Cow::Owned).collect(),
                 };
 
-                if let Err(e) = self.send_msg(msg, None).await {
-                    self.subscription_closed(&id).await;
-                    return Err(e);
+                // A REQ still queued from before the disconnect is sent on this
+                // connection: a second one would make the relay close the ID as a duplicate.
+                match self.send_resubscription(&msg) {
+                    Ok(true) => (),
+                    Ok(false) => {
+                        tracing::debug!("Skip re-subscription of '{id}': REQ already queued")
+                    }
+                    Err(e) => {
+                        self.subscription_closed(&id).await;
+                        return Err(e);
+                    }
                 }
             } else {
                 tracing::debug!("Skip re-subscription of '{id}'");
@@ -2242,6 +2333,7 @@ async fn close_ws(tx: &mut WebSocketSink) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+    use std::collections::HashSet;
     use std::error::Error as StdError;
     use std::future::Future;
     use std::pin::Pin;
@@ -3484,6 +3576,189 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.to_string(), Error::read_disabled().to_string());
         assert_eq!(outbound_capacity(&relay), 1024);
+    }
+
+    fn queued_frames(rx: &mut Receiver<JsonMessageItem>) -> Vec<String> {
+        let mut frames = Vec::new();
+        while let Ok(item) = rx.try_recv() {
+            frames.push(item.json);
+        }
+        frames
+    }
+
+    #[tokio::test]
+    async fn test_resubscribe_skips_id_with_queued_req() {
+        let relay = queueing_relay();
+        let id = SubscriptionId::new("live");
+        let filter = Filter::new().kind(Kind::TextNote);
+        relay
+            .inner
+            .add_long_lived_subscription(id.clone(), vec![filter.clone()])
+            .await
+            .unwrap();
+
+        // Re-issue left in the queue by a connection that dropped before sending it.
+        let close = ClientMessage::close(id.clone());
+        let req = ClientMessage::req(id.clone(), filter);
+        relay.batch_msg(vec![close.clone(), req.clone()]).unwrap();
+
+        relay.inner.stats.new_success();
+        relay.inner.stats.new_success();
+        relay.inner.resubscribe().await.unwrap();
+
+        let mut rx = relay.inner.atomic.channels.rx_nostr().await;
+        assert_eq!(queued_frames(&mut rx), vec![close.as_json(), req.as_json()]);
+        drop(rx);
+
+        // The queued REQ counts as this connection's REQ.
+        assert!(!relay.inner.should_resubscribe(&id).await);
+        assert_eq!(relay.subscription_received_eose(&id).await, Some(false));
+    }
+
+    #[tokio::test]
+    async fn test_resubscribe_sends_req_once_queued_req_left_the_queue() {
+        let relay = queueing_relay();
+        let id = SubscriptionId::new("live");
+        let filter = Filter::new().kind(Kind::TextNote);
+        relay
+            .inner
+            .add_long_lived_subscription(id.clone(), vec![filter.clone()])
+            .await
+            .unwrap();
+        relay
+            .send_msg(ClientMessage::req(id.clone(), filter))
+            .await
+            .unwrap();
+
+        // A sender took the REQ, but the connection dropped before it was written.
+        {
+            let mut rx = relay.inner.atomic.channels.rx_nostr().await;
+            let item = rx.try_recv().unwrap();
+            relay.inner.atomic.channels.dequeued(&item);
+        }
+
+        relay.inner.stats.new_success();
+        relay.inner.stats.new_success();
+        relay.inner.resubscribe().await.unwrap();
+
+        let mut rx = relay.inner.atomic.channels.rx_nostr().await;
+        assert_eq!(queued_frames(&mut rx).len(), 1);
+    }
+
+    /// Serve a relay that answers a `REQ` for an ID already open on the connection
+    /// with `CLOSED duplicate:`, and drops the first connection after its first `REQ`.
+    ///
+    /// Every received frame is reported with the index of its connection.
+    async fn run_duplicate_refusing_relay() -> (RelayUrl, mpsc::UnboundedReceiver<(usize, String)>)
+    {
+        use async_wsocket::native::{self, Message as WsMessage};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = RelayUrl::parse(&format!("ws://{}", listener.local_addr().unwrap())).unwrap();
+        let (frames_tx, frames_rx) = mpsc::unbounded_channel();
+
+        tokio::spawn(async move {
+            let mut index: usize = 0;
+            while let Ok((stream, _)) = listener.accept().await {
+                let frames_tx = frames_tx.clone();
+                let connection = index;
+                index += 1;
+
+                tokio::spawn(async move {
+                    let mut ws = native::accept_async(stream).await.unwrap();
+                    let mut open: HashSet<SubscriptionId> = HashSet::new();
+
+                    while let Some(Ok(msg)) = ws.next().await {
+                        let WsMessage::Text(text) = msg else {
+                            continue;
+                        };
+                        let _ = frames_tx.send((connection, text.to_string()));
+
+                        match ClientMessage::from_json(text.as_str()) {
+                            Ok(ClientMessage::Req {
+                                subscription_id, ..
+                            }) => {
+                                let id = subscription_id.into_owned();
+                                let reply = if open.insert(id.clone()) {
+                                    RelayMessage::eose(id)
+                                } else {
+                                    RelayMessage::closed(id, "duplicate: subscription already open")
+                                };
+                                ws.send(WsMessage::Text(reply.as_json().into()))
+                                    .await
+                                    .unwrap();
+
+                                if connection == 0 {
+                                    return;
+                                }
+                            }
+                            Ok(ClientMessage::Close(id)) => {
+                                open.remove(&id);
+                            }
+                            _ => (),
+                        }
+                    }
+                });
+            }
+        });
+
+        (url, frames_rx)
+    }
+
+    #[tokio::test]
+    async fn test_reissue_queued_across_reconnect_is_sent_once() {
+        let (url, mut frames) = run_duplicate_refusing_relay().await;
+        let opts = RelayOptions::default()
+            .retry_interval(Duration::from_secs(1))
+            .adjust_retry_interval(false);
+        let relay = Relay::builder(url).opts(opts).build();
+        relay.connect();
+        relay.wait_for_connection(Duration::from_secs(5)).await;
+
+        let id = SubscriptionId::new("live");
+        let filter = Filter::new().kind(Kind::TextNote);
+        relay
+            .subscribe(filter.clone())
+            .with_id(id.clone())
+            .await
+            .unwrap();
+
+        // The relay drops the first connection after its REQ. Queue the re-issue
+        // before the reconnect, so it waits in the outbound queue.
+        time::timeout(Some(Duration::from_secs(5)), async {
+            while relay.status() == RelayStatus::Connected {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        relay
+            .batch_msg(vec![
+                ClientMessage::close(id.clone()),
+                ClientMessage::req(id.clone(), filter),
+            ])
+            .unwrap();
+
+        relay.wait_for_connection(Duration::from_secs(5)).await;
+        assert_eq!(relay.status(), RelayStatus::Connected);
+
+        // Give a duplicate REQ time to arrive.
+        let mut reconnect_frames: Vec<String> = Vec::new();
+        let _ = time::timeout(Some(Duration::from_secs(1)), async {
+            while let Some((connection, frame)) = frames.recv().await {
+                if connection == 1 {
+                    reconnect_frames.push(frame);
+                }
+            }
+        })
+        .await;
+
+        let reqs = reconnect_frames
+            .iter()
+            .filter(|frame| frame.starts_with(r#"["REQ","live""#))
+            .count();
+        assert_eq!(reqs, 1, "frames on reconnect: {reconnect_frames:?}");
+        assert!(relay.subscription(&id).await.is_some());
     }
 
     #[tokio::test]
