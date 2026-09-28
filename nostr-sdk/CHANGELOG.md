@@ -45,9 +45,20 @@
 - Add `LocalRelay::connections_left` (https://github.com/nostrdevkit/nostr/pull/1459)
 - Add `LocalRelayBuilderNip42::relay_url` to make it possible to configure a custom `relay_url` for the nip42 challenge validation (https://github.com/nostrdevkit/nostr/pull/1476)
 - Add `LocalRelayBuilder::new_event_channel_size` for customizing the size of the channel used to notify new received events
+- Add `Relay::batch_msg` to queue several messages on one relay connection
+  atomically: every message is queued in order, or none is.
+- Add `Relay::subscription_received_eose` to read whether a subscription got
+  `EOSE` for its current `REQ`. The flag resets whenever the `REQ` is re-sent,
+  such as on resubscription after a reconnection or a re-issue under the same ID.
 
 ### Fixed
 
+- A `REQ` sent with `Relay::send_msg` or `Relay::batch_msg` for a registered
+  long-lived subscription now replaces its stored filters and resets its `EOSE`
+  state, so verification and later resubscriptions follow the re-issued `REQ`.
+- Don't re-send a subscription's `REQ` on reconnect while a `REQ` for the same ID
+  is still queued from before the disconnect, which relays may reject as a duplicate
+  and close the subscription.
 - Keep request-local `acquire_events` input out of ordinary live Event
   notifications and the shared seen-event database, preserving later live
   delivery and rejecting late replies after request cleanup.

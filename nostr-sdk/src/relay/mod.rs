@@ -201,6 +201,17 @@ impl Relay {
         self.inner.subscription(id).await
     }
 
+    /// Check if `EOSE` was received for the subscription on the current connection.
+    ///
+    /// The flag resets whenever the subscription's `REQ` is sent again, for example
+    /// when it is restored after a reconnection.
+    ///
+    /// Returns `None` if the subscription isn't registered.
+    #[inline]
+    pub async fn subscription_received_eose(&self, id: &SubscriptionId) -> Option<bool> {
+        self.inner.subscription_received_eose(id).await
+    }
+
     /// Get options
     #[inline]
     pub fn opts(&self) -> &RelayOptions {
@@ -412,6 +423,19 @@ impl Relay {
     #[inline]
     pub fn send_msg<'msg>(&self, msg: ClientMessage<'msg>) -> SendMessage<'_, 'msg> {
         SendMessage::new(self, msg)
+    }
+
+    /// Queue every message in order on this connection, or none.
+    ///
+    /// All messages are checked before any is queued: if one can't be sent
+    /// (i.e., the relay isn't operational, it lacks the read or write capability,
+    /// or the outbound queue can't fit the whole batch), nothing is queued.
+    ///
+    /// A `REQ` for a registered subscription replaces its stored filters and
+    /// resets its `EOSE` state, like re-sending it with [`Relay::send_msg`].
+    #[inline]
+    pub async fn batch_msg(&self, msgs: Vec<ClientMessage<'_>>) -> Result<(), Error> {
+        self.inner.send_msgs(msgs).await
     }
 
     /// Send event and wait for `OK` relay msg
@@ -1103,6 +1127,43 @@ mod tests {
         relay.wait_for_connection(Duration::from_secs(3)).await;
 
         assert_eq!(relay.status(), RelayStatus::Connected);
+    }
+
+    #[tokio::test]
+    async fn test_batch_msg_frames_arrive_in_order() {
+        let mock = MockRelay::run().await.unwrap();
+        let url = mock.url().await;
+
+        let relay: Relay = new_relay(url, RelayOptions::default());
+        relay.connect();
+        relay.wait_for_connection(Duration::from_secs(5)).await;
+
+        let mut notifications = relay.notifications();
+        let ids: Vec<SubscriptionId> = ["a", "b", "c"]
+            .into_iter()
+            .map(SubscriptionId::new)
+            .collect();
+        let batch = ids
+            .iter()
+            .map(|id| ClientMessage::req(id.clone(), Filter::new().kind(Kind::TextNote)))
+            .collect();
+        relay.batch_msg(batch).await.unwrap();
+
+        // The relay handles frames sequentially, so EOSE order mirrors arrival order.
+        let mut received: Vec<SubscriptionId> = Vec::new();
+        time::timeout(Some(Duration::from_secs(5)), async {
+            while received.len() < ids.len() {
+                if let Some(RelayNotification::Message { message }) = notifications.next().await {
+                    if let RelayMessage::EndOfStoredEvents(id) = *message {
+                        received.push(id.into_owned());
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(received, ids);
     }
 
     #[tokio::test]
