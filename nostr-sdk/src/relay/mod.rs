@@ -430,9 +430,12 @@ impl Relay {
     /// All messages are checked before any is queued: if one can't be sent
     /// (i.e., the relay isn't operational, it lacks the read or write capability,
     /// or the outbound queue can't fit the whole batch), nothing is queued.
+    ///
+    /// A `REQ` for a registered subscription replaces its stored filters and
+    /// resets its `EOSE` state, like re-sending it with [`Relay::send_msg`].
     #[inline]
-    pub fn batch_msg(&self, msgs: Vec<ClientMessage<'_>>) -> Result<(), Error> {
-        self.inner.send_msgs(msgs)
+    pub async fn batch_msg(&self, msgs: Vec<ClientMessage<'_>>) -> Result<(), Error> {
+        self.inner.send_msgs(msgs).await
     }
 
     /// Send event and wait for `OK` relay msg
@@ -1144,7 +1147,7 @@ mod tests {
             .iter()
             .map(|id| ClientMessage::req(id.clone(), Filter::new().kind(Kind::TextNote)))
             .collect();
-        relay.batch_msg(batch).unwrap();
+        relay.batch_msg(batch).await.unwrap();
 
         // The relay handles frames sequentially, so EOSE order mirrors arrival order.
         let mut received: Vec<SubscriptionId> = Vec::new();

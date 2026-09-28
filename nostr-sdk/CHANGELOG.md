@@ -49,10 +49,13 @@
   atomically: every message is queued in order, or none is.
 - Add `Relay::subscription_received_eose` to read whether a subscription got
   `EOSE` for its current `REQ`. The flag resets whenever the `REQ` is re-sent,
-  such as on resubscription after a reconnection or a filter update.
+  such as on resubscription after a reconnection or a re-issue under the same ID.
 
 ### Fixed
 
+- A `REQ` sent with `Relay::send_msg` or `Relay::batch_msg` for a registered
+  long-lived subscription now replaces its stored filters and resets its `EOSE`
+  state, so verification and later resubscriptions follow the re-issued `REQ`.
 - Don't re-send a subscription's `REQ` on reconnect while a `REQ` for the same ID
   is still queued from before the disconnect, which relays may reject as a duplicate
   and close the subscription.

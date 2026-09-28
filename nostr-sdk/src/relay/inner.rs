@@ -1,10 +1,10 @@
 use std::borrow::Cow;
-use std::cmp;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
+use std::{cmp, slice};
 
 use async_utility::{task, time};
 use async_wsocket::Message;
@@ -220,6 +220,13 @@ struct SubscriptionData {
 }
 
 impl SubscriptionData {
+    /// A newly sent `REQ` gets its own `EOSE` and pre-`EOSE` limit count.
+    #[inline]
+    fn start_stored_events_phase(&mut self) {
+        self.received_eose = false;
+        self.received_events.store(0, Ordering::SeqCst);
+    }
+
     #[inline]
     fn long_lived(filters: Vec<Filter>, subscribed_connection: usize) -> Self {
         Self {
@@ -574,13 +581,10 @@ impl InnerRelay {
             .ok_or_else(|| Error::not_found("subscription not found"))?;
         data.filters = filters;
 
-        // A changed or re-sent REQ starts a new stored-events phase.
-        data.received_eose = false;
-        data.received_events.store(0, Ordering::SeqCst);
-
         if mark_subscribed {
             data.subscribed_connection = self.stats.success();
             data.closed = false;
+            data.start_stored_events_phase();
         }
 
         Ok(())
@@ -1751,35 +1755,81 @@ impl InnerRelay {
                 let (tx, rx) = oneshot::channel();
 
                 // Send the item
-                self.atomic
-                    .channels
-                    .send_client_msg(JsonMessageItem::new(&msg, Some(tx)))?;
+                let item = JsonMessageItem::new(&msg, Some(tx));
+                self.queue_tracking_reqs(slice::from_ref(&msg), || {
+                    self.atomic.channels.send_client_msg(item)
+                })
+                .await?;
 
                 // Wait for confirmation
                 Ok(time::timeout(Some(timeout), rx)
                     .await
                     .ok_or_else(Error::timeout)??)
             }
-            None => self
-                .atomic
-                .channels
-                .send_client_msg(JsonMessageItem::new(&msg, None)),
+            None => {
+                let item = JsonMessageItem::new(&msg, None);
+                self.queue_tracking_reqs(slice::from_ref(&msg), || {
+                    self.atomic.channels.send_client_msg(item)
+                })
+                .await
+            }
         }
     }
 
     /// Queue every message in order on this connection, or none of them.
-    pub(super) fn send_msgs(&self, msgs: Vec<ClientMessage<'_>>) -> Result<(), Error> {
+    pub(super) async fn send_msgs(&self, msgs: Vec<ClientMessage<'_>>) -> Result<(), Error> {
         // Check every message before reserving, so a rejected one queues nothing
         self.ensure_operational()?;
         for msg in msgs.iter() {
             self.ensure_msg_allowed(msg)?;
         }
 
-        self.atomic.channels.send_client_msgs(
-            msgs.iter()
-                .map(|msg| JsonMessageItem::new(msg, None))
-                .collect(),
-        )
+        let items = msgs
+            .iter()
+            .map(|msg| JsonMessageItem::new(msg, None))
+            .collect();
+        self.queue_tracking_reqs(&msgs, || self.atomic.channels.send_client_msgs(items))
+            .await
+    }
+
+    /// Run `queue`, then point registered long-lived subscriptions at the `REQ`s it queued.
+    ///
+    /// A queued `REQ` replaces the relay's filters for its ID and gets its own `EOSE`.
+    /// Updating the registry under the write lock, which `EOSE` handling also takes,
+    /// keeps the stored filters, `EOSE` flag and limit count describing that `REQ`.
+    async fn queue_tracking_reqs<F>(
+        &self,
+        msgs: &[ClientMessage<'_>],
+        queue: F,
+    ) -> Result<(), Error>
+    where
+        F: FnOnce() -> Result<(), Error>,
+    {
+        if !msgs.iter().any(ClientMessage::is_req) {
+            return queue();
+        }
+
+        let mut subscriptions = self.atomic.subscriptions.write().await;
+        queue()?;
+
+        for msg in msgs.iter() {
+            let ClientMessage::Req {
+                subscription_id,
+                filters,
+            } = msg
+            else {
+                continue;
+            };
+
+            if let Some(data) = subscriptions.get_mut(subscription_id.as_ref()) {
+                if !data.is_auto_closing {
+                    data.filters = filters.iter().map(|f| f.as_ref().clone()).collect();
+                    data.start_stored_events_phase();
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn send_resubscription(&self, msg: &ClientMessage<'_>) -> Result<bool, Error> {
@@ -3511,7 +3561,7 @@ mod tests {
         let req = ClientMessage::req(id, Filter::new().kind(Kind::TextNote));
         let expected = vec![close.as_json(), req.as_json()];
 
-        relay.batch_msg(vec![close, req]).unwrap();
+        relay.batch_msg(vec![close, req]).await.unwrap();
 
         let mut rx = relay.inner.atomic.channels.rx_nostr().await;
         let queued: Vec<String> = vec![rx.try_recv().unwrap().json, rx.try_recv().unwrap().json];
@@ -3534,7 +3584,7 @@ mod tests {
             ClientMessage::close(id.clone()),
             ClientMessage::req(id, Filter::new().kind(Kind::TextNote)),
         ];
-        let err = relay.batch_msg(batch).unwrap_err();
+        let err = relay.batch_msg(batch).await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::State);
         assert_eq!(
             err.to_string(),
@@ -3564,6 +3614,7 @@ mod tests {
         relay.capabilities().remove(RelayCapabilities::WRITE);
         let err = relay
             .batch_msg(vec![req.clone(), ClientMessage::event(event.clone())])
+            .await
             .unwrap_err();
         assert_eq!(err.to_string(), Error::write_disabled().to_string());
         assert_eq!(outbound_capacity(&relay), 1024);
@@ -3573,6 +3624,7 @@ mod tests {
         relay.capabilities().remove(RelayCapabilities::READ);
         let err = relay
             .batch_msg(vec![ClientMessage::event(event), close])
+            .await
             .unwrap_err();
         assert_eq!(err.to_string(), Error::read_disabled().to_string());
         assert_eq!(outbound_capacity(&relay), 1024);
@@ -3598,9 +3650,13 @@ mod tests {
             .unwrap();
 
         // Re-issue left in the queue by a connection that dropped before sending it.
+        let retarget = Filter::new().kind(Kind::Reaction);
         let close = ClientMessage::close(id.clone());
-        let req = ClientMessage::req(id.clone(), filter);
-        relay.batch_msg(vec![close.clone(), req.clone()]).unwrap();
+        let req = ClientMessage::req(id.clone(), retarget.clone());
+        relay
+            .batch_msg(vec![close.clone(), req.clone()])
+            .await
+            .unwrap();
 
         relay.inner.stats.new_success();
         relay.inner.stats.new_success();
@@ -3610,8 +3666,9 @@ mod tests {
         assert_eq!(queued_frames(&mut rx), vec![close.as_json(), req.as_json()]);
         drop(rx);
 
-        // The queued REQ counts as this connection's REQ.
+        // The queued REQ counts as this connection's REQ, and the registry follows it.
         assert!(!relay.inner.should_resubscribe(&id).await);
+        assert_eq!(relay.subscription(&id).await, Some(vec![retarget]));
         assert_eq!(relay.subscription_received_eose(&id).await, Some(false));
     }
 
@@ -3737,6 +3794,7 @@ mod tests {
                 ClientMessage::close(id.clone()),
                 ClientMessage::req(id.clone(), filter),
             ])
+            .await
             .unwrap();
 
         relay.wait_for_connection(Duration::from_secs(5)).await;
@@ -3791,12 +3849,35 @@ mod tests {
         assert_eq!(relay.subscription_received_eose(&id).await, Some(true));
 
         // Updating the filters under the same ID clears it too.
+        let retarget = filter.limit(10);
+        {
+            let subscriptions = relay.inner.atomic.subscriptions.read().await;
+            let data = subscriptions.get(&id).unwrap();
+            data.received_events.store(10, Ordering::SeqCst);
+        }
         relay
-            .inner
-            .update_subscription(&id, vec![filter.limit(10)], false)
+            .batch_msg(vec![
+                ClientMessage::close(id.clone()),
+                ClientMessage::req(id.clone(), retarget.clone()),
+            ])
             .await
             .unwrap();
         assert_eq!(relay.subscription_received_eose(&id).await, Some(false));
+        assert_eq!(relay.subscription(&id).await, Some(vec![retarget]));
+        {
+            let subscriptions = relay.inner.atomic.subscriptions.read().await;
+            let data = subscriptions.get(&id).unwrap();
+            assert_eq!(data.received_events.load(Ordering::SeqCst), 0);
+        }
+
+        // Updating stored filters without sending a REQ keeps the current phase.
+        relay.inner.handle_relay_message(eose, &tx).await;
+        relay
+            .inner
+            .update_subscription(&id, vec![Filter::new().kind(Kind::Reaction)], false)
+            .await
+            .unwrap();
+        assert_eq!(relay.subscription_received_eose(&id).await, Some(true));
 
         relay.inner.handle_relay_message(eose, &tx).await;
         assert_eq!(relay.subscription_received_eose(&id).await, Some(true));
