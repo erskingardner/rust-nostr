@@ -114,7 +114,18 @@ impl EventSendStatus {
     }
 }
 
-/// Send event to relay
+/// Send an event to one relay.
+///
+/// By default, the operation waits for a matching `OK true` acknowledgement
+/// from the relay. A matching `OK false` is an explicit rejection.
+///
+/// Timeout, disconnection, notification loss, or notification closure while
+/// waiting for the acknowledgement leaves publication unconfirmed: the relay
+/// may have received the event. Callers should retain the event ID and resolve
+/// ambiguity according to their own policy.
+///
+/// Use [`SendEvent::wait_for_ok(false)`] to return after send submission without
+/// waiting for relay acknowledgement.
 #[must_use = "Does nothing unless you await!"]
 pub struct SendEvent<'relay, 'event> {
     relay: &'relay Relay,
@@ -135,7 +146,10 @@ impl<'relay, 'event> SendEvent<'relay, 'event> {
         }
     }
 
-    /// Wait for OK confirmation by the relay (default: true)
+    /// Wait for a matching `OK` confirmation by the relay (default: true).
+    ///
+    /// If disabled, [`EventSendStatus::Sent`] confirms only SDK send submission,
+    /// not relay acceptance.
     #[inline]
     pub fn wait_for_ok(mut self, enable: bool) -> Self {
         self.wait_for_ok = enable;
@@ -184,8 +198,8 @@ async fn wait_for_authentication(
     timeout: Duration,
 ) -> Result<(), Error> {
     time::timeout(Some(timeout), async {
-        while let Ok(notification) = notifications.recv().await {
-            match notification {
+        loop {
+            match notifications.recv().await.map_err(Error::from)? {
                 RelayNotification::Authenticated => {
                     return Ok(());
                 }
@@ -198,8 +212,6 @@ async fn wait_for_authentication(
                 _ => (),
             }
         }
-
-        Err(Error::state_msg("premature exit"))
     })
     .await
     .ok_or_else(Error::timeout)?
@@ -268,6 +280,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::error::Error as _;
     use std::time::Duration;
 
     use nostr::prelude::*;
@@ -391,5 +404,50 @@ mod tests {
 
         // Send as authenticated
         assert!(relay.send_event(&event).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn authentication_waiter_preserves_receive_failure() {
+        let (tx, mut rx) = broadcast::channel(2);
+
+        for _ in 0..8 {
+            tx.send(RelayNotification::Authenticated).unwrap();
+        }
+
+        let error = wait_for_authentication(&mut rx, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .source()
+                .and_then(|source| source.downcast_ref::<broadcast::error::RecvError>())
+                .is_some_and(|source| matches!(source, broadcast::error::RecvError::Lagged(_)))
+        );
+
+        let (tx, mut rx) = broadcast::channel(2);
+
+        drop(tx);
+
+        let error = wait_for_authentication(&mut rx, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .source()
+                .and_then(|source| source.downcast_ref::<broadcast::error::RecvError>())
+                .is_some_and(|source| matches!(source, broadcast::error::RecvError::Closed))
+        );
+
+        let (tx, mut rx) = broadcast::channel(2);
+
+        tx.send(RelayNotification::AuthenticationFailed).unwrap();
+
+        let error = wait_for_authentication(&mut rx, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), crate::error::ErrorKind::Rejected);
     }
 }

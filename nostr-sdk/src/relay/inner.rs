@@ -1608,8 +1608,8 @@ impl InnerRelay {
         timeout: Duration,
     ) -> Result<(bool, String), Error> {
         time::timeout(Some(timeout), async {
-            while let Ok(notification) = notifications.recv().await {
-                match notification {
+            loop {
+                match notifications.recv().await.map_err(Error::from)? {
                     RelayNotification::Message { message } => {
                         if let RelayMessage::Ok {
                             event_id,
@@ -1629,8 +1629,6 @@ impl InnerRelay {
                     _ => (),
                 }
             }
-
-            Err(Error::state_msg("premature exit"))
         })
         .await
         .ok_or_else(Error::timeout)?
@@ -2013,6 +2011,8 @@ async fn close_ws(tx: &mut WebSocketSink) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
+    use std::error::Error as _;
     use std::future::Future;
     use std::pin::Pin;
     use std::sync::Arc;
@@ -2644,6 +2644,90 @@ mod tests {
             .unwrap();
 
         assert!(!relay.inner.should_resubscribe(&subscription_id).await);
+    }
+
+    #[tokio::test]
+    async fn ok_waiter_requires_matching_reply_and_preserves_receive_failure() {
+        let relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
+
+        let wanted = EventId::from_byte_array([0; 32]);
+        let other = EventId::from_byte_array([1; 32]);
+
+        let (tx, mut rx) = broadcast::channel(2);
+
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::Ok {
+                event_id: other,
+                status: true,
+                message: Cow::Borrowed("unrelated"),
+            }),
+        })
+        .unwrap();
+
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::Ok {
+                event_id: wanted,
+                status: false,
+                message: Cow::Borrowed("rejected"),
+            }),
+        })
+        .unwrap();
+
+        let (accepted, message) = relay
+            .inner
+            .wait_for_ok(&mut rx, &wanted, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert!(!accepted);
+        assert_eq!(message, "rejected");
+
+        let (_silent_tx, mut silent_rx) = broadcast::channel(2);
+
+        let error = relay
+            .inner
+            .wait_for_ok(&mut silent_rx, &wanted, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::Timeout);
+
+        let (lag_tx, _) = broadcast::channel(2);
+        let mut lagged = lag_tx.subscribe();
+
+        for _ in 0..8 {
+            lag_tx.send(RelayNotification::Authenticated).unwrap();
+        }
+
+        let error = relay
+            .inner
+            .wait_for_ok(&mut lagged, &wanted, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .source()
+                .and_then(|source| source.downcast_ref::<broadcast::error::RecvError>())
+                .is_some_and(|source| matches!(source, broadcast::error::RecvError::Lagged(_)))
+        );
+
+        let (closed_tx, mut closed_rx) = broadcast::channel(2);
+
+        drop(closed_tx);
+
+        let error = relay
+            .inner
+            .wait_for_ok(&mut closed_rx, &wanted, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .source()
+                .and_then(|source| source.downcast_ref::<broadcast::error::RecvError>())
+                .is_some_and(|source| matches!(source, broadcast::error::RecvError::Closed))
+        );
     }
 }
 

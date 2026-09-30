@@ -409,41 +409,34 @@ impl Relay {
         FetchEvents::new(self, filters.into())
     }
 
-    /// Count events
+    /// Count events.
+    ///
+    /// A successful zero is returned only for a matching COUNT response.
+    /// Timeout, notification loss, closure, or relay rejection return an error.
     pub async fn count_events(&self, filter: Filter, timeout: Duration) -> Result<usize, Error> {
-        let id = SubscriptionId::generate();
+        let id: SubscriptionId = SubscriptionId::generate();
+
+        let mut notifications = self.inner.internal_notification_sender.subscribe();
+
         let msg = ClientMessage::Count {
             subscription_id: Cow::Borrowed(&id),
             filter: Cow::Owned(filter),
         };
         self.send_msg(msg).await?;
 
-        let mut count = 0;
-
-        let mut notifications = self.inner.internal_notification_sender.subscribe();
-        time::timeout(Some(timeout), async {
-            while let Ok(notification) = notifications.recv().await {
-                if let RelayNotification::Message { message } = notification {
-                    if let RelayMessage::Count {
-                        subscription_id,
-                        count: c,
-                    } = *message
-                    {
-                        if subscription_id.as_ref() == &id {
-                            count = c;
-                            break;
-                        }
-                    }
-                }
-            }
-        })
-        .await
-        .ok_or_else(Error::timeout)?;
+        let fut = time::timeout(Some(timeout), receive_count_reply(&mut notifications, &id));
+        let result: Result<usize, Error> = fut.await.unwrap_or_else(|| Err(Error::timeout()));
 
         // Unsubscribe
-        self.send_msg(ClientMessage::close(id)).await?;
+        let close_result: Result<(), Error> = self.send_msg(ClientMessage::close(id)).await;
 
-        Ok(count)
+        match result {
+            Ok(count) => {
+                close_result?;
+                Ok(count)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Sync events with relays (negentropy reconciliation)
@@ -453,14 +446,44 @@ impl Relay {
     }
 }
 
+async fn receive_count_reply(
+    notifications: &mut broadcast::Receiver<RelayNotification>,
+    id: &SubscriptionId,
+) -> Result<usize, Error> {
+    loop {
+        match notifications.recv().await.map_err(Error::from)? {
+            RelayNotification::Message { message } => match *message {
+                RelayMessage::Count {
+                    subscription_id,
+                    count,
+                } if subscription_id.as_ref() == id => return Ok(count),
+                RelayMessage::Closed {
+                    subscription_id,
+                    message,
+                } if subscription_id.as_ref() == id => {
+                    return Err(Error::relay_msg(message.into_owned()));
+                }
+                _ => {}
+            },
+            RelayNotification::RelayStatus { status } if status.is_disconnected() => {
+                return Err(Error::not_connected());
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::collections::HashSet;
     use std::future::Future;
+    use std::net::SocketAddr;
     use std::pin::Pin;
     use std::sync::Arc;
 
     use async_utility::time;
+    use nostr::message::MachineReadablePrefix;
 
     use super::*;
     use crate::error::{Error, ErrorKind};
@@ -484,6 +507,34 @@ mod tests {
                     Ok(AdmitStatus::Success)
                 }
             })
+        }
+    }
+
+    #[derive(Debug)]
+    struct RejectCount;
+
+    impl QueryPolicy for RejectCount {
+        fn admit_query<'a>(
+            &'a self,
+            _query: &'a mut Filter,
+            _addr: &'a SocketAddr,
+        ) -> Pin<Box<dyn Future<Output = QueryPolicyResult> + Send + 'a>> {
+            Box::pin(async {
+                QueryPolicyResult::reject(MachineReadablePrefix::Blocked, "count rejected")
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct SilentCount;
+
+    impl QueryPolicy for SilentCount {
+        fn admit_query<'a>(
+            &'a self,
+            _query: &'a mut Filter,
+            _addr: &'a SocketAddr,
+        ) -> Pin<Box<dyn Future<Output = QueryPolicyResult> + Send + 'a>> {
+            Box::pin(std::future::pending())
         }
     }
 
@@ -1094,5 +1145,136 @@ mod tests {
 
         // Must return None, as it's empty
         assert!(res.is_none());
+    }
+
+    #[tokio::test]
+    async fn count_requires_a_matching_response() {
+        let (tx, mut notifications) = broadcast::channel(4);
+        let id = SubscriptionId::new("expected-count");
+        let other_id = SubscriptionId::new("other-count");
+
+        tx.send(RelayNotification::Authenticated).unwrap();
+
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::Count {
+                subscription_id: Cow::Owned(other_id),
+                count: 99,
+            }),
+        })
+        .unwrap();
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::Count {
+                subscription_id: Cow::Owned(id.clone()),
+                count: 0,
+            }),
+        })
+        .unwrap();
+
+        assert_eq!(
+            receive_count_reply(&mut notifications, &id).await.unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn count_receive_loss_and_closure_are_errors() {
+        let id = SubscriptionId::new("missing-count");
+        let (tx, mut notifications) = broadcast::channel(2);
+        for _ in 0..8 {
+            tx.send(RelayNotification::Authenticated).unwrap();
+        }
+        let error = receive_count_reply(&mut notifications, &id)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Other);
+        assert!(error.to_string().contains("lagged"));
+
+        let (tx, mut notifications) = broadcast::channel(2);
+        drop(tx);
+        let error = receive_count_reply(&mut notifications, &id)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Other);
+        assert!(error.to_string().contains("closed"));
+    }
+
+    #[tokio::test]
+    async fn count_disconnect_is_reported_before_timeout() {
+        let id = SubscriptionId::new("interrupted-count");
+        let (tx, mut notifications) = broadcast::channel(2);
+        tx.send(RelayNotification::RelayStatus {
+            status: RelayStatus::Disconnected,
+        })
+        .unwrap();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(1),
+            receive_count_reply(&mut notifications, &id),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::State);
+        assert!(error.to_string().contains("not connected"));
+    }
+
+    #[tokio::test]
+    async fn count_with_no_matches_returns_zero() {
+        let local = LocalRelay::builder().build();
+        local.run().await.unwrap();
+        let relay = new_relay(local.url().await, RelayOptions::default());
+        relay
+            .try_connect()
+            .timeout(Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            relay
+                .count_events(Filter::new(), Duration::from_secs(2))
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn count_without_count_reply_reports_rejection() {
+        let local = LocalRelay::builder().query_policy(RejectCount).build();
+        local.run().await.unwrap();
+        let relay = new_relay(local.url().await, RelayOptions::default());
+        relay
+            .try_connect()
+            .timeout(Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        let error = relay
+            .count_events(Filter::new(), Duration::from_secs(2))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Rejected);
+        assert!(error.to_string().contains("count rejected"));
+    }
+
+    #[tokio::test]
+    async fn count_without_a_reply_times_out() {
+        let local = LocalRelay::builder().query_policy(SilentCount).build();
+        local.run().await.unwrap();
+        let relay = new_relay(local.url().await, RelayOptions::default());
+        relay
+            .try_connect()
+            .timeout(Duration::from_secs(2))
+            .await
+            .unwrap();
+
+        let error = relay
+            .count_events(Filter::new(), Duration::from_millis(20))
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Timeout);
+        assert_eq!(relay.status(), RelayStatus::Connected);
+        relay.shutdown();
+        local.shutdown();
     }
 }
