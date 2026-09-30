@@ -713,6 +713,96 @@ mod tests {
     use crate::error::ErrorKind;
     use crate::local_relay::{LocalRelay, MockRelay, QueryPolicy, QueryPolicyResult};
     use crate::relay::{SyncDirection, SyncOptions};
+    use crate::transport::websocket::{
+        DefaultWebsocketTransport, WebSocketSink, WebSocketStream, WebSocketTransport,
+    };
+
+    #[derive(Debug)]
+    struct CloseInsteadOfEose {
+        omit_events: bool,
+    }
+
+    impl WebSocketTransport for CloseInsteadOfEose {
+        fn support_ping(&self) -> bool {
+            true
+        }
+
+        fn connect<'a>(
+            &'a self,
+            url: &'a Url,
+            proxy: Option<SocketAddr>,
+        ) -> BoxedFuture<'a, Result<(WebSocketSink, WebSocketStream), Error>> {
+            Box::pin(async move {
+                let (sink, stream) = DefaultWebsocketTransport.connect(url, proxy).await?;
+                let omit_events = self.omit_events;
+                let stream = stream.filter_map(move |message| async move {
+                    match message {
+                        Ok(async_wsocket::Message::Text(text)) => {
+                            match RelayMessage::from_json(&text) {
+                                Ok(RelayMessage::EndOfStoredEvents(id)) => {
+                                    Some(Ok(async_wsocket::Message::Text(
+                                        RelayMessage::closed(id.into_owned(), "").as_json(),
+                                    )))
+                                }
+                                Ok(RelayMessage::Event { .. }) if omit_events => None,
+                                _ => Some(Ok(async_wsocket::Message::Text(text))),
+                            }
+                        }
+                        other => Some(other),
+                    }
+                });
+                Ok((sink, Box::pin(stream) as WebSocketStream))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_closed_requires_all_requested_download_events() {
+        for omit_events in [false, true] {
+            let local = LocalRelay::new();
+            local.run().await.unwrap();
+            let event = EventBuilder::new(Kind::TextNote, "explicit download")
+                .finalize(&Keys::generate())
+                .unwrap();
+            local.add_event(event.clone()).await.unwrap();
+            let relay = Relay::builder(local.url().await)
+                .websocket_transport(CloseInsteadOfEose { omit_events })
+                .build();
+            relay
+                .try_connect()
+                .timeout(Duration::from_secs(2))
+                .await
+                .unwrap();
+
+            let result = relay
+                .sync(Filter::new().kind(Kind::TextNote))
+                .opts(
+                    SyncOptions::new()
+                        .initial_timeout(Duration::from_secs(2))
+                        .idle_timeout(Duration::from_secs(2)),
+                )
+                .await;
+            if omit_events {
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("closed before all requested events arrived")
+                );
+            } else {
+                assert_eq!(result.unwrap().received, HashSet::from([event.id]));
+            }
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while relay.inner.active_subscription_count().await != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            relay.shutdown();
+            local.shutdown();
+        }
+    }
 
     #[derive(Debug)]
     struct RejectDownloadAfter {
