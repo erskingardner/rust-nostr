@@ -35,6 +35,12 @@
 - Add `LocalRelayBuilderNip42::relay_url` to make it possible to configure a custom `relay_url` for the nip42 challenge validation (https://github.com/nostrdevkit/nostr/pull/1476)
 - Add `LocalRelayBuilder::new_event_channel_size` for customizing the size of the channel used to notify new received events
 
+### Fixed
+
+- Clean up NIP-77 request-owned subscriptions when reconciliation fails or is cancelled.
+- Fail NIP-77 reconciliation when a download batch is rejected or closes before
+  its requested events arrive, without closing unrelated subscriptions.
+
 ### Deprecated
 
 - Deprecate `LocalRelayBuilder::max_query_results` and `LocalRelayBuilder::default_filter_limit` (https://github.com/nostrdevkit/nostr/pull/1461)
