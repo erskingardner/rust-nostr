@@ -40,6 +40,8 @@
 - Clean up NIP-77 request-owned subscriptions when reconciliation fails or is cancelled.
 - Fail NIP-77 reconciliation when a download batch is rejected or closes before
   its requested events arrive, without closing unrelated subscriptions.
+- Require a correlated COUNT response before `Relay::count_events` returns a count.
+- Preserve the broadcast lag or closure cause in event `OK` and authentication waiters instead of returning a generic premature-exit error.
 
 ### Deprecated
 
