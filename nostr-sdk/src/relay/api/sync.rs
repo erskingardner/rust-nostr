@@ -710,7 +710,7 @@ mod tests {
 
     use super::*;
     use crate::client::Client;
-    use crate::error::ErrorKind;
+    use crate::error::{Error, ErrorKind};
     use crate::local_relay::{LocalRelay, MockRelay, QueryPolicy, QueryPolicyResult};
     use crate::relay::{SyncDirection, SyncOptions};
     use crate::transport::websocket::{
