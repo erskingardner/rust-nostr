@@ -1262,6 +1262,11 @@ mod tests {
         let mut fast_relay = relay.notifications_with_gaps();
         let mut slow_relay = relay.notifications_with_gaps();
         let keys = Keys::generate();
+        // Ignore another request's EOSE while waiting for the selected subscription.
+        client
+            .subscribe(Filter::new().kind(Kind::Metadata))
+            .await
+            .unwrap();
         let id = client
             .subscribe(Filter::new().author(keys.public_key()))
             .await
@@ -1270,18 +1275,11 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                match fast_client.next().await {
-                    Some(NotificationUpdate::Notification(ClientNotification::Message {
-                        message,
-                        ..
-                    })) => {
-                        if matches!(*message, RelayMessage::EndOfStoredEvents(ref received) if received.as_ref() == &id) {
-                            break;
-                        }
-                    }
-                    Some(NotificationUpdate::Lagged { .. }) => panic!("active client receiver lagged"),
-                    None => panic!("client stream closed before EOSE"),
-                    _ => {}
+                let update = fast_client.next().await.expect("active client stream closed");
+                assert!(matches!(update, NotificationUpdate::Notification(_)), "active client receiver lagged");
+                if matches!(update, NotificationUpdate::Notification(ClientNotification::Message { message, .. })
+                    if matches!(*message, RelayMessage::EndOfStoredEvents(ref received) if received.as_ref() == &id)) {
+                    break;
                 }
             }
         })
@@ -1289,17 +1287,11 @@ mod tests {
         .unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
-                match fast_relay.next().await {
-                    Some(NotificationUpdate::Notification(RelayNotification::Message {
-                        message,
-                    })) => {
-                        if matches!(*message, RelayMessage::EndOfStoredEvents(ref received) if received.as_ref() == &id) {
-                            break;
-                        }
-                    }
-                    Some(NotificationUpdate::Lagged { .. }) => panic!("active relay receiver lagged"),
-                    None => panic!("relay stream closed before EOSE"),
-                    _ => {}
+                let update = fast_relay.next().await.expect("active relay stream closed");
+                assert!(matches!(update, NotificationUpdate::Notification(_)), "active relay receiver lagged");
+                if matches!(update, NotificationUpdate::Notification(RelayNotification::Message { message, .. })
+                    if matches!(*message, RelayMessage::EndOfStoredEvents(ref received) if received.as_ref() == &id)) {
+                    break;
                 }
             }
         })
@@ -1316,16 +1308,20 @@ mod tests {
 
             let received_client = tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
-                    match fast_client.next().await {
-                        Some(NotificationUpdate::Notification(ClientNotification::Event {
-                            event,
-                            ..
-                        })) => break event.id,
-                        Some(NotificationUpdate::Lagged { .. }) => {
-                            panic!("active client receiver lagged")
-                        }
-                        None => panic!("client stream closed before event"),
-                        _ => {}
+                    let update = fast_client
+                        .next()
+                        .await
+                        .expect("active client stream closed");
+                    assert!(
+                        matches!(update, NotificationUpdate::Notification(_)),
+                        "active client receiver lagged"
+                    );
+                    if let NotificationUpdate::Notification(ClientNotification::Event {
+                        event,
+                        ..
+                    }) = update
+                    {
+                        break event.id;
                     }
                 }
             })
@@ -1333,16 +1329,17 @@ mod tests {
             .unwrap();
             let received_relay = tokio::time::timeout(Duration::from_secs(5), async {
                 loop {
-                    match fast_relay.next().await {
-                        Some(NotificationUpdate::Notification(RelayNotification::Event {
-                            event,
-                            ..
-                        })) => break event.id,
-                        Some(NotificationUpdate::Lagged { .. }) => {
-                            panic!("active relay receiver lagged")
-                        }
-                        None => panic!("relay stream closed before event"),
-                        _ => {}
+                    let update = fast_relay.next().await.expect("active relay stream closed");
+                    assert!(
+                        matches!(update, NotificationUpdate::Notification(_)),
+                        "active relay receiver lagged"
+                    );
+                    if let NotificationUpdate::Notification(RelayNotification::Event {
+                        event,
+                        ..
+                    }) = update
+                    {
+                        break event.id;
                     }
                 }
             })
