@@ -333,6 +333,20 @@ impl InnerRelay {
         }
     }
 
+    /// Returns the WebSocket session that will write a message queued now.
+    fn delivery_connection(&self) -> usize {
+        // A successful connection updates the counter and the status under this lock.
+        let state: NonPoisoningMutexGuard<'_, ConnectionState> = self.connection_state();
+        let current_connection: usize = self.stats.success();
+
+        // Messages queued while disconnected wait in the outbound channel for the next session.
+        if state.status.is_connected() {
+            current_connection
+        } else {
+            current_connection + 1
+        }
+    }
+
     /// Perform checks to ensure that the relay is ready for use.
     pub(super) fn ensure_operational(&self) -> Result<(), Error> {
         // Ensures that the relay is awake.
@@ -433,7 +447,7 @@ impl InnerRelay {
 
         subscriptions.insert(
             id,
-            SubscriptionData::long_lived(filters, self.stats.success()),
+            SubscriptionData::long_lived(filters, self.delivery_connection()),
         );
 
         Ok(())
@@ -526,10 +540,11 @@ impl InnerRelay {
                 }
 
                 // The successful connection count identifies the WebSocket session.
-                // Requests queued before the first connection are already in the outbound
-                // channel. Later sessions must restore subscriptions even within one second.
+                // A REQ queued while disconnected is already recorded for the session
+                // that will write it. Later sessions must restore subscriptions even
+                // within one second.
                 let current_connection: usize = self.stats.success();
-                current_connection > 1 && current_connection > *subscribed_connection
+                current_connection > *subscribed_connection
             }
             // NOT subscribe if auto-closing subscription or subscription not found
             Some(SubscriptionData {
@@ -1590,6 +1605,40 @@ impl InnerRelay {
         }
     }
 
+    async fn queue_msg(&self, msg: &ClientMessage<'_>, item: JsonMessageItem) -> Result<(), Error> {
+        let ClientMessage::Req {
+            subscription_id, ..
+        } = msg
+        else {
+            return self.atomic.channels.send_client_msg(item);
+        };
+
+        // Record the session that will write this REQ, so that session doesn't restore
+        // the subscription a second time. The lock is held until the REQ is queued so
+        // a reconnection can't check the subscription in between.
+        let mut subscriptions = self.atomic.subscriptions.write().await;
+        let Some(data) = subscriptions
+            .get_mut(subscription_id.as_ref())
+            .filter(|data| !data.is_auto_closing)
+        else {
+            return self.atomic.channels.send_client_msg(item);
+        };
+
+        let connection: usize = self.delivery_connection();
+        self.atomic.channels.send_client_msg(item)?;
+
+        // A later session answers with a new stored-events query. On the current
+        // session, events of the previous query may still be in flight.
+        if connection > data.subscribed_connection {
+            data.subscribed_connection = connection;
+            data.received_eose = false;
+            *data.received_events.get_mut() = 0;
+        }
+        data.closed = false;
+
+        Ok(())
+    }
+
     #[inline]
     pub(super) async fn send_msg(
         &self,
@@ -1615,20 +1664,30 @@ impl InnerRelay {
                 let (tx, rx) = oneshot::channel();
 
                 // Send the item
-                self.atomic.channels.send_client_msg(JsonMessageItem {
-                    json: msg.as_json(),
-                    confirmation: Some(tx),
-                })?;
+                self.queue_msg(
+                    &msg,
+                    JsonMessageItem {
+                        json: msg.as_json(),
+                        confirmation: Some(tx),
+                    },
+                )
+                .await?;
 
                 // Wait for confirmation
                 Ok(time::timeout(Some(timeout), rx)
                     .await
                     .ok_or_else(Error::timeout)??)
             }
-            None => self.atomic.channels.send_client_msg(JsonMessageItem {
-                json: msg.as_json(),
-                confirmation: None,
-            }),
+            None => {
+                self.queue_msg(
+                    &msg,
+                    JsonMessageItem {
+                        json: msg.as_json(),
+                        confirmation: None,
+                    },
+                )
+                .await
+            }
         }
     }
 
@@ -2089,6 +2148,7 @@ async fn close_ws(tx: &mut WebSocketSink) -> Result<(), Error> {
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+    use std::collections::HashSet;
     use std::error::Error as StdError;
     use std::future::{Future, IntoFuture};
     use std::io::{Error as IoError, ErrorKind as IoErrorKind};
@@ -2113,9 +2173,9 @@ mod tests {
     use crate::relay::{Relay, RelayOptions};
     use crate::stream::NotificationStream;
     use crate::test_utils::{
-        ControlledConnectionPolicy, ControlledRelay, DialReply, PolicyReply, TEST_TIMEOUT,
-        connection_gate_close, fake_connection, start_try_connect, wait_for_eose, wait_for_status,
-        wait_for_subscription_event, wait_until,
+        ControlledConnectionPolicy, ControlledRelay, DialReply, PolicyReply, RecordedConnection,
+        TEST_TIMEOUT, connection_gate_close, fake_connection, recording_connection,
+        start_try_connect, wait_for_eose, wait_for_status, wait_for_subscription_event, wait_until,
     };
     use crate::transport::websocket::{DefaultWebsocketTransport, WebSocketTransport};
 
@@ -3432,6 +3492,253 @@ mod tests {
         relay.inner.stats.new_success();
 
         assert!(relay.inner.should_resubscribe(&id).await);
+    }
+
+    enum QueuedReq {
+        Subscribe,
+        CloseAndReq,
+    }
+
+    /// Replies like a relay that rejects a REQ for an already-open subscription ID.
+    fn reply_rejecting_duplicate_reqs(connection: &RecordedConnection, frames: &[String]) {
+        let mut open: HashSet<SubscriptionId> = HashSet::new();
+
+        for frame in frames {
+            match ClientMessage::from_json(frame) {
+                Ok(ClientMessage::Req {
+                    subscription_id, ..
+                }) => {
+                    let id: SubscriptionId = subscription_id.into_owned();
+                    let reply: RelayMessage = if open.insert(id.clone()) {
+                        RelayMessage::eose(id)
+                    } else {
+                        RelayMessage::closed(id, "duplicate: subscription already open")
+                    };
+                    connection.reply(reply);
+                }
+                Ok(ClientMessage::Close(id)) => {
+                    open.remove(id.as_ref());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Waits until the frames queued so far are written, and returns the barrier ID.
+    async fn flush_outbound(relay: &Relay) -> SubscriptionId {
+        let barrier: SubscriptionId = SubscriptionId::new("barrier");
+        relay
+            .send_msg(ClientMessage::close(barrier.clone()))
+            .wait_until_sent(TEST_TIMEOUT)
+            .await
+            .unwrap();
+        barrier
+    }
+
+    async fn queued_req_is_sent_once_after_reconnect(queued: QueuedReq) {
+        let opts: RelayOptions = RelayOptions::default()
+            .adjust_retry_interval(false)
+            .retry_interval(Duration::from_secs(1));
+
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::with_opts(opts);
+
+        let id: SubscriptionId = SubscriptionId::new("live");
+        let filter: Filter = Filter::new().kind(Kind::TextNote);
+
+        relay.connect();
+
+        let (connection, first) = recording_connection();
+        assert!(transport.next_dial().await.send(Ok(connection)).is_ok());
+        wait_for_status(&relay, RelayStatus::Connected).await;
+
+        if let QueuedReq::CloseAndReq = queued {
+            relay
+                .subscribe(filter.clone())
+                .with_id(id.clone())
+                .await
+                .unwrap();
+        }
+
+        // Otherwise an unwritten REQ would be carried over to the next session.
+        flush_outbound(&relay).await;
+        first.close();
+        wait_for_status(&relay, RelayStatus::Disconnected).await;
+
+        match queued {
+            QueuedReq::Subscribe => {
+                relay
+                    .subscribe(filter.clone())
+                    .with_id(id.clone())
+                    .await
+                    .unwrap();
+            }
+            QueuedReq::CloseAndReq => {
+                relay
+                    .send_msg(ClientMessage::close(id.clone()))
+                    .await
+                    .unwrap();
+                relay
+                    .send_msg(ClientMessage::req(id.clone(), filter))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let (connection, mut second) = recording_connection();
+        assert!(transport.next_dial().await.send(Ok(connection)).is_ok());
+        wait_for_status(&relay, RelayStatus::Connected).await;
+
+        // Restored and queued frames precede the barrier in the outbound channel.
+        let barrier: SubscriptionId = flush_outbound(&relay).await;
+
+        let frames: Vec<String> = second.sent_text();
+        let reqs: usize = frames
+            .iter()
+            .filter(|frame| frame.starts_with(r#"["REQ","live""#))
+            .count();
+        assert_eq!(reqs, 1, "frames on reconnected session: {frames:?}");
+
+        let mut notifications: NotificationStream<RelayNotification> = relay.notifications();
+        reply_rejecting_duplicate_reqs(&second, &frames);
+        second.reply(RelayMessage::eose(barrier.clone()));
+        wait_for_eose(&mut notifications, &barrier).await;
+
+        assert!(relay.inner.has_subscription(&id).await);
+        assert!(!relay.inner.should_resubscribe(&id).await);
+    }
+
+    #[tokio::test]
+    async fn subscription_queued_while_disconnected_is_sent_once() {
+        queued_req_is_sent_once_after_reconnect(QueuedReq::Subscribe).await;
+    }
+
+    #[tokio::test]
+    async fn close_and_req_queued_while_disconnected_are_sent_once() {
+        queued_req_is_sent_once_after_reconnect(QueuedReq::CloseAndReq).await;
+    }
+
+    #[tokio::test]
+    async fn failed_req_queue_keeps_subscription_restorable() {
+        let opts: RelayOptions = RelayOptions::default()
+            .adjust_retry_interval(false)
+            .retry_interval(Duration::from_secs(1));
+
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::with_opts(opts);
+
+        let filter: Filter = Filter::new().kind(Kind::TextNote);
+
+        relay.connect();
+
+        let (connection, first) = recording_connection();
+        assert!(transport.next_dial().await.send(Ok(connection)).is_ok());
+        wait_for_status(&relay, RelayStatus::Connected).await;
+
+        let id: SubscriptionId = relay.subscribe(filter.clone()).await.unwrap();
+        flush_outbound(&relay).await;
+        first.close();
+        wait_for_status(&relay, RelayStatus::Disconnected).await;
+
+        relay.inner.subscription_closed(&id).await;
+
+        // Fill the outbound channel so the REQ can't be queued.
+        while relay
+            .send_msg(ClientMessage::close(SubscriptionId::new("filler")))
+            .await
+            .is_ok()
+        {}
+
+        assert!(
+            relay
+                .send_msg(ClientMessage::req(id.clone(), filter))
+                .await
+                .is_err()
+        );
+
+        let subscriptions = relay.inner.atomic.subscriptions.read().await;
+        let data: &SubscriptionData = subscriptions.get(&id).unwrap();
+        assert_eq!(data.subscribed_connection, 1);
+        assert!(data.closed);
+    }
+
+    #[tokio::test]
+    async fn req_queued_for_next_session_resets_limit_tracking() {
+        let relay: Relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
+
+        let id: SubscriptionId = SubscriptionId::new("live");
+        let filter: Filter = Filter::new().kind(Kind::TextNote).limit(1);
+
+        relay
+            .inner
+            .add_long_lived_subscription(id.clone(), vec![filter.clone()])
+            .await
+            .unwrap();
+
+        // Subscribed on the current session, which already reached EOSE.
+        relay
+            .inner
+            .update_subscription(&id, vec![filter.clone()], true)
+            .await
+            .unwrap();
+        relay.inner.received_eose(&id).await;
+        {
+            let mut subscriptions = relay.inner.atomic.subscriptions.write().await;
+            *subscriptions
+                .get_mut(&id)
+                .unwrap()
+                .received_events
+                .get_mut() = 1;
+        }
+
+        // The relay isn't connected, so the REQ is written on the next session.
+        let msg: ClientMessage = ClientMessage::req(id.clone(), filter);
+        let item: JsonMessageItem = JsonMessageItem {
+            json: msg.as_json(),
+            confirmation: None,
+        };
+        relay.inner.queue_msg(&msg, item).await.unwrap();
+
+        let subscriptions = relay.inner.atomic.subscriptions.read().await;
+        let data: &SubscriptionData = subscriptions.get(&id).unwrap();
+        assert_eq!(data.subscribed_connection, 1);
+        assert!(!data.received_eose);
+        assert_eq!(data.received_events.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn subscription_queued_before_first_connection_is_sent_once() {
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::new();
+
+        relay.connect();
+
+        let reply: DialReply = transport.next_dial().await;
+
+        let id: SubscriptionId = relay
+            .subscribe(Filter::new().kind(Kind::TextNote))
+            .await
+            .unwrap();
+
+        let (connection, mut recorded) = recording_connection();
+        assert!(reply.send(Ok(connection)).is_ok());
+        wait_for_status(&relay, RelayStatus::Connected).await;
+
+        flush_outbound(&relay).await;
+
+        let req: String = format!(r#"["REQ","{id}""#);
+        let frames: Vec<String> = recorded.sent_text();
+        let reqs: usize = frames
+            .iter()
+            .filter(|frame| frame.starts_with(&req))
+            .count();
+        assert_eq!(reqs, 1, "frames on first session: {frames:?}");
     }
 }
 

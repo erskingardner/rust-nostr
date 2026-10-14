@@ -290,6 +290,55 @@ pub(crate) fn fake_connection() -> (WebSocketSink, WebSocketStream) {
     )
 }
 
+/// Controls a connection created by [`recording_connection`].
+pub(crate) struct RecordedConnection {
+    sent: mpsc::UnboundedReceiver<Message>,
+    // Dropping it ends the incoming stream, which closes the session.
+    incoming: futures::channel::mpsc::UnboundedSender<Result<Message, Error>>,
+}
+
+impl RecordedConnection {
+    /// Returns the text frames written so far.
+    pub(crate) fn sent_text(&mut self) -> Vec<String> {
+        let mut frames = Vec::new();
+        while let Ok(msg) = self.sent.try_recv() {
+            if let Message::Text(text) = msg {
+                frames.push(text);
+            }
+        }
+        frames
+    }
+
+    pub(crate) fn reply(&self, msg: RelayMessage<'_>) {
+        self.incoming
+            .unbounded_send(Ok(Message::Text(msg.as_json())))
+            .expect("relay dropped the connection");
+    }
+
+    pub(crate) fn close(self) {
+        drop(self.incoming);
+    }
+}
+
+/// Records outgoing messages and stays open until [`RecordedConnection::close`].
+pub(crate) fn recording_connection() -> ((WebSocketSink, WebSocketStream), RecordedConnection) {
+    let (sent_tx, sent) = mpsc::unbounded_channel();
+    let (incoming, incoming_rx) = futures::channel::mpsc::unbounded();
+
+    (
+        (
+            Box::pin(futures::sink::unfold(sent_tx, |sent_tx, msg| async move {
+                sent_tx
+                    .send(msg)
+                    .map_err(|_| Error::state_msg("recorder dropped"))?;
+                Ok(sent_tx)
+            })),
+            Box::pin(incoming_rx),
+        ),
+        RecordedConnection { sent, incoming },
+    )
+}
+
 pub(crate) fn connection_gate_close(
     connection: (WebSocketSink, WebSocketStream),
 ) -> ((WebSocketSink, WebSocketStream), CloseGate) {
