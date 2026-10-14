@@ -58,6 +58,7 @@
 - Retain reconnect requests while a previous WebSocket closes (https://github.com/nostrdevkit/nostr/pull/1491).
 - Allow banning and shutting down idle relays (https://github.com/nostrdevkit/nostr/pull/1491).
 - Restore subscriptions after reconnections within the same second  (https://github.com/nostrdevkit/nostr/pull/1491).
+- Reset subscription EOSE and event-limit tracking when a subscription is restored, so a relay isn't flagged for resending stored events.
 
 ### Deprecated
 

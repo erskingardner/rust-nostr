@@ -471,6 +471,10 @@ impl InnerRelay {
         if mark_subscribed {
             data.subscribed_connection = self.stats.success();
             data.closed = false;
+
+            // The relay answers the new REQ with a new stored-events query.
+            data.received_eose = false;
+            *data.received_events.get_mut() = 0;
         }
 
         Ok(())
@@ -2424,6 +2428,84 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.to_string(), "subscription not found");
+    }
+
+    async fn handle_text_note(
+        relay: &Relay,
+        subscription_id: &SubscriptionId,
+    ) -> Result<(), Error> {
+        let event = EventBuilder::new(Kind::TextNote, "test")
+            .finalize(&Keys::generate())
+            .unwrap();
+        relay
+            .inner
+            .handle_event_msg(subscription_id.clone(), event)
+            .await
+            .map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn test_resubscribe_resets_received_event_count() {
+        let url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let opts = RelayOptions::default()
+            .verify_subscriptions(true)
+            .ban_relay_on_mismatch(true);
+        let relay = Relay::builder(url).opts(opts).build();
+        let subscription_id = SubscriptionId::new("test");
+        let filter = Filter::new().kind(Kind::TextNote).limit(2);
+
+        relay
+            .inner
+            .add_long_lived_subscription(subscription_id.clone(), vec![filter.clone()])
+            .await
+            .unwrap();
+
+        // The connection drops before EOSE.
+        for _ in 0..2 {
+            handle_text_note(&relay, &subscription_id).await.unwrap();
+        }
+
+        relay
+            .inner
+            .update_subscription(&subscription_id, vec![filter], true)
+            .await
+            .unwrap();
+
+        // The relay sends the stored events again for the restored REQ.
+        for _ in 0..2 {
+            handle_text_note(&relay, &subscription_id).await.unwrap();
+        }
+
+        assert_ne!(relay.status(), RelayStatus::Banned);
+    }
+
+    #[tokio::test]
+    async fn test_resubscribe_resets_received_eose() {
+        let url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let opts = RelayOptions::default().verify_subscriptions(true);
+        let relay = Relay::builder(url).opts(opts).build();
+        let subscription_id = SubscriptionId::new("test");
+        let filter = Filter::new().kind(Kind::TextNote).limit(1);
+
+        relay
+            .inner
+            .add_long_lived_subscription(subscription_id.clone(), vec![filter.clone()])
+            .await
+            .unwrap();
+        relay.inner.received_eose(&subscription_id).await;
+
+        relay
+            .inner
+            .update_subscription(&subscription_id, vec![filter], true)
+            .await
+            .unwrap();
+
+        // The limit applies again until the restored REQ reaches EOSE.
+        handle_text_note(&relay, &subscription_id).await.unwrap();
+        let err = handle_text_note(&relay, &subscription_id)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::LimitExceeded);
     }
 
     #[tokio::test]
