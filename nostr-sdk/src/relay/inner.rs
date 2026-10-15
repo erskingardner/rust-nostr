@@ -68,6 +68,54 @@ struct HandleAutoClosing {
 struct JsonMessageItem {
     json: ClientMessageJson,
     confirmation: Option<oneshot::Sender<()>>,
+    pending_req: Option<PendingReq>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PendingReqCounter(Arc<AtomicUsize>);
+
+impl PendingReqCounter {
+    #[inline]
+    fn track(&self, subscription_id: SubscriptionId) -> PendingReq {
+        self.0.fetch_add(1, Ordering::SeqCst);
+
+        PendingReq {
+            subscription_id,
+            counter: self.clone(),
+        }
+    }
+
+    #[inline]
+    fn decrement(&self) {
+        let _ = self
+            .0
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_sub(1)
+            });
+    }
+
+    #[inline]
+    fn has_pending(&self) -> bool {
+        self.0.load(Ordering::SeqCst) > 0
+    }
+
+    #[inline]
+    fn is_current(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// Keeps a queued REQ counted until it is dispatched or dropped.
+struct PendingReq {
+    subscription_id: SubscriptionId,
+    counter: PendingReqCounter,
+}
+
+impl Drop for PendingReq {
+    #[inline]
+    fn drop(&mut self) {
+        self.counter.decrement();
+    }
 }
 
 #[derive(Debug)]
@@ -198,6 +246,8 @@ struct SubscriptionData {
     pub received_events: AtomicUsize,
     /// Subscription closed by relay
     pub closed: bool,
+    /// Counter used for long-lived subscriptions, for tracking the number of the pending ones
+    pending_req_counter: Option<PendingReqCounter>,
 }
 
 impl SubscriptionData {
@@ -210,6 +260,7 @@ impl SubscriptionData {
             received_eose: false,
             received_events: AtomicUsize::new(0),
             closed: false,
+            pending_req_counter: Some(PendingReqCounter::default()),
         }
     }
 
@@ -222,6 +273,7 @@ impl SubscriptionData {
             received_eose: false,
             received_events: AtomicUsize::new(0),
             closed: false,
+            pending_req_counter: None,
         }
     }
 }
@@ -533,16 +585,21 @@ impl InnerRelay {
                 subscribed_connection,
                 closed,
                 is_auto_closing: false,
+                pending_req_counter,
                 ..
             }) => {
+                if let Some(counter) = pending_req_counter {
+                    if counter.has_pending() {
+                        return false;
+                    }
+                }
+
                 if *closed {
                     return true;
                 }
 
-                // The successful connection count identifies the WebSocket session.
-                // A REQ queued while disconnected is already recorded for the session
-                // that will write it. Later sessions must restore subscriptions even
-                // within one second.
+                // Restore subscriptions dispatched on an earlier WebSocket session,
+                // even when reconnecting within one second.
                 let current_connection: usize = self.stats.success();
                 current_connection > *subscribed_connection
             }
@@ -553,6 +610,33 @@ impl InnerRelay {
             })
             | None => false,
         }
+    }
+
+    async fn subscription_req_started(&self, request: &PendingReq) {
+        let mut subscriptions = self.atomic.subscriptions.write().await;
+
+        let Some(data) = subscriptions.get_mut(&request.subscription_id) else {
+            return;
+        };
+
+        let Some(counter) = &data.pending_req_counter else {
+            return;
+        };
+
+        if !counter.is_current(&request.counter) {
+            return;
+        }
+
+        // A queued REQ may have survived an earlier session without being dispatched.
+        let connection: usize = self.stats.success();
+
+        if connection > data.subscribed_connection {
+            data.received_eose = false;
+            *data.received_events.get_mut() = 0;
+        }
+
+        data.subscribed_connection = connection;
+        data.closed = false;
     }
 
     #[inline]
@@ -1095,9 +1179,13 @@ impl InnerRelay {
             tokio::select! {
                 // Nostr channel receiver
                 item = self.recv_client_msg(rx_nostr, attempt) => {
-                    let Some(JsonMessageItem { json, confirmation }) = item else {
+                    let Some(JsonMessageItem { json, confirmation, pending_req }) = item else {
                         break;
                     };
+
+                    if let Some(pending_req) = pending_req {
+                        self.subscription_req_started(&pending_req).await;
+                    }
 
                     // Get messages size
                     let size: usize = json.len();
@@ -1605,7 +1693,11 @@ impl InnerRelay {
         }
     }
 
-    async fn queue_msg(&self, msg: &ClientMessage<'_>, item: JsonMessageItem) -> Result<(), Error> {
+    async fn queue_msg(
+        &self,
+        msg: &ClientMessage<'_>,
+        mut item: JsonMessageItem,
+    ) -> Result<(), Error> {
         let ClientMessage::Req {
             subscription_id, ..
         } = msg
@@ -1613,30 +1705,16 @@ impl InnerRelay {
             return self.atomic.channels.send_client_msg(item);
         };
 
-        // Record the session that will write this REQ, so that session doesn't restore
-        // the subscription a second time. The lock is held until the REQ is queued so
-        // a reconnection can't check the subscription in between.
-        let mut subscriptions = self.atomic.subscriptions.write().await;
-        let Some(data) = subscriptions
-            .get_mut(subscription_id.as_ref())
-            .filter(|data| !data.is_auto_closing)
-        else {
-            return self.atomic.channels.send_client_msg(item);
-        };
+        // Keep the pending count and enqueue atomic with restoration checks.
+        let subscriptions = self.atomic.subscriptions.write().await;
 
-        let connection: usize = self.delivery_connection();
-        self.atomic.channels.send_client_msg(item)?;
-
-        // A later session answers with a new stored-events query. On the current
-        // session, events of the previous query may still be in flight.
-        if connection > data.subscribed_connection {
-            data.subscribed_connection = connection;
-            data.received_eose = false;
-            *data.received_events.get_mut() = 0;
+        if let Some(data) = subscriptions.get(subscription_id.as_ref()) {
+            if let Some(counter) = &data.pending_req_counter {
+                item.pending_req = Some(counter.track(subscription_id.as_ref().clone()));
+            }
         }
-        data.closed = false;
 
-        Ok(())
+        self.atomic.channels.send_client_msg(item)
     }
 
     #[inline]
@@ -1669,6 +1747,7 @@ impl InnerRelay {
                     JsonMessageItem {
                         json: msg.as_json(),
                         confirmation: Some(tx),
+                        pending_req: None,
                     },
                 )
                 .await?;
@@ -1684,6 +1763,7 @@ impl InnerRelay {
                     JsonMessageItem {
                         json: msg.as_json(),
                         confirmation: None,
+                        pending_req: None,
                     },
                 )
                 .await
@@ -2861,6 +2941,7 @@ mod tests {
         let message: JsonMessageItem = JsonMessageItem {
             json: "queued message".to_owned(),
             confirmation: None,
+            pending_req: None,
         };
         assert!(tx.try_send(message).is_ok());
 
@@ -3611,6 +3692,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subscription_queued_before_disconnect_is_sent_once_after_reconnect() {
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::new();
+        let id: SubscriptionId = SubscriptionId::new("live");
+        let filter: Filter = Filter::new().kind(Kind::TextNote);
+
+        relay.connect();
+
+        let (connection, mut first) = recording_connection();
+        let reply: DialReply = transport.next_dial().await;
+
+        assert!(reply.send(Ok(connection)).is_ok());
+
+        wait_for_status(&relay, RelayStatus::Connected).await;
+        flush_outbound(&relay).await;
+        first.sent_text();
+
+        relay
+            .subscribe(filter.clone())
+            .with_id(id.clone())
+            .await
+            .unwrap();
+
+        // Do not yield between queueing the REQ and invalidating the sender.
+        relay.disconnect();
+        relay.connect();
+
+        let (connection, mut second) = recording_connection();
+        let reply: DialReply = transport.next_dial().await;
+
+        assert!(reply.send(Ok(connection)).is_ok());
+
+        wait_for_status(&relay, RelayStatus::Connected).await;
+        flush_outbound(&relay).await;
+
+        assert!(first.sent_text().is_empty());
+
+        let expected: String = ClientMessage::req(id.clone(), filter).as_json();
+        let frames: Vec<String> = second.sent_text();
+
+        assert_eq!(
+            frames.iter().filter(|frame| **frame == expected).count(),
+            1,
+            "frames on reconnected session: {frames:?}"
+        );
+        assert!(relay.subscription(&id).await.is_some());
+    }
+
+    #[tokio::test]
     async fn subscription_queued_while_disconnected_is_sent_once() {
         queued_req_is_sent_once_after_reconnect(QueuedReq::Subscribe).await;
     }
@@ -3664,50 +3796,152 @@ mod tests {
         let data: &SubscriptionData = subscriptions.get(&id).unwrap();
         assert_eq!(data.subscribed_connection, 1);
         assert!(data.closed);
+        assert!(!data.pending_req_counter.as_ref().unwrap().has_pending());
+        drop(subscriptions);
+
+        assert!(relay.inner.should_resubscribe(&id).await);
     }
 
     #[tokio::test]
-    async fn req_queued_for_next_session_resets_limit_tracking() {
-        let relay: Relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
-
+    async fn queued_req_resets_limit_tracking_when_dispatched_on_next_session() {
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::with_opts(RelayOptions::default().verify_subscriptions(true));
         let id: SubscriptionId = SubscriptionId::new("live");
         let filter: Filter = Filter::new().kind(Kind::TextNote).limit(1);
 
+        relay.connect();
+
+        let (connection, first) = recording_connection();
+        assert!(transport.next_dial().await.send(Ok(connection)).is_ok());
+        wait_for_status(&relay, RelayStatus::Connected).await;
+
         relay
-            .inner
-            .add_long_lived_subscription(id.clone(), vec![filter.clone()])
+            .subscribe(filter.clone())
+            .with_id(id.clone())
+            .await
+            .unwrap();
+        flush_outbound(&relay).await;
+
+        let mut notifications = relay.notifications();
+        let event = EventBuilder::new(Kind::TextNote, "stored event")
+            .finalize(&Keys::generate())
+            .unwrap();
+        first.reply(RelayMessage::event(id.clone(), event));
+        first.reply(RelayMessage::eose(id.clone()));
+        wait_for_eose(&mut notifications, &id).await;
+
+        relay.disconnect();
+        relay
+            .send_msg(ClientMessage::req(id.clone(), filter))
             .await
             .unwrap();
 
-        // Subscribed on the current session, which already reached EOSE.
-        relay
-            .inner
-            .update_subscription(&id, vec![filter.clone()], true)
-            .await
-            .unwrap();
-        relay.inner.received_eose(&id).await;
+        // Queueing alone must leave the previous query's tracking intact.
         {
-            let mut subscriptions = relay.inner.atomic.subscriptions.write().await;
-            *subscriptions
-                .get_mut(&id)
-                .unwrap()
-                .received_events
-                .get_mut() = 1;
+            let subscriptions = relay.inner.atomic.subscriptions.read().await;
+            let data = subscriptions.get(&id).unwrap();
+            assert!(data.received_eose);
+            assert_eq!(data.received_events.load(Ordering::SeqCst), 1);
         }
 
-        // The relay isn't connected, so the REQ is written on the next session.
-        let msg: ClientMessage = ClientMessage::req(id.clone(), filter);
-        let item: JsonMessageItem = JsonMessageItem {
-            json: msg.as_json(),
-            confirmation: None,
-        };
-        relay.inner.queue_msg(&msg, item).await.unwrap();
+        relay.connect();
+
+        let (connection, _second) = recording_connection();
+        assert!(transport.next_dial().await.send(Ok(connection)).is_ok());
+        wait_for_status(&relay, RelayStatus::Connected).await;
+        flush_outbound(&relay).await;
 
         let subscriptions = relay.inner.atomic.subscriptions.read().await;
         let data: &SubscriptionData = subscriptions.get(&id).unwrap();
-        assert_eq!(data.subscribed_connection, 1);
+        assert_eq!(data.subscribed_connection, 2);
         assert!(!data.received_eose);
         assert_eq!(data.received_events.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn pending_req_counter_does_not_underflow() {
+        let counter = PendingReqCounter::default();
+
+        counter.decrement();
+        counter.decrement();
+
+        assert!(!counter.has_pending());
+    }
+
+    #[test]
+    fn pending_req_counter_tracks_requests_until_all_are_dropped() {
+        let counter = PendingReqCounter::default();
+        let id = SubscriptionId::new("live");
+        let first = counter.track(id.clone());
+        let second = counter.track(id);
+
+        assert!(counter.has_pending());
+
+        drop(first);
+
+        assert!(counter.has_pending());
+
+        drop(second);
+
+        assert!(!counter.has_pending());
+    }
+
+    #[tokio::test]
+    async fn cancelled_req_dispatch_releases_pending_count() {
+        let controlled = ControlledRelay::new();
+        let relay = &controlled.relay;
+        let mut queue = relay.inner.atomic.channels.rx_nostr().await;
+
+        relay.connect();
+        let id = relay.subscribe(Filter::new()).await.unwrap();
+        let request = queue.try_recv().unwrap().pending_req.unwrap();
+
+        // Make dispatch wait for the subscription lock, then cancel it.
+        let subscriptions = relay.inner.atomic.subscriptions.read().await;
+        let data = subscriptions.get(&id).unwrap();
+        let pending_count = data.pending_req_counter.as_ref().unwrap();
+        let mut dispatch = Box::pin(async move {
+            relay.inner.subscription_req_started(&request).await;
+        });
+        assert!(futures::poll!(dispatch.as_mut()).is_pending());
+        assert!(pending_count.has_pending());
+
+        drop(dispatch);
+
+        assert!(!pending_count.has_pending());
+    }
+
+    #[tokio::test]
+    async fn old_queued_req_does_not_update_reused_subscription_id() {
+        let controlled = ControlledRelay::new();
+        let relay = &controlled.relay;
+        let mut queue = relay.inner.atomic.channels.rx_nostr().await;
+        let id = SubscriptionId::new("reused");
+
+        relay.connect();
+        relay
+            .subscribe(Filter::new())
+            .with_id(id.clone())
+            .await
+            .unwrap();
+        let old_request = queue.try_recv().unwrap().pending_req.unwrap();
+
+        relay.unsubscribe(&id).await.unwrap();
+        relay
+            .subscribe(Filter::new())
+            .with_id(id.clone())
+            .await
+            .unwrap();
+
+        relay.inner.subscription_req_started(&old_request).await;
+        drop(old_request);
+
+        let subscriptions = relay.inner.atomic.subscriptions.read().await;
+        let data = subscriptions.get(&id).unwrap();
+        assert_eq!(data.subscribed_connection, 1);
+        assert!(data.pending_req_counter.as_ref().unwrap().has_pending());
     }
 
     #[tokio::test]
