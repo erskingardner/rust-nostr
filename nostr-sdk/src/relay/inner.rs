@@ -3,8 +3,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::task::Poll;
 use std::time::Duration;
-use std::{cmp, ptr};
+use std::{cmp, future, ptr};
 
 use async_utility::task::{self, JoinHandle};
 use async_utility::time;
@@ -1013,7 +1014,7 @@ impl InnerRelay {
         // Add also termination here, to allow closing the connection in case of termination request.
         tokio::select! {
             // Message sender handler
-            res = self.sender_message_handler(&mut ws_tx, rx_nostr, &ping) => match res {
+            res = self.sender_message_handler(&mut ws_tx, rx_nostr, &ping, attempt) => match res {
                 Ok(()) => tracing::trace!(url = %self.url, "Relay sender exited."),
                 Err(e) => tracing::error!(url = %self.url, error = %e, "Relay sender exited with error.")
             },
@@ -1042,11 +1043,31 @@ impl InnerRelay {
         }
     }
 
+    async fn recv_client_msg(
+        &self,
+        rx_nostr: &mut Receiver<JsonMessageItem>,
+        attempt: &ConnectionAttempt,
+    ) -> Option<JsonMessageItem> {
+        future::poll_fn(|cx| {
+            let state: NonPoisoningMutexGuard<'_, ConnectionState> = self.connection_state();
+
+            // Serialize the dequeue with invalidation so an old sender cannot
+            // consume frames assigned to the next session, even on another thread.
+            if !state.status.is_connected() || !attempt.is_current(&state.attempt) {
+                return Poll::Ready(None);
+            }
+
+            rx_nostr.poll_recv(cx)
+        })
+        .await
+    }
+
     async fn sender_message_handler(
         &self,
         ws_tx: &mut WebSocketSink,
         rx_nostr: &mut MutexGuard<'_, Receiver<JsonMessageItem>>,
         ping: &PingTracker,
+        attempt: &ConnectionAttempt,
     ) -> Result<(), Error> {
         #[cfg(target_arch = "wasm32")]
         let _ping = ping;
@@ -1054,7 +1075,11 @@ impl InnerRelay {
         loop {
             tokio::select! {
                 // Nostr channel receiver
-                Some(JsonMessageItem { json, confirmation }) = rx_nostr.recv() => {
+                item = self.recv_client_msg(rx_nostr, attempt) => {
+                    let Some(JsonMessageItem { json, confirmation }) = item else {
+                        break;
+                    };
+
                     // Get messages size
                     let size: usize = json.len();
 
@@ -2668,6 +2693,65 @@ mod tests {
             &first,
             &attempt.wait_for_result().await.unwrap_err()
         ));
+    }
+
+    #[tokio::test]
+    async fn recv_client_msg_preserves_messages_for_current_connection() {
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::new();
+
+        let inner: &InnerRelay = &relay.inner;
+
+        relay.connect();
+
+        let reply: DialReply = transport.next_dial().await;
+
+        assert!(reply.send(Ok(fake_connection())).is_ok());
+
+        wait_for_status(&relay, RelayStatus::Connected).await;
+
+        let old_attempt: Arc<ConnectionAttempt> = inner.connection_state().attempt.clone().unwrap();
+
+        // Isolate the queue from the background sender while testing the receive operation.
+        let (tx, mut rx) = mpsc::channel(1);
+        let message: JsonMessageItem = JsonMessageItem {
+            json: "queued message".to_owned(),
+            confirmation: None,
+        };
+        assert!(tx.try_send(message).is_ok());
+
+        relay.disconnect();
+
+        // After disconnection the "attempt" is taken, so the receiver MUST NOT receive any messages.
+        assert!(inner.recv_client_msg(&mut rx, &old_attempt).await.is_none());
+
+        // The message MUST STILL be in the queue, since the receiver has not consumed it.
+        assert_eq!(rx.len(), 1);
+
+        relay.connect();
+
+        let reply: DialReply = transport.next_dial().await;
+
+        assert!(reply.send(Ok(fake_connection())).is_ok());
+
+        wait_for_status(&relay, RelayStatus::Connected).await;
+
+        // Old "attempt" MUST NOT consume the message.
+        assert!(inner.recv_client_msg(&mut rx, &old_attempt).await.is_none());
+        assert_eq!(rx.len(), 1);
+
+        let current_attempt: Arc<ConnectionAttempt> =
+            inner.connection_state().attempt.clone().unwrap();
+
+        // The current "attempt" MUST consume the message.
+        let received: JsonMessageItem = inner
+            .recv_client_msg(&mut rx, &current_attempt)
+            .await
+            .unwrap();
+        assert_eq!(received.json, "queued message");
+        assert!(rx.is_empty());
     }
 
     #[tokio::test]
