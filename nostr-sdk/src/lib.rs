@@ -13,6 +13,7 @@ mod future;
 #[cfg(any(feature = "local-relay", test))]
 pub mod local_relay;
 pub mod monitor;
+mod mutex;
 pub mod policy;
 mod pool;
 pub mod prelude;
@@ -20,9 +21,7 @@ pub mod prelude;
 pub mod proxy;
 pub mod relay;
 mod shared;
-mod stream;
+pub mod stream;
 #[cfg(test)]
 mod test_utils;
 pub mod transport;
-
-pub use crate::stream::NotificationUpdate;

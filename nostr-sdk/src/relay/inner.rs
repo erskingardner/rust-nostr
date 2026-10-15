@@ -2,11 +2,13 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex as StdMutex};
+use std::sync::{Arc, OnceLock};
+use std::task::Poll;
 use std::time::Duration;
-use std::{cmp, slice};
+use std::{cmp, future, ptr};
 
-use async_utility::{task, time};
+use async_utility::task::{self, JoinHandle};
+use async_utility::time;
 use async_wsocket::Message;
 use futures::{self, SinkExt, StreamExt};
 use nostr::filter::MatchEventOptions;
@@ -18,7 +20,8 @@ use rand::Rng;
 use rand::RngExt;
 use rand::rand_core::UnwrapErr;
 use rand::rngs::SysRng;
-use tokio::sync::mpsc::{self, Receiver, Sender};
+use tokio::sync::futures::Notified;
+use tokio::sync::mpsc::{self, PermitIterator, Receiver, Sender};
 use tokio::sync::{Mutex, MutexGuard, Notify, RwLock, RwLockWriteGuard, broadcast, oneshot, watch};
 use universal_time::Instant;
 
@@ -35,13 +38,14 @@ use super::{
     SubscriptionAutoClosedReason,
 };
 use crate::client::ClientNotification;
-use crate::error::Error;
+use crate::error::{Error, ErrorKind};
+use crate::mutex::{NonPoisoningMutex, NonPoisoningMutexGuard};
 use crate::policy::AdmitStatus;
-use crate::relay::status::AtomicRelayStatus;
 use crate::shared::SharedState;
 use crate::transport::websocket::{WebSocketSink, WebSocketStream};
 
 type ClientMessageJson = String;
+type ConnectionResult = Result<(), Arc<Error>>;
 
 // Skip NIP-50 matches since they may create issues and ban non-malicious relays.
 const MATCH_EVENT_OPTS: MatchEventOptions = MatchEventOptions::new().nip50(false);
@@ -64,23 +68,132 @@ struct HandleAutoClosing {
 struct JsonMessageItem {
     json: ClientMessageJson,
     confirmation: Option<oneshot::Sender<()>>,
-    /// Subscription ID, if this is a `REQ`
-    req_id: Option<SubscriptionId>,
+    pending_req: Option<PendingReq>,
 }
 
-impl JsonMessageItem {
-    fn new(msg: &ClientMessage<'_>, confirmation: Option<oneshot::Sender<()>>) -> Self {
-        let req_id = match msg {
-            ClientMessage::Req {
-                subscription_id, ..
-            } => Some(subscription_id.clone().into_owned()),
-            _ => None,
-        };
+#[derive(Debug, Clone, Default)]
+struct PendingReqCounter(Arc<AtomicUsize>);
 
+impl PendingReqCounter {
+    #[inline]
+    fn track(&self, subscription_id: SubscriptionId) -> PendingReq {
+        self.0.fetch_add(1, Ordering::SeqCst);
+
+        PendingReq {
+            subscription_id,
+            counter: self.clone(),
+        }
+    }
+
+    #[inline]
+    fn decrement(&self) {
+        let _ = self
+            .0
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+                count.checked_sub(1)
+            });
+    }
+
+    #[inline]
+    fn has_pending(&self) -> bool {
+        self.0.load(Ordering::SeqCst) > 0
+    }
+
+    #[inline]
+    fn is_current(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// Keeps a queued REQ counted until it is dispatched or dropped.
+struct PendingReq {
+    subscription_id: SubscriptionId,
+    counter: PendingReqCounter,
+}
+
+impl Drop for PendingReq {
+    #[inline]
+    fn drop(&mut self) {
+        self.counter.decrement();
+    }
+}
+
+#[derive(Debug)]
+enum RequestConnectionKind {
+    /// Connection has been requested from a caller not interested in waiting for the outcome.
+    Background,
+    /// Connection has been requested from a caller interested in waiting for the outcome.
+    WaitForResult { deadline: Instant },
+}
+
+impl RequestConnectionKind {
+    #[inline]
+    fn is_background(&self) -> bool {
+        matches!(self, Self::Background)
+    }
+}
+
+#[derive(Debug)]
+struct ConnectionAttempt {
+    kind: RequestConnectionKind,
+    result: OnceLock<ConnectionResult>,
+    result_ready: Notify,
+}
+
+impl ConnectionAttempt {
+    #[inline]
+    fn new(kind: RequestConnectionKind) -> Self {
         Self {
-            json: msg.as_json(),
-            confirmation,
-            req_id,
+            kind,
+            result: OnceLock::new(),
+            result_ready: Notify::new(),
+        }
+    }
+
+    #[inline]
+    fn is_current(&self, current: &Option<Arc<Self>>) -> bool {
+        match current {
+            Some(current) => ptr::eq(self, current.as_ref()),
+            None => false,
+        }
+    }
+
+    fn finish(&self, result: Result<(), Error>) {
+        if self.result.get().is_some() {
+            return;
+        }
+
+        if self.result.set(result.map_err(Arc::new)).is_ok() {
+            self.result_ready.notify_waiters();
+        }
+    }
+
+    async fn wait_for_result(&self) -> ConnectionResult {
+        loop {
+            // Register before checking the result so completion cannot be missed.
+            let ready: Notified<'_> = self.result_ready.notified();
+
+            if let Some(result) = self.result.get() {
+                return result.clone();
+            }
+
+            ready.await;
+        }
+    }
+}
+
+// Status and attempt identity change together. Never retain this lock across an await.
+#[derive(Debug)]
+struct ConnectionState {
+    status: RelayStatus,
+    attempt: Option<Arc<ConnectionAttempt>>,
+}
+
+impl Default for ConnectionState {
+    fn default() -> Self {
+        Self {
+            status: RelayStatus::Initialized,
+            attempt: None,
         }
     }
 }
@@ -88,13 +201,8 @@ impl JsonMessageItem {
 #[derive(Debug)]
 struct RelayChannels {
     nostr: (Sender<JsonMessageItem>, Mutex<Receiver<JsonMessageItem>>),
-    /// Number of `REQ`s per subscription ID in the outbound queue.
-    ///
-    /// Queued frames survive a disconnect, so a reconnect must not queue
-    /// another `REQ` for an ID that still has one waiting.
-    queued_reqs: StdMutex<HashMap<SubscriptionId, usize>>,
+    connection_changed: Notify,
     ping: Notify,
-    terminate: Notify,
 }
 
 impl RelayChannels {
@@ -103,83 +211,32 @@ impl RelayChannels {
 
         Self {
             nostr: (tx_nostr, Mutex::new(rx_nostr)),
-            queued_reqs: StdMutex::new(HashMap::new()),
+            connection_changed: Notify::new(),
             ping: Notify::new(),
-            terminate: Notify::new(),
         }
-    }
-
-    fn send_client_msg(&self, msg: JsonMessageItem) -> Result<(), Error> {
-        let Some(id) = msg.req_id.clone() else {
-            return self.try_send(msg);
-        };
-
-        let mut queued_reqs = self.queued_reqs.lock().unwrap();
-        self.try_send(msg)?;
-        *queued_reqs.entry(id).or_default() += 1;
-        Ok(())
-    }
-
-    /// Queue a `REQ` unless one for the same subscription ID is still queued.
-    ///
-    /// Returns `false` if the `REQ` was skipped.
-    fn send_req_unless_queued(&self, msg: JsonMessageItem) -> Result<bool, Error> {
-        let Some(id) = msg.req_id.clone() else {
-            return Err(Error::invalid_msg("not a REQ message"));
-        };
-
-        let mut queued_reqs = self.queued_reqs.lock().unwrap();
-        if queued_reqs.contains_key(&id) {
-            return Ok(false);
-        }
-
-        self.try_send(msg)?;
-        queued_reqs.insert(id, 1);
-        Ok(true)
-    }
-
-    /// Queue every message in order, or none of them.
-    fn send_client_msgs(&self, msgs: Vec<JsonMessageItem>) -> Result<(), Error> {
-        let mut queued_reqs = self.queued_reqs.lock().unwrap();
-
-        // Reserve every slot first, so a full queue can't split the batch.
-        let permits = self
-            .nostr
-            .0
-            .try_reserve_many(msgs.len())
-            .map_err(|_| Error::state_msg("can't send message to the transport dispatcher"))?;
-
-        for (permit, msg) in permits.zip(msgs) {
-            if let Some(id) = &msg.req_id {
-                *queued_reqs.entry(id.clone()).or_default() += 1;
-            }
-            permit.send(msg);
-        }
-
-        Ok(())
     }
 
     #[inline]
-    fn try_send(&self, msg: JsonMessageItem) -> Result<(), Error> {
+    fn send_client_msg(&self, msg: JsonMessageItem) -> Result<(), Error> {
         self.nostr
             .0
             .try_send(msg)
             .map_err(|_| Error::state_msg("can't send message to the transport dispatcher"))
     }
 
-    /// Record that a frame left the outbound queue.
-    fn dequeued(&self, msg: &JsonMessageItem) {
-        let Some(id) = &msg.req_id else {
-            return;
-        };
+    /// Queue the messages in order, or none of them if the channel can't fit them all.
+    fn send_client_msg_batch(&self, msgs: Vec<JsonMessageItem>) -> Result<(), Error> {
+        let permits: PermitIterator<'_, JsonMessageItem> = self
+            .nostr
+            .0
+            .try_reserve_many(msgs.len())
+            .map_err(|_| Error::state_msg("can't send message to the transport dispatcher"))?;
 
-        let mut queued_reqs = self.queued_reqs.lock().unwrap();
-        if let Some(count) = queued_reqs.get_mut(id) {
-            *count -= 1;
-            if *count == 0 {
-                queued_reqs.remove(id);
-            }
+        for (permit, msg) in permits.zip(msgs) {
+            permit.send(msg);
         }
+
+        Ok(())
     }
 
     #[inline]
@@ -190,17 +247,6 @@ impl RelayChannels {
     #[cfg(not(target_arch = "wasm32"))]
     pub fn ping(&self) {
         self.ping.notify_one()
-    }
-
-    pub fn terminate(&self) {
-        self.terminate.notify_one()
-    }
-
-    fn clear_termination_permit(&self) {
-        let mut notified = std::pin::pin!(self.terminate.notified());
-        // `enable` consumes a stored permit, if any. The old task no longer
-        // waits for it when its replacement is reserved.
-        let _ = notified.as_mut().enable();
     }
 }
 
@@ -217,16 +263,11 @@ struct SubscriptionData {
     pub received_events: AtomicUsize,
     /// Subscription closed by relay
     pub closed: bool,
+    /// Counter used for long-lived subscriptions, for tracking the number of the pending ones
+    pending_req_counter: Option<PendingReqCounter>,
 }
 
 impl SubscriptionData {
-    /// A newly sent `REQ` gets its own `EOSE` and pre-`EOSE` limit count.
-    #[inline]
-    fn start_stored_events_phase(&mut self) {
-        self.received_eose = false;
-        self.received_events.store(0, Ordering::SeqCst);
-    }
-
     #[inline]
     fn long_lived(filters: Vec<Filter>, subscribed_connection: usize) -> Self {
         Self {
@@ -237,6 +278,7 @@ impl SubscriptionData {
             received_eose: false,
             received_events: AtomicUsize::new(0),
             closed: false,
+            pending_req_counter: Some(PendingReqCounter::default()),
         }
     }
 
@@ -250,6 +292,7 @@ impl SubscriptionData {
             received_eose: false,
             received_events: AtomicUsize::new(0),
             closed: false,
+            pending_req_counter: None,
         }
     }
 }
@@ -258,32 +301,15 @@ impl SubscriptionData {
 // put all fields that require an `Arc` here.
 #[derive(Debug)]
 pub(super) struct AtomicPrivateData {
-    status: AtomicRelayStatus,
+    connection_state: NonPoisoningMutex<ConnectionState>,
+    connection_task_handle: OnceLock<JoinHandle<()>>,
     channels: RelayChannels,
     subscriptions: RwLock<HashMap<SubscriptionId, SubscriptionData>>,
     /// Immutable across clones and reconnects; classifies late acquisition
     /// replies without retaining an unbounded set of closed request IDs.
     acquisition_namespace: String,
-    connection_task: StdMutex<ConnectionTaskOwnership>,
     #[cfg(test)]
-    teardown_hook: StdMutex<Option<Arc<TeardownHook>>>,
-    #[cfg(test)]
-    registration_gate: StdMutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
-}
-
-#[derive(Debug, Default)]
-struct ConnectionTaskOwnership {
-    running: bool,
-    restart_requested: bool,
-}
-
-#[cfg(test)]
-#[derive(Debug, Default)]
-struct TeardownHook {
-    started: Notify,
-    entered: Notify,
-    release: Notify,
-    finished: Notify,
+    registration_gate: NonPoisoningMutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
 }
 
 #[derive(Debug, Clone)]
@@ -311,15 +337,13 @@ impl InnerRelay {
         Self {
             url,
             atomic: Arc::new(AtomicPrivateData {
-                status: AtomicRelayStatus::default(),
+                connection_state: NonPoisoningMutex::new(ConnectionState::default()),
+                connection_task_handle: OnceLock::new(),
                 channels: RelayChannels::new(),
                 subscriptions: RwLock::new(HashMap::new()),
                 acquisition_namespace: format!("a{}", SubscriptionId::generate()),
-                connection_task: StdMutex::new(ConnectionTaskOwnership::default()),
                 #[cfg(test)]
-                teardown_hook: StdMutex::new(None),
-                #[cfg(test)]
-                registration_gate: StdMutex::new(None),
+                registration_gate: NonPoisoningMutex::new(None),
             }),
             capabilities: Arc::new(AtomicRelayCapabilities::new(capabilities)),
             opts,
@@ -342,45 +366,63 @@ impl InnerRelay {
         None
     }
 
-    /// Check if the connection task is running
-    #[inline]
     #[cfg(test)]
     pub(super) fn is_running(&self) -> bool {
-        self.atomic.connection_task.lock().unwrap().running
+        match self.atomic.connection_task_handle.get() {
+            Some(handle) => !handle.is_finished(),
+            None => false,
+        }
     }
 
     #[inline]
-    pub fn status(&self) -> RelayStatus {
-        self.atomic.status.load()
+    fn connection_state(&self) -> NonPoisoningMutexGuard<'_, ConnectionState> {
+        self.atomic.connection_state.lock()
     }
 
-    pub(super) fn set_status(&self, status: RelayStatus, log: bool) {
-        // Change status
-        self.atomic.status.set(status);
+    #[inline]
+    pub(super) fn status(&self) -> RelayStatus {
+        let state = self.connection_state();
+        state.status
+    }
 
-        // Log
-        if log {
-            match status {
-                RelayStatus::Initialized => tracing::trace!(url = %self.url, "Relay initialized."),
-                RelayStatus::Pending => tracing::trace!(url = %self.url, "Relay is pending."),
-                RelayStatus::Connecting => tracing::debug!("Connecting to '{}'", self.url),
-                RelayStatus::Connected => tracing::info!("Connected to '{}'", self.url),
-                RelayStatus::Disconnected => tracing::info!("Disconnected from '{}'", self.url),
-                RelayStatus::Terminated => {
-                    tracing::info!("Completely disconnected from '{}'", self.url)
-                }
-                RelayStatus::Banned => tracing::info!(url = %self.url, "Relay banned."),
-                RelayStatus::Sleeping => tracing::info!("Relay '{}' went to sleep.", self.url),
-                RelayStatus::Shutdown => tracing::info!("Relay '{}' has been shutdown.", self.url),
-            }
+    fn set_status(&self, state: &mut ConnectionState, status: RelayStatus) {
+        if state.status == status {
+            return;
         }
 
-        // Send notification
+        state.status = status;
+
+        match status {
+            RelayStatus::Initialized => tracing::trace!(url = %self.url, "Relay initialized."),
+            RelayStatus::Connecting => tracing::debug!("Connecting to '{}'", self.url),
+            RelayStatus::Connected => tracing::info!("Connected to '{}'", self.url),
+            RelayStatus::Disconnected => tracing::info!("Disconnected from '{}'", self.url),
+            RelayStatus::Idle => tracing::info!(url = %self.url, "Relay idle."),
+            RelayStatus::Banned => tracing::info!(url = %self.url, "Relay banned."),
+            RelayStatus::Sleeping => tracing::info!("Relay '{}' went to sleep.", self.url),
+            RelayStatus::Shutdown => tracing::info!("Relay '{}' has been shutdown.", self.url),
+        }
+
+        // Publish under the same lock so notifications follow the order of transitions.
         self.send_notification(RelayNotification::RelayStatus { status }, false);
 
         // If monitor is enabled, notify status change.
         if let Some(monitor) = &self.state.monitor {
             monitor.notify_status_change(self.url.clone(), status);
+        }
+    }
+
+    /// Returns the WebSocket session that will write a message queued now.
+    fn delivery_connection(&self) -> usize {
+        // A successful connection updates the counter and the status under this lock.
+        let state: NonPoisoningMutexGuard<'_, ConnectionState> = self.connection_state();
+        let current_connection: usize = self.stats.success();
+
+        // Messages queued while disconnected wait in the outbound channel for the next session.
+        if state.status.is_connected() {
+            current_connection
+        } else {
+            current_connection + 1
         }
     }
 
@@ -451,31 +493,6 @@ impl InnerRelay {
         self.atomic.subscriptions.read().await.len()
     }
 
-    #[cfg(test)]
-    pub(crate) async fn auto_closing_subscription_id(&self) -> Option<SubscriptionId> {
-        self.atomic
-            .subscriptions
-            .read()
-            .await
-            .iter()
-            .find_map(|(id, data)| data.is_auto_closing.then(|| id.clone()))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn inject_notification(&self, notification: RelayNotification) {
-        let _ = self.internal_notification_sender.send(notification);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn gate_auto_closing_registration(
-        &self,
-    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
-        let (entered_tx, entered_rx) = oneshot::channel();
-        let (release_tx, release_rx) = oneshot::channel();
-        *self.atomic.registration_gate.lock().unwrap() = Some((entered_tx, release_rx));
-        (entered_rx, release_tx)
-    }
-
     /// Returns all long-lived (non-auto-closing) subscriptions
     pub async fn subscriptions(&self) -> HashMap<SubscriptionId, Vec<Filter>> {
         let subscription = self.atomic.subscriptions.read().await;
@@ -488,6 +505,14 @@ impl InnerRelay {
     pub async fn subscription(&self, id: &SubscriptionId) -> Option<Vec<Filter>> {
         let subscription = self.atomic.subscriptions.read().await;
         subscription.get(id).map(|d| d.filters.clone())
+    }
+
+    /// Whether EOSE was received for the subscription's current REQ.
+    ///
+    /// Returns `None` if the subscription isn't registered.
+    pub(super) async fn subscription_received_eose(&self, id: &SubscriptionId) -> Option<bool> {
+        let subscriptions = self.atomic.subscriptions.read().await;
+        subscriptions.get(id).map(|data| data.received_eose)
     }
 
     pub(super) async fn remove_subscription(&self, id: &SubscriptionId) {
@@ -509,30 +534,10 @@ impl InnerRelay {
 
         subscriptions.insert(
             id,
-            SubscriptionData::long_lived(filters, self.stats.success()),
+            SubscriptionData::long_lived(filters, self.delivery_connection()),
         );
 
         Ok(())
-    }
-
-    /// Register an auto-closing subscription
-    pub(crate) async fn add_auto_closing_subscription(
-        &self,
-        id: SubscriptionId,
-        filters: Vec<Filter>,
-    ) -> Result<(), Error> {
-        self.register_auto_closing_subscription(id, filters, false)
-            .await
-    }
-
-    /// Register a request-local acquisition before its REQ can receive data.
-    pub(crate) async fn add_acquisition_subscription(
-        &self,
-        id: SubscriptionId,
-        filters: Vec<Filter>,
-    ) -> Result<(), Error> {
-        self.register_auto_closing_subscription(id, filters, true)
-            .await
     }
 
     pub(crate) fn acquisition_subscription_id(&self) -> SubscriptionId {
@@ -545,6 +550,46 @@ impl InnerRelay {
         ))
     }
 
+    #[cfg(test)]
+    pub(crate) async fn auto_closing_subscription_id(&self) -> Option<SubscriptionId> {
+        self.atomic
+            .subscriptions
+            .read()
+            .await
+            .iter()
+            .find_map(|(id, data)| data.is_auto_closing.then(|| id.clone()))
+    }
+
+    /// Register a request-local acquisition before its REQ can receive data.
+    pub(crate) async fn add_acquisition_subscription(
+        &self,
+        id: SubscriptionId,
+        filters: Vec<Filter>,
+    ) -> Result<(), Error> {
+        self.register_auto_closing_subscription(id, filters, true)
+            .await
+    }
+
+    /// Register an auto-closing subscription
+    pub(crate) async fn add_auto_closing_subscription(
+        &self,
+        id: SubscriptionId,
+        filters: Vec<Filter>,
+    ) -> Result<(), Error> {
+        self.register_auto_closing_subscription(id, filters, false)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn gate_auto_closing_registration(
+        &self,
+    ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        *self.atomic.registration_gate.lock() = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
     async fn register_auto_closing_subscription(
         &self,
         id: SubscriptionId,
@@ -552,7 +597,7 @@ impl InnerRelay {
         is_acquisition: bool,
     ) -> Result<(), Error> {
         #[cfg(test)]
-        let gate = self.atomic.registration_gate.lock().unwrap().take();
+        let gate = self.atomic.registration_gate.lock().take();
         #[cfg(test)]
         if let Some((entered, release)) = gate {
             let _ = entered.send(());
@@ -584,7 +629,10 @@ impl InnerRelay {
         if mark_subscribed {
             data.subscribed_connection = self.stats.success();
             data.closed = false;
-            data.start_stored_events_phase();
+
+            // The relay answers the new REQ with a new stored-events query.
+            data.received_eose = false;
+            *data.received_events.get_mut() = 0;
         }
 
         Ok(())
@@ -621,14 +669,6 @@ impl InnerRelay {
         }
     }
 
-    /// Whether EOSE was received for the subscription's current REQ.
-    ///
-    /// Returns `None` if the subscription isn't registered.
-    pub async fn subscription_received_eose(&self, id: &SubscriptionId) -> Option<bool> {
-        let subscriptions = self.atomic.subscriptions.read().await;
-        subscriptions.get(id).map(|data| data.received_eose)
-    }
-
     /// Check if it should subscribe for current websocket session
     pub(crate) async fn should_resubscribe(&self, id: &SubscriptionId) -> bool {
         let subscriptions = self.atomic.subscriptions.read().await;
@@ -637,18 +677,23 @@ impl InnerRelay {
                 subscribed_connection,
                 closed,
                 is_auto_closing: false,
+                pending_req_counter,
                 ..
             }) => {
-                // Never subscribed -> SHOULD subscribe
-                // Subscription closed by relay -> SHOULD subscribe
+                if let Some(counter) = pending_req_counter {
+                    if counter.has_pending() {
+                        return false;
+                    }
+                }
+
                 if *closed {
                     return true;
                 }
 
-                // A request queued before the first connection is already in the
-                // outbound channel. Later connections must restore it once.
-                let current_connection = self.stats.success();
-                current_connection > 1 && current_connection > *subscribed_connection
+                // Restore subscriptions dispatched on an earlier WebSocket session,
+                // even when reconnecting within one second.
+                let current_connection: usize = self.stats.success();
+                current_connection > *subscribed_connection
             }
             // NOT subscribe if auto-closing subscription or subscription not found
             Some(SubscriptionData {
@@ -659,12 +704,47 @@ impl InnerRelay {
         }
     }
 
+    async fn subscription_req_started(&self, request: &PendingReq) {
+        let mut subscriptions = self.atomic.subscriptions.write().await;
+
+        let Some(data) = subscriptions.get_mut(&request.subscription_id) else {
+            return;
+        };
+
+        let Some(counter) = &data.pending_req_counter else {
+            return;
+        };
+
+        if !counter.is_current(&request.counter) {
+            return;
+        }
+
+        // Every REQ starts a new stored-events query, also when sent again on the same
+        // connection. Frames the relay sent for the previous REQ before handling the
+        // CLOSE may still arrive after this reset:
+        // - its EOSE sets the flag early, which is acceptable because the filters are
+        //   the same, so that EOSE covers the same stored events;
+        // - its events count toward the limit of the new REQ.
+        data.received_eose = false;
+        *data.received_events.get_mut() = 0;
+
+        // Record the session that sends the REQ, since a queued REQ may have survived
+        // an earlier session without being dispatched.
+        data.subscribed_connection = self.stats.success();
+        data.closed = false;
+    }
+
     #[inline]
     pub(crate) fn set_notification_sender(
         &mut self,
         notification_sender: broadcast::Sender<ClientNotification>,
     ) {
         self.external_notification_sender = Some(notification_sender);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_notification(&self, notification: RelayNotification) {
+        let _ = self.internal_notification_sender.send(notification);
     }
 
     fn send_notification(&self, notification: RelayNotification, external: bool) {
@@ -704,7 +784,8 @@ impl InnerRelay {
         }
     }
 
-    pub(super) async fn check_connection_policy(&self) -> Result<AdmitStatus, Error> {
+    #[inline]
+    async fn check_connection_policy(&self) -> Result<AdmitStatus, Error> {
         match &self.state.admit_policy {
             Some(policy) => Ok(policy.admit_connection(&self.url).await?),
             None => Ok(AdmitStatus::Success),
@@ -766,205 +847,116 @@ impl InnerRelay {
 
         self.request_connect();
 
-        // Update the wake-up timestamp
         self.stats.just_woke_up();
     }
 
-    pub(super) fn reserve_try_connect(&self) -> Result<bool, Error> {
-        let mut ownership = self.atomic.connection_task.lock().unwrap();
-        let status = self.status();
-        if status.is_shutdown() {
-            return Err(Error::shutdown());
-        }
-        if status.is_banned() {
-            return Err(Error::banned());
-        }
-        if !status.can_connect() {
-            return Ok(false);
-        }
-        if ownership.running {
-            ownership.restart_requested = true;
-            self.set_status(RelayStatus::Pending, false);
-            return Err(Error::state_msg(
-                "previous connection task is stopping; reconnect queued",
-            ));
-        }
-        self.atomic.channels.clear_termination_permit();
-        ownership.running = true;
-        self.set_status(RelayStatus::Pending, false);
-        Ok(true)
-    }
-
-    pub(super) fn spawn_reserved_connection_task(&self, stream: (WebSocketSink, WebSocketStream)) {
-        task::spawn(self.clone().connection_task(Some(stream)));
-    }
-
-    pub(super) fn finish_reserved_connection_task(&self) {
-        if self.status() == RelayStatus::Connecting {
-            self.set_status(RelayStatus::Terminated, false);
-        }
-        self.finish_connection_task();
-    }
-
+    #[inline]
     pub(super) fn request_connect(&self) {
-        let mut ownership = self.atomic.connection_task.lock().unwrap();
-        if !self.status().can_connect() {
-            return;
+        if let Err(error) = self.request_connection(RequestConnectionKind::Background) {
+            tracing::debug!(url = %self.url, %error, "Connection request ignored.");
         }
-
-        self.set_status(RelayStatus::Pending, false);
-        if ownership.running {
-            ownership.restart_requested = true;
-            return;
-        }
-
-        self.atomic.channels.clear_termination_permit();
-        ownership.running = true;
-        drop(ownership);
-        task::spawn(self.clone().connection_task(None));
     }
 
-    /// This **MUST** be called only after connection-task ownership is reserved.
-    async fn connection_task(self, mut stream: Option<(WebSocketSink, WebSocketStream)>) {
-        let status = self.status();
-        if status.is_terminated() || status.is_banned() || status.is_shutdown() {
-            self.finish_connection_task();
-            return;
+    pub(super) async fn try_connect(&self, timeout: Duration) -> Result<(), Error> {
+        let kind = RequestConnectionKind::WaitForResult {
+            deadline: Instant::now() + timeout,
+        };
+
+        let Some(attempt) = self.request_connection(kind)? else {
+            return Ok(());
+        };
+
+        match time::timeout(Some(timeout), attempt.wait_for_result()).await {
+            Some(result) => result.map_err(|error| Error::new(error.kind(), error)),
+            None => Err(Error::timeout()),
+        }
+    }
+
+    fn request_connection(
+        &self,
+        kind: RequestConnectionKind,
+    ) -> Result<Option<Arc<ConnectionAttempt>>, Error> {
+        let attempt: Arc<ConnectionAttempt> = {
+            let mut state: NonPoisoningMutexGuard<'_, ConnectionState> = self.connection_state();
+
+            if state.status.is_banned() {
+                return Err(Error::banned());
+            }
+
+            if state.status.is_shutdown() {
+                return Err(Error::shutdown());
+            }
+
+            if state.status.is_connected() {
+                return Ok(None);
+            }
+
+            match &state.attempt {
+                // We already have an attempt in progress
+                Some(attempt) => Arc::clone(attempt),
+                // No attempt in progress, create a new one
+                None => {
+                    let attempt: Arc<ConnectionAttempt> = Arc::new(ConnectionAttempt::new(kind));
+
+                    state.attempt = Some(Arc::clone(&attempt));
+
+                    self.set_status(&mut state, RelayStatus::Connecting);
+
+                    self.atomic.channels.connection_changed.notify_one();
+
+                    attempt
+                }
+            }
+        };
+
+        let handle: &JoinHandle<()> = self.atomic.connection_task_handle.get_or_init(|| {
+            let relay: InnerRelay = self.clone();
+            task::spawn(relay.connection_task())
+        });
+
+        // Ban or shutdown may run before get_or_init publishes the task handle.
+        let status: RelayStatus = self.status();
+        if status.is_terminal() {
+            handle.abort();
         }
 
-        // Lock receiver
-        let mut rx_nostr = self.atomic.channels.rx_nostr().await;
+        Ok(Some(attempt))
+    }
 
-        #[cfg(test)]
-        if let Some(hook) = self.atomic.teardown_hook.lock().unwrap().as_ref() {
-            hook.started.notify_one();
-        }
-
-        // Last websocket error
-        // Store it to avoid printing every time the same connection error
-        let mut last_ws_error = None;
-
-        // Auto-connect loop
+    async fn next_connection(&self) -> Option<(Arc<ConnectionAttempt>, RelayStatus)> {
         loop {
-            // Check if the connection is allowed
-            match self.check_connection_policy().await {
-                Ok(status) => {
-                    // Connection rejected, update status and break the loop.
-                    if let AdmitStatus::Rejected { reason } = status {
-                        if let Some(reason) = reason {
-                            tracing::warn!(reason = %reason, "Connection rejected by admission policy.");
-                        }
+            // Only the connection task waits here; the request itself remains in the state.
+            let changed: Notified<'_> = self.atomic.channels.connection_changed.notified();
 
-                        // Set the status to "terminated" and break loop.
-                        self.set_status(RelayStatus::Terminated, false);
-                        break;
-                    }
-                }
-                Err(e) => tracing::error!(error = %e, "Impossible to check connection policy."),
-            }
-
-            // Connect and run message handler
-            // The termination requests are handled inside this method!
-            self.connect_and_run(stream.take(), &mut rx_nostr, &mut last_ws_error)
-                .await;
-
-            // Get status
-            let status: RelayStatus = self.status();
-
-            // A connect requested during teardown belongs to a replacement
-            // task. Do not turn it into an ordinary delayed retry here.
-            if self
-                .atomic
-                .connection_task
-                .lock()
-                .unwrap()
-                .restart_requested
             {
-                break;
-            }
+                let state: NonPoisoningMutexGuard<'_, ConnectionState> = self.connection_state();
 
-            // If the relay is terminated, banned or sleeping, break the loop.
-            if status.is_terminated()
-                || status.is_banned()
-                || status.is_sleeping()
-                || status.is_shutdown()
-            {
-                break;
-            }
-
-            // Check if reconnection is enabled
-            if self.opts.reconnect {
-                // Check if the relay is marked as disconnected. If not, update status.
-                // Check if disconnected to avoid a possible double log
-                if !status.is_disconnected() {
-                    self.set_status(RelayStatus::Disconnected, true);
+                if state.status.is_terminal() {
+                    return None;
                 }
 
-                // Sleep before retry to connect
-                let interval: Duration = self.calculate_retry_interval();
-                tracing::debug!(
-                    "Reconnecting to '{}' relay in {} secs",
-                    self.url,
-                    interval.as_secs()
-                );
-
-                // Sleep before retry to connect
-                // Handle termination to allow exiting immediately if request is received during the sleep.
-                tokio::select! {
-                    // Sleep
-                    _ = time::sleep(interval) => {},
-                    // Handle termination notification
-                    _ = self.handle_terminate() => break,
+                if let Some(attempt) = &state.attempt {
+                    return Some((Arc::clone(attempt), state.status));
                 }
-            } else {
-                // Reconnection disabled, set status to "terminated"
-                self.set_status(RelayStatus::Terminated, true);
-
-                // Break loop and exit
-                tracing::debug!(url = %self.url, "Reconnection disabled, breaking loop.");
-                break;
             }
+
+            changed.await;
         }
-
-        drop(rx_nostr);
-
-        #[cfg(test)]
-        let hook = self.atomic.teardown_hook.lock().unwrap().take();
-        #[cfg(test)]
-        if let Some(hook) = hook.as_ref() {
-            hook.entered.notify_one();
-            hook.release.notified().await;
-        }
-
-        self.finish_connection_task();
-
-        #[cfg(test)]
-        if let Some(hook) = hook {
-            hook.finished.notify_one();
-        }
-
-        tracing::debug!(url = %self.url, "Auto connect loop terminated.");
     }
 
-    fn finish_connection_task(&self) {
-        let mut ownership = self.atomic.connection_task.lock().unwrap();
-        let status = self.status();
-        let restart = ownership.restart_requested
-            && !status.is_banned()
-            && !status.is_shutdown()
-            && !status.is_sleeping();
+    async fn connection_changed(&self, attempt: &ConnectionAttempt) {
+        loop {
+            let changed: Notified<'_> = self.atomic.channels.connection_changed.notified();
 
-        ownership.restart_requested = false;
-        if restart {
-            if status.is_terminated() {
-                self.set_status(RelayStatus::Pending, false);
+            {
+                let state = self.connection_state();
+                if !attempt.is_current(&state.attempt) {
+                    return;
+                }
             }
-            self.atomic.channels.clear_termination_permit();
-            // Keep ownership reserved until the replacement task starts.
-            drop(ownership);
-            task::spawn(self.clone().connection_task(None));
-        } else {
-            ownership.running = false;
+
+            // Notifications only wake the task. Recheck identity after stale or coalesced wakes.
+            changed.await;
         }
     }
 
@@ -1007,124 +999,186 @@ impl InnerRelay {
         self.opts.retry_interval
     }
 
-    #[inline]
-    async fn handle_terminate(&self) {
-        // Wait to be notified
-        self.atomic.channels.terminate.notified().await;
+    async fn connection_task(self) {
+        let mut rx_nostr: MutexGuard<'_, Receiver<JsonMessageItem>> =
+            self.atomic.channels.rx_nostr().await;
+        let mut last_ws_error: Option<String> = None;
+
+        while let Some((attempt, status)) = self.next_connection().await {
+            if status.is_disconnected() {
+                let interval: Duration = self.calculate_retry_interval();
+
+                tracing::debug!(url = %self.url, ?interval, "Waiting before reconnect.");
+
+                tokio::select! {
+                    biased;
+                    _ = self.connection_changed(&attempt) => continue,
+                    _ = time::sleep(interval) => {},
+                }
+            }
+
+            self.connect_and_run(&attempt, &mut rx_nostr, &mut last_ws_error)
+                .await;
+        }
     }
 
-    pub(super) async fn _try_connect(
-        &self,
-        timeout: Duration,
-        status_on_failure: RelayStatus,
-    ) -> Result<(WebSocketSink, WebSocketStream), Error> {
-        {
-            let ownership = self.atomic.connection_task.lock().unwrap();
-            let status = self.status();
-            if ownership.restart_requested
-                || status.is_terminated()
-                || status.is_banned()
-                || status.is_shutdown()
-            {
-                return Err(Error::state_msg("connection attempt superseded"));
-            }
-            self.set_status(RelayStatus::Connecting, true);
+    fn begin_connection(&self, attempt: &ConnectionAttempt) -> bool {
+        let mut state: NonPoisoningMutexGuard<'_, ConnectionState> = self.connection_state();
+
+        if !attempt.is_current(&state.attempt) {
+            return false;
         }
 
-        // Increase the attempts
+        self.set_status(&mut state, RelayStatus::Connecting);
+
+        true
+    }
+
+    fn begin_dial(&self, attempt: &ConnectionAttempt) -> bool {
+        let state: NonPoisoningMutexGuard<'_, ConnectionState> = self.connection_state();
+
+        if !attempt.is_current(&state.attempt) {
+            return false;
+        }
+
         self.stats.new_attempt();
 
-        // Connect futures
-        let connect_fut = self
-            .state
-            .transport
-            .connect((&self.url).into(), self.proxy());
-        let fut = time::timeout(Some(timeout), connect_fut);
-
-        // Try to connect
-        // If during connection the termination request is received, abort the connection and return error.
-        // At this stem is NOT required to close the WebSocket connection.
-        tokio::select! {
-            // Connect
-            res = fut => match res {
-                Some(Ok((ws_tx, ws_rx))) => {
-                    // A disconnect or replacement request may have superseded
-                    // this dial while the transport was connecting.
-                    let _ownership = self.atomic.connection_task.lock().unwrap();
-                    if self.status() != RelayStatus::Connecting {
-                        return Err(Error::state_msg("connection attempt superseded"));
-                    }
-                    self.set_status(RelayStatus::Connected, true);
-
-                    // Increment success stats
-                    self.stats.new_success();
-
-                    Ok((ws_tx, ws_rx))
-                }
-                Some(Err(e)) => {
-                    let _ownership = self.atomic.connection_task.lock().unwrap();
-                    if self.status() == RelayStatus::Connecting {
-                        self.set_status(status_on_failure, false);
-                    }
-
-                    // Return error
-                    Err(Error::transport(e))
-                }
-                None => {
-                    let _ownership = self.atomic.connection_task.lock().unwrap();
-                    if self.status() == RelayStatus::Connecting {
-                        self.set_status(status_on_failure, false);
-                    }
-
-                    // Return error
-                    Err(Error::timeout())
-                }
-            },
-            // Handle termination notification
-            _ = self.handle_terminate() => Err(Error::rejected_msg("received termination request")),
-        }
+        true
     }
 
-    /// Connect and run message handler
-    ///
-    /// If `stream` arg is passed, no connection attempt will be done.
+    async fn dial_connection(
+        &self,
+        attempt: &ConnectionAttempt,
+    ) -> Result<(WebSocketSink, WebSocketStream), Error> {
+        let timeout: Duration = match attempt.kind {
+            RequestConnectionKind::Background => self.opts.connect_timeout,
+            RequestConnectionKind::WaitForResult { deadline } => deadline - Instant::now(),
+        };
+
+        if timeout.is_zero() {
+            return Err(Error::timeout());
+        }
+
+        time::timeout(Some(timeout), async {
+            if let AdmitStatus::Rejected { reason } = self.check_connection_policy().await? {
+                return Err(Error::connection_rejected(reason));
+            }
+
+            if !self.begin_dial(attempt) {
+                return Err(Error::state_msg("connection attempt superseded"));
+            }
+
+            self.state
+                .transport
+                .connect((&self.url).into(), self.proxy())
+                .await
+                .map_err(Error::transport)
+        })
+        .await
+        .unwrap_or_else(|| Err(Error::timeout()))
+    }
+
+    fn accept_connection(&self, attempt: &ConnectionAttempt) -> bool {
+        let mut state: NonPoisoningMutexGuard<'_, ConnectionState> = self.connection_state();
+
+        // A superseded dial must not publish Connected or count as a successful connection.
+        if !attempt.is_current(&state.attempt) {
+            return false;
+        }
+
+        self.stats.new_success();
+
+        self.set_status(&mut state, RelayStatus::Connected);
+
+        attempt.finish(Ok(()));
+
+        true
+    }
+
+    fn connection_failed(
+        &self,
+        attempt: &ConnectionAttempt,
+        error: Error,
+        last_ws_error: &mut Option<String>,
+    ) {
+        let mut state: NonPoisoningMutexGuard<'_, ConnectionState> = self.connection_state();
+
+        if !attempt.is_current(&state.attempt) {
+            return;
+        }
+
+        let message: String = error.to_string();
+        if last_ws_error.as_ref() != Some(&message) {
+            tracing::error!(url = %self.url, %error, "Connection failed.");
+            *last_ws_error = Some(message);
+        }
+
+        let stop: bool = !attempt.kind.is_background()
+            || error.kind() == ErrorKind::Rejected
+            || !self.opts.reconnect;
+
+        attempt.finish(Err(error));
+
+        if stop {
+            state.attempt = None;
+            self.set_status(&mut state, RelayStatus::Idle);
+            return;
+        }
+
+        state.attempt = Some(Arc::new(ConnectionAttempt::new(
+            RequestConnectionKind::Background,
+        )));
+
+        self.set_status(&mut state, RelayStatus::Disconnected);
+    }
+
+    fn schedule_reconnect(&self, attempt: &ConnectionAttempt) {
+        let mut state: NonPoisoningMutexGuard<'_, ConnectionState> = self.connection_state();
+
+        // A new request may already be waiting while the previous WebSocket closes.
+        if !attempt.is_current(&state.attempt) {
+            return;
+        }
+
+        if !self.opts.reconnect {
+            state.attempt = None;
+            self.set_status(&mut state, RelayStatus::Idle);
+            return;
+        }
+
+        state.attempt = Some(Arc::new(ConnectionAttempt::new(
+            RequestConnectionKind::Background,
+        )));
+
+        self.set_status(&mut state, RelayStatus::Disconnected);
+    }
+
     async fn connect_and_run(
         &self,
-        stream: Option<(WebSocketSink, WebSocketStream)>,
+        attempt: &ConnectionAttempt,
         rx_nostr: &mut MutexGuard<'_, Receiver<JsonMessageItem>>,
         last_ws_error: &mut Option<String>,
     ) {
-        match stream {
-            // Already have a stream, go to post-connection stage
-            Some((ws_tx, ws_rx)) => self.post_connection(ws_tx, ws_rx, rx_nostr).await,
-            // No stream is passed, try to connect
-            // Set the status to "disconnected" to allow to automatic retries
-            None => match self
-                ._try_connect(self.opts.connect_timeout, RelayStatus::Disconnected)
-                .await
-            {
-                // Connection success, go to post-connection stage
-                Ok((ws_tx, ws_rx)) => self.post_connection(ws_tx, ws_rx, rx_nostr).await,
-                // Error during connection
-                Err(e) => {
-                    // TODO: avoid string allocation. The error is converted to string only to perform the `!=` binary operation.
-                    // Check if error should be logged
-                    let e: String = e.to_string();
-                    let to_log: bool = match &last_ws_error {
-                        Some(prev_err) => {
-                            // Log only if different from the last one
-                            prev_err != &e
-                        }
-                        None => true,
-                    };
+        if !self.begin_connection(attempt) {
+            return;
+        }
 
-                    // Log error and update the last error
-                    if to_log {
-                        tracing::error!(url = %self.url, error= %e, "Connection failed.");
-                        *last_ws_error = Some(e);
-                    }
+        let connection: Result<(WebSocketSink, WebSocketStream), Error> = tokio::select! {
+            biased;
+            _ = self.connection_changed(attempt) => return,
+            result = self.dial_connection(attempt) => result,
+        };
+
+        match connection {
+            Ok((ws_tx, ws_rx)) => {
+                if !self.accept_connection(attempt) {
+                    return;
                 }
-            },
+
+                self.post_connection(ws_tx, ws_rx, rx_nostr, attempt).await;
+                self.schedule_reconnect(attempt);
+            }
+            Err(error) => self.connection_failed(attempt, error, last_ws_error),
         }
     }
 
@@ -1135,12 +1189,23 @@ impl InnerRelay {
         mut ws_tx: WebSocketSink,
         ws_rx: WebSocketStream,
         rx_nostr: &mut MutexGuard<'_, Receiver<JsonMessageItem>>,
+        attempt: &ConnectionAttempt,
     ) {
-        // (Re)subscribe to relay
-        if self.capabilities.can_read() {
-            if let Err(e) = self.resubscribe().await {
-                tracing::error!(url = %self.url, error = %e, "Impossible to subscribe.")
+        let resubscribe = async {
+            if self.capabilities.can_read() {
+                if let Err(error) = self.resubscribe().await {
+                    tracing::error!(url = %self.url, %error, "Impossible to subscribe.");
+                }
             }
+        };
+
+        tokio::select! {
+            biased;
+            _ = self.connection_changed(attempt) => {
+                let _ = close_ws(&mut ws_tx).await;
+                return;
+            },
+            _ = resubscribe => {},
         }
 
         let ping: PingTracker = PingTracker::default();
@@ -1152,7 +1217,7 @@ impl InnerRelay {
         // Add also termination here, to allow closing the connection in case of termination request.
         tokio::select! {
             // Message sender handler
-            res = self.sender_message_handler(&mut ws_tx, rx_nostr, &ping) => match res {
+            res = self.sender_message_handler(&mut ws_tx, rx_nostr, &ping, attempt) => match res {
                 Ok(()) => tracing::trace!(url = %self.url, "Relay sender exited."),
                 Err(e) => tracing::error!(url = %self.url, error = %e, "Relay sender exited with error.")
             },
@@ -1167,9 +1232,9 @@ impl InnerRelay {
                 Err(e) => tracing::error!(url = %self.url, error = %e, "Relay ingester exited with error.")
             },
             // Monitor when the relay can go to sleep
-            _ = self.sleep_when_idle_monitor() => {},
+            _ = self.sleep_when_idle_monitor(attempt) => {},
             // Termination handler
-            _ = self.handle_terminate() => {},
+            _ = self.connection_changed(attempt) => {},
             // Pinger
             _ = self.pinger() => {}
         }
@@ -1181,11 +1246,31 @@ impl InnerRelay {
         }
     }
 
+    async fn recv_client_msg(
+        &self,
+        rx_nostr: &mut Receiver<JsonMessageItem>,
+        attempt: &ConnectionAttempt,
+    ) -> Option<JsonMessageItem> {
+        future::poll_fn(|cx| {
+            let state: NonPoisoningMutexGuard<'_, ConnectionState> = self.connection_state();
+
+            // Serialize the dequeue with invalidation so an old sender cannot
+            // consume frames assigned to the next session, even on another thread.
+            if !state.status.is_connected() || !attempt.is_current(&state.attempt) {
+                return Poll::Ready(None);
+            }
+
+            rx_nostr.poll_recv(cx)
+        })
+        .await
+    }
+
     async fn sender_message_handler(
         &self,
         ws_tx: &mut WebSocketSink,
         rx_nostr: &mut MutexGuard<'_, Receiver<JsonMessageItem>>,
         ping: &PingTracker,
+        attempt: &ConnectionAttempt,
     ) -> Result<(), Error> {
         #[cfg(target_arch = "wasm32")]
         let _ping = ping;
@@ -1193,9 +1278,14 @@ impl InnerRelay {
         loop {
             tokio::select! {
                 // Nostr channel receiver
-                Some(item) = rx_nostr.recv() => {
-                    self.atomic.channels.dequeued(&item);
-                    let JsonMessageItem { json, confirmation, .. } = item;
+                item = self.recv_client_msg(rx_nostr, attempt) => {
+                    let Some(JsonMessageItem { json, confirmation, pending_req }) = item else {
+                        break;
+                    };
+
+                    if let Some(pending_req) = pending_req {
+                        self.subscription_req_started(&pending_req).await;
+                    }
 
                     // Get messages size
                     let size: usize = json.len();
@@ -1349,15 +1439,20 @@ impl InnerRelay {
     }
 
     /// Monitor if it's time to put the relay in sleep mode.
-    async fn sleep_when_idle_monitor(&self) {
+    async fn sleep_when_idle_monitor(&self, attempt: &ConnectionAttempt) {
         loop {
             // Sleep
             time::sleep(SLEEP_INTERVAL).await;
 
             // Check if should go to sleep
             if self.should_sleep().await {
-                // Update status
-                self.set_status(RelayStatus::Sleeping, true);
+                let mut state: NonPoisoningMutexGuard<'_, ConnectionState> =
+                    self.connection_state();
+
+                if attempt.is_current(&state.attempt) {
+                    state.attempt = None;
+                    self.set_status(&mut state, RelayStatus::Sleeping);
+                }
 
                 // Break the loop
                 break;
@@ -1688,55 +1783,76 @@ impl InnerRelay {
         }))
     }
 
-    pub fn disconnect(&self) {
-        let mut ownership = self.atomic.connection_task.lock().unwrap();
-        let status = self.status();
-
-        // Check if it's already terminated, banned or shutdown
-        if status.is_terminated() || status.is_banned() || status.is_shutdown() {
-            return;
-        }
-
-        // Notify termination
-        self.atomic.channels.terminate();
-
-        // Update status
-        self.set_status(RelayStatus::Terminated, true);
-        ownership.restart_requested = false;
+    #[inline]
+    pub(super) fn disconnect(&self) {
+        self.stop_connection(RelayStatus::Idle);
     }
 
-    pub fn ban(&self) {
-        let mut ownership = self.atomic.connection_task.lock().unwrap();
-        let status = self.status();
-
-        // Check if it's already terminated, banned or shutdown
-        if status.is_terminated() || status.is_banned() || status.is_shutdown() {
-            return;
-        }
-
-        // Notify termination
-        self.atomic.channels.terminate();
-
-        // Update status
-        self.set_status(RelayStatus::Banned, true);
-        ownership.restart_requested = false;
+    #[inline]
+    pub(super) fn ban(&self) {
+        self.stop_connection(RelayStatus::Banned);
     }
 
+    #[inline]
     pub(super) fn shutdown(&self) {
-        let mut ownership = self.atomic.connection_task.lock().unwrap();
-        let status = self.status();
+        self.stop_connection(RelayStatus::Shutdown);
+    }
 
-        // Check if it's already terminated, banned or shutdown
-        if status.is_terminated() || status.is_banned() || status.is_shutdown() {
-            return;
+    fn stop_connection(&self, status: RelayStatus) {
+        {
+            let mut state: NonPoisoningMutexGuard<'_, ConnectionState> = self.connection_state();
+
+            let previous: RelayStatus = state.status;
+
+            if previous.is_terminal() || previous == status {
+                return;
+            }
+
+            if let Some(attempt) = state.attempt.take() {
+                let error: Error = match status {
+                    RelayStatus::Banned => Error::banned(),
+                    RelayStatus::Shutdown => Error::shutdown(),
+                    _ => Error::rejected_msg("received termination request"),
+                };
+                attempt.finish(Err(error));
+            }
+
+            self.set_status(&mut state, status);
+
+            // Wake the connection task so it observes the invalidated attempt
+            // and stops any pending retry, dial, or active session.
+            self.atomic.channels.connection_changed.notify_one();
         }
 
-        // Notify termination
-        self.atomic.channels.terminate();
+        if status.is_terminal() {
+            if let Some(handle) = self.atomic.connection_task_handle.get() {
+                handle.abort();
+            }
+        }
+    }
 
-        // Update status
-        self.set_status(RelayStatus::Shutdown, true);
-        ownership.restart_requested = false;
+    async fn queue_msg(
+        &self,
+        msg: &ClientMessage<'_>,
+        mut item: JsonMessageItem,
+    ) -> Result<(), Error> {
+        let ClientMessage::Req {
+            subscription_id, ..
+        } = msg
+        else {
+            return self.atomic.channels.send_client_msg(item);
+        };
+
+        // Keep the pending count and enqueue atomic with restoration checks.
+        let subscriptions = self.atomic.subscriptions.write().await;
+
+        if let Some(data) = subscriptions.get(subscription_id.as_ref()) {
+            if let Some(counter) = &data.pending_req_counter {
+                item.pending_req = Some(counter.track(subscription_id.as_ref().clone()));
+            }
+        }
+
+        self.atomic.channels.send_client_msg(item)
     }
 
     #[inline]
@@ -1747,7 +1863,16 @@ impl InnerRelay {
     ) -> Result<(), Error> {
         // Check if relay is operational
         self.ensure_operational()?;
-        self.ensure_msg_allowed(&msg)?;
+
+        // If it can't write, check if there are "write" messages
+        if !self.capabilities.can_write() && msg.is_event() {
+            return Err(Error::write_disabled());
+        }
+
+        // If it can't read, check if there are "read" messages
+        if !self.capabilities.can_read() && (msg.is_req() || msg.is_close()) {
+            return Err(Error::read_disabled());
+        }
 
         match wait_until_sent {
             Some(timeout) => {
@@ -1755,10 +1880,14 @@ impl InnerRelay {
                 let (tx, rx) = oneshot::channel();
 
                 // Send the item
-                let item = JsonMessageItem::new(&msg, Some(tx));
-                self.queue_tracking_reqs(slice::from_ref(&msg), || {
-                    self.atomic.channels.send_client_msg(item)
-                })
+                self.queue_msg(
+                    &msg,
+                    JsonMessageItem {
+                        json: msg.as_json(),
+                        confirmation: Some(tx),
+                        pending_req: None,
+                    },
+                )
                 .await?;
 
                 // Wait for confirmation
@@ -1767,86 +1896,60 @@ impl InnerRelay {
                     .ok_or_else(Error::timeout)??)
             }
             None => {
-                let item = JsonMessageItem::new(&msg, None);
-                self.queue_tracking_reqs(slice::from_ref(&msg), || {
-                    self.atomic.channels.send_client_msg(item)
-                })
+                self.queue_msg(
+                    &msg,
+                    JsonMessageItem {
+                        json: msg.as_json(),
+                        confirmation: None,
+                        pending_req: None,
+                    },
+                )
                 .await
             }
         }
     }
 
     /// Queue every message in order on this connection, or none of them.
-    pub(super) async fn send_msgs(&self, msgs: Vec<ClientMessage<'_>>) -> Result<(), Error> {
-        // Check every message before reserving, so a rejected one queues nothing
+    pub(super) async fn send_msg_batch(&self, msgs: Vec<ClientMessage<'_>>) -> Result<(), Error> {
+        // Check every message first, so a rejected one queues nothing.
         self.ensure_operational()?;
+
         for msg in msgs.iter() {
             self.ensure_msg_allowed(msg)?;
         }
 
-        let items = msgs
-            .iter()
-            .map(|msg| JsonMessageItem::new(msg, None))
-            .collect();
-        self.queue_tracking_reqs(&msgs, || self.atomic.channels.send_client_msgs(items))
-            .await
-    }
+        // Like `queue_msg`, hold the lock until the REQs are queued and tracked,
+        // so the restoration on reconnect can't send another REQ in between.
+        let subscriptions = self.atomic.subscriptions.write().await;
 
-    /// Run `queue`, then point registered long-lived subscriptions at the `REQ`s it queued.
-    ///
-    /// A queued `REQ` replaces the relay's filters for its ID and gets its own `EOSE`.
-    /// Updating the registry under the write lock, which `EOSE` handling also takes,
-    /// keeps the stored filters, `EOSE` flag and limit count describing that `REQ`.
-    async fn queue_tracking_reqs<F>(
-        &self,
-        msgs: &[ClientMessage<'_>],
-        queue: F,
-    ) -> Result<(), Error>
-    where
-        F: FnOnce() -> Result<(), Error>,
-    {
-        if !msgs.iter().any(ClientMessage::is_req) {
-            return queue();
-        }
-
-        let mut subscriptions = self.atomic.subscriptions.write().await;
-        queue()?;
+        let mut items: Vec<JsonMessageItem> = Vec::with_capacity(msgs.len());
 
         for msg in msgs.iter() {
-            let ClientMessage::Req {
-                subscription_id,
-                filters,
-            } = msg
-            else {
-                continue;
+            let pending_req: Option<PendingReq> = match msg {
+                ClientMessage::Req {
+                    subscription_id, ..
+                } => subscriptions
+                    .get(subscription_id.as_ref())
+                    .and_then(|data| data.pending_req_counter.as_ref())
+                    .map(|counter| counter.track(subscription_id.as_ref().clone())),
+                _ => None,
             };
 
-            if let Some(data) = subscriptions.get_mut(subscription_id.as_ref()) {
-                if !data.is_auto_closing {
-                    data.filters = filters.iter().map(|f| f.as_ref().clone()).collect();
-                    data.start_stored_events_phase();
-                }
-            }
+            items.push(JsonMessageItem {
+                json: msg.as_json(),
+                confirmation: None,
+                pending_req,
+            });
         }
 
-        Ok(())
-    }
-
-    fn send_resubscription(&self, msg: &ClientMessage<'_>) -> Result<bool, Error> {
-        self.ensure_operational()?;
-        self.ensure_msg_allowed(msg)?;
-        self.atomic
-            .channels
-            .send_req_unless_queued(JsonMessageItem::new(msg, None))
+        self.atomic.channels.send_client_msg_batch(items)
     }
 
     fn ensure_msg_allowed(&self, msg: &ClientMessage<'_>) -> Result<(), Error> {
-        // If it can't write, check if there are "write" messages
         if !self.capabilities.can_write() && msg.is_event() {
             return Err(Error::write_disabled());
         }
 
-        // If it can't read, check if there are "read" messages
         if !self.capabilities.can_read() && (msg.is_req() || msg.is_close()) {
             return Err(Error::read_disabled());
         }
@@ -1908,8 +2011,7 @@ impl InnerRelay {
     ) -> Result<(bool, String), Error> {
         time::timeout(Some(timeout), async {
             loop {
-                let notification = notifications.recv().await.map_err(Error::from)?;
-                match notification {
+                match notifications.recv().await.map_err(Error::from)? {
                     RelayNotification::Message { message } => {
                         if let RelayMessage::Ok {
                             event_id,
@@ -1923,7 +2025,7 @@ impl InnerRelay {
                             }
                         }
                     }
-                    RelayNotification::RelayStatus { status } if status.is_disconnected() => {
+                    RelayNotification::RelayStatus { status } if status.is_connection_closed() => {
                         return Err(Error::not_connected());
                     }
                     _ => (),
@@ -1946,17 +2048,9 @@ impl InnerRelay {
                     filters: filters.into_iter().map(Cow::Owned).collect(),
                 };
 
-                // A REQ still queued from before the disconnect is sent on this
-                // connection: a second one would make the relay close the ID as a duplicate.
-                match self.send_resubscription(&msg) {
-                    Ok(true) => (),
-                    Ok(false) => {
-                        tracing::debug!("Skip re-subscription of '{id}': REQ already queued")
-                    }
-                    Err(e) => {
-                        self.subscription_closed(&id).await;
-                        return Err(e);
-                    }
+                if let Err(e) = self.send_msg(msg, None).await {
+                    self.subscription_closed(&id).await;
+                    return Err(e);
                 }
             } else {
                 tracing::debug!("Skip re-subscription of '{id}'");
@@ -2233,7 +2327,7 @@ impl InnerRelay {
                             reason: Some(SubscriptionAutoClosedReason::AuthenticationFailed),
                         });
                     }
-                    RelayNotification::RelayStatus { status } if status.is_disconnected() => {
+                    RelayNotification::RelayStatus { status } if status.is_connection_closed() => {
                         return Some(HandleAutoClosing {
                             to_close: false, // No need to send CLOSE msg
                             reason: Some(SubscriptionAutoClosedReason::Disconnected),
@@ -2347,7 +2441,7 @@ async fn post_eose_grace(
                     }
                     _ => (),
                 },
-                Ok(RelayNotification::RelayStatus { status }) if status.is_disconnected() => {
+                Ok(RelayNotification::RelayStatus { status }) if status.is_connection_closed() => {
                     return SubscriptionAutoClosedReason::Disconnected;
                 }
                 Ok(_) => {}
@@ -2385,7 +2479,8 @@ mod tests {
     use std::borrow::Cow;
     use std::collections::HashSet;
     use std::error::Error as StdError;
-    use std::future::Future;
+    use std::future::{Future, IntoFuture};
+    use std::io::{Error as IoError, ErrorKind as IoErrorKind};
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2395,801 +2490,23 @@ mod tests {
     use nostr::key::Keys;
     use nostr::message::SubscriptionId;
     use nostr::types::RelayUrl;
+    use tokio::sync::broadcast::Receiver as BroadcastReceiver;
+    use tokio::task::JoinHandle as TokioJoinHandle;
 
     use super::*;
     use crate::authenticator::SignerAuthenticator;
-    use crate::error::ErrorKind;
+    use crate::error::{Error, ErrorKind};
+    use crate::future::BoxedFuture;
     use crate::local_relay::MockRelay;
     use crate::policy::{AdmitPolicy, AdmitStatus};
-    use crate::relay::{Relay, RelayCapabilities, RelayLimits, RelayOptions};
-
-    #[tokio::test]
-    async fn acquisition_first_does_not_steal_live_first_sighting() {
-        let url = RelayUrl::parse("wss://relay.example.com").unwrap();
-        let mut relay = Relay::builder(url)
-            .opts(RelayOptions::default().verify_subscriptions(true))
-            .build();
-        let (sender, mut notifications) = broadcast::channel(8);
-        relay.set_notification_sender(sender);
-        let event = EventBuilder::new(Kind::TextNote, "acquired then live")
-            .finalize(&Keys::generate())
-            .unwrap();
-        let filter = Filter::new().id(event.id);
-        let acquire_id = relay.inner.acquisition_subscription_id();
-        relay
-            .inner
-            .add_acquisition_subscription(acquire_id.clone(), vec![filter.clone()])
-            .await
-            .unwrap();
-
-        assert!(matches!(
-            relay
-                .inner
-                .handle_event_msg(acquire_id.clone(), event.clone())
-                .await
-                .unwrap(),
-            Some(RelayMessage::Event { .. })
-        ));
-        assert_eq!(
-            relay
-                .inner
-                .state
-                .database()
-                .check_id(&event.id)
-                .await
-                .unwrap(),
-            DatabaseEventStatus::NotExistent
-        );
-        assert!(matches!(
-            notifications.try_recv(),
-            Err(broadcast::error::TryRecvError::Empty)
-        ));
-
-        let live_id = SubscriptionId::new("live");
-        relay
-            .inner
-            .add_long_lived_subscription(live_id.clone(), vec![filter])
-            .await
-            .unwrap();
-        relay
-            .inner
-            .handle_event_msg(live_id.clone(), event.clone())
-            .await
-            .unwrap();
-        assert_eq!(
-            relay
-                .inner
-                .state
-                .database()
-                .check_id(&event.id)
-                .await
-                .unwrap(),
-            DatabaseEventStatus::Saved
-        );
-        assert!(matches!(
-            notifications.try_recv(),
-            Ok(ClientNotification::Event { subscription_id, event: received, .. })
-                if subscription_id == live_id && received.id == event.id
-        ));
-        relay
-            .inner
-            .handle_event_msg(acquire_id, event)
-            .await
-            .unwrap();
-        assert!(matches!(
-            notifications.try_recv(),
-            Err(broadcast::error::TryRecvError::Empty)
-        ));
-    }
-
-    #[tokio::test]
-    async fn late_acquisition_id_is_discarded_without_changing_raw_req_ids() {
-        let url = RelayUrl::parse("wss://relay.example.com").unwrap();
-        let mut relay = Relay::new(url.clone());
-        let (sender, mut notifications) = broadcast::channel(8);
-        relay.set_notification_sender(sender);
-        let other = Relay::new(url);
-        let event = EventBuilder::new(Kind::TextNote, "late")
-            .finalize(&Keys::generate())
-            .unwrap();
-        let id = relay.inner.acquisition_subscription_id();
-        relay
-            .inner
-            .add_acquisition_subscription(id.clone(), vec![Filter::new().id(event.id)])
-            .await
-            .unwrap();
-        relay.inner.remove_subscription(&id).await;
-        assert!(
-            relay
-                .inner
-                .handle_event_msg(id.clone(), event.clone())
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(
-            relay
-                .inner
-                .state
-                .database()
-                .check_id(&event.id)
-                .await
-                .unwrap(),
-            DatabaseEventStatus::NotExistent
-        );
-        assert!(matches!(
-            notifications.try_recv(),
-            Err(broadcast::error::TryRecvError::Empty)
-        ));
-        // The namespace belongs to one relay instance, including its clones
-        // and reconnects. Another relay's raw REQ retains prior behavior.
-        assert!(matches!(
-            other
-                .inner
-                .handle_event_msg(id, event.clone())
-                .await
-                .unwrap(),
-            Some(RelayMessage::Event { .. })
-        ));
-        assert_eq!(
-            other
-                .inner
-                .state
-                .database()
-                .check_id(&event.id)
-                .await
-                .unwrap(),
-            DatabaseEventStatus::Saved
-        );
-        let raw = EventBuilder::new(Kind::TextNote, "raw request")
-            .finalize(&Keys::generate())
-            .unwrap();
-        relay
-            .inner
-            .handle_event_msg(SubscriptionId::new("sdk-acq-user-chosen"), raw.clone())
-            .await
-            .unwrap();
-        assert_eq!(
-            relay
-                .inner
-                .state
-                .database()
-                .check_id(&raw.id)
-                .await
-                .unwrap(),
-            DatabaseEventStatus::Saved
-        );
-        assert!(matches!(
-            notifications.try_recv(),
-            Ok(ClientNotification::Event { event: received, .. }) if received.id == raw.id
-        ));
-
-        // A registered caller auto-close using a colliding private-prefix ID
-        // retains its ordinary behavior; registration, not spelling, owns it.
-        let caller = EventBuilder::new(Kind::TextNote, "caller registration")
-            .finalize(&Keys::generate())
-            .unwrap();
-        let caller_id = relay.inner.acquisition_subscription_id();
-        relay
-            .inner
-            .add_auto_closing_subscription(caller_id.clone(), vec![Filter::new().id(caller.id)])
-            .await
-            .unwrap();
-        relay
-            .inner
-            .handle_event_msg(caller_id.clone(), caller.clone())
-            .await
-            .unwrap();
-        assert_eq!(
-            relay
-                .inner
-                .state
-                .database()
-                .check_id(&caller.id)
-                .await
-                .unwrap(),
-            DatabaseEventStatus::Saved
-        );
-        assert!(matches!(
-            notifications.try_recv(),
-            Ok(ClientNotification::Event { subscription_id, event: received, .. })
-                if subscription_id == caller_id && received.id == caller.id
-        ));
-
-        let mut limits = RelayLimits::default();
-        limits.events.max_size = Some(1);
-        let limited = Relay::builder(RelayUrl::parse("wss://limited.example.com").unwrap())
-            .opts(RelayOptions::default().limits(limits))
-            .build();
-        let late_id = limited.inner.acquisition_subscription_id();
-        limited
-            .inner
-            .add_acquisition_subscription(late_id.clone(), vec![Filter::new().id(event.id)])
-            .await
-            .unwrap();
-        limited.inner.remove_subscription(&late_id).await;
-        assert!(
-            limited
-                .inner
-                .handle_event_msg(late_id, event)
-                .await
-                .unwrap()
-                .is_none()
-        );
-    }
-
-    #[tokio::test]
-    async fn acquisition_still_rejects_invalid_signature_and_filter_mismatch() {
-        let relay = Relay::builder(RelayUrl::parse("wss://relay.example.com").unwrap())
-            .opts(RelayOptions::default().verify_subscriptions(true))
-            .build();
-        let event = EventBuilder::new(Kind::TextNote, "valid")
-            .finalize(&Keys::generate())
-            .unwrap();
-        let id = relay.inner.acquisition_subscription_id();
-        relay
-            .inner
-            .add_acquisition_subscription(id.clone(), vec![Filter::new().id(event.id)])
-            .await
-            .unwrap();
-        let mut forged = event.clone();
-        forged.content = "forged".into();
-        assert!(
-            relay
-                .inner
-                .handle_event_msg(id.clone(), forged)
-                .await
-                .is_err()
-        );
-        let unrelated = EventBuilder::new(Kind::TextNote, "unrelated")
-            .finalize(&Keys::generate())
-            .unwrap();
-        assert!(
-            relay
-                .inner
-                .handle_event_msg(id.clone(), unrelated.clone())
-                .await
-                .is_err()
-        );
-        for event in [event, unrelated] {
-            assert_eq!(
-                relay
-                    .inner
-                    .state
-                    .database()
-                    .check_id(&event.id)
-                    .await
-                    .unwrap(),
-                DatabaseEventStatus::NotExistent
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn auto_closing_lag_before_eose_is_not_completion() {
-        let relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
-        let id = SubscriptionId::new("lagged-before-eose");
-        let (tx, rx) = broadcast::channel(2);
-        for _ in 0..8 {
-            tx.send(RelayNotification::Authenticated).unwrap();
-        }
-        tx.send(RelayNotification::Message {
-            message: Box::new(RelayMessage::EndOfStoredEvents(Cow::Owned(id.clone()))),
-        })
-        .unwrap();
-
-        let result = relay
-            .inner
-            .handle_auto_closing(
-                &id,
-                &[Filter::new()],
-                SubscribeAutoCloseOptions::default(),
-                rx,
-                &None,
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            result.reason,
-            Some(SubscriptionAutoClosedReason::Lagged(skipped)) if skipped > 0
-        ));
-    }
-
-    #[tokio::test]
-    async fn auto_closing_receiver_closure_is_not_completion() {
-        let relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
-        let id = SubscriptionId::new("closed-receiver");
-        let (tx, rx) = broadcast::channel(2);
-        drop(tx);
-
-        let result = relay
-            .inner
-            .handle_auto_closing(
-                &id,
-                &[Filter::new()],
-                SubscribeAutoCloseOptions::default(),
-                rx,
-                &None,
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            result.reason,
-            Some(SubscriptionAutoClosedReason::ReceiverClosed)
-        ));
-    }
-
-    #[tokio::test]
-    async fn post_eose_grace_lag_is_not_completion() {
-        let id = SubscriptionId::new("grace-lag");
-        let (tx, mut rx) = broadcast::channel(2);
-        for _ in 0..8 {
-            tx.send(RelayNotification::Authenticated).unwrap();
-        }
-
-        let reason = post_eose_grace(&id, Duration::from_secs(2), &mut rx, &None, true).await;
-        assert!(matches!(
-            reason,
-            Some(SubscriptionAutoClosedReason::Lagged(skipped)) if skipped > 0
-        ));
-    }
-
-    #[tokio::test]
-    async fn auto_closing_eose_and_limit_have_distinct_reasons() {
-        let relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
-        let id = SubscriptionId::new("completed-eose");
-        let (tx, rx) = broadcast::channel(2);
-        tx.send(RelayNotification::Message {
-            message: Box::new(RelayMessage::EndOfStoredEvents(Cow::Owned(id.clone()))),
-        })
-        .unwrap();
-        let result = relay
-            .inner
-            .handle_auto_closing(
-                &id,
-                &[Filter::new()],
-                SubscribeAutoCloseOptions::default(),
-                rx,
-                &None,
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            result.reason,
-            Some(SubscriptionAutoClosedReason::Completed)
-        ));
-
-        let id = SubscriptionId::new("reached-limit");
-        let (tx, rx) = broadcast::channel(2);
-        let event = EventBuilder::new(Kind::TextNote, "limit")
-            .finalize(&Keys::generate())
-            .unwrap();
-        tx.send(RelayNotification::Message {
-            message: Box::new(RelayMessage::Event {
-                subscription_id: Cow::Owned(id.clone()),
-                event: Cow::Owned(event),
-            }),
-        })
-        .unwrap();
-        let result = relay
-            .inner
-            .handle_auto_closing(
-                &id,
-                &[Filter::new()],
-                SubscribeAutoCloseOptions::default().exit_policy(ReqExitPolicy::WaitForEvents(1)),
-                rx,
-                &None,
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            result.reason,
-            Some(SubscriptionAutoClosedReason::LimitReached)
-        ));
-    }
-
-    #[tokio::test]
-    async fn reporting_request_does_not_complete_on_early_unprefixed_closed() {
-        let relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
-        for (policy, message) in [
-            (ReqExitPolicy::ExitOnEOSE, "temporarily unavailable"),
-            (ReqExitPolicy::WaitForEvents(2), ""),
-        ] {
-            let id = SubscriptionId::generate();
-            let (tx, rx) = broadcast::channel(2);
-            tx.send(RelayNotification::Message {
-                message: Box::new(RelayMessage::Closed {
-                    subscription_id: Cow::Owned(id.clone()),
-                    message: Cow::Borrowed(message),
-                }),
-            })
-            .unwrap();
-            let result = relay
-                .inner
-                .handle_auto_closing(
-                    &id,
-                    &[Filter::new()],
-                    SubscribeAutoCloseOptions::default()
-                        .exit_policy(policy)
-                        .report_relay_closed(true),
-                    rx,
-                    &None,
-                )
-                .await
-                .unwrap();
-            assert!(matches!(
-                result.reason,
-                Some(SubscriptionAutoClosedReason::RelayClosed(ref reason)) if reason == message
-            ));
-        }
-
-        let id = SubscriptionId::generate();
-        let (tx, rx) = broadcast::channel(2);
-        tx.send(RelayNotification::Message {
-            message: Box::new(RelayMessage::Closed {
-                subscription_id: Cow::Owned(id.clone()),
-                message: Cow::Borrowed("legacy shortcut"),
-            }),
-        })
-        .unwrap();
-        let result = relay
-            .inner
-            .handle_auto_closing(
-                &id,
-                &[Filter::new()],
-                SubscribeAutoCloseOptions::default(),
-                rx,
-                &None,
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            result.reason,
-            Some(SubscriptionAutoClosedReason::Completed)
-        ));
-    }
-
-    #[tokio::test]
-    async fn reporting_grace_does_not_complete_on_matching_closed() {
-        let relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
-        let id = SubscriptionId::generate();
-        let (tx, rx) = broadcast::channel(4);
-        tx.send(RelayNotification::Message {
-            message: Box::new(RelayMessage::EndOfStoredEvents(Cow::Owned(id.clone()))),
-        })
-        .unwrap();
-        tx.send(RelayNotification::Message {
-            message: Box::new(RelayMessage::Closed {
-                subscription_id: Cow::Owned(SubscriptionId::generate()),
-                message: Cow::Borrowed("unrelated"),
-            }),
-        })
-        .unwrap();
-        tx.send(RelayNotification::Message {
-            message: Box::new(RelayMessage::Closed {
-                subscription_id: Cow::Owned(id.clone()),
-                message: Cow::Borrowed("grace interrupted"),
-            }),
-        })
-        .unwrap();
-        let result = relay
-            .inner
-            .handle_auto_closing(
-                &id,
-                &[Filter::new()],
-                SubscribeAutoCloseOptions::default()
-                    .exit_policy(ReqExitPolicy::WaitDurationAfterEOSE(Duration::from_secs(2)))
-                    .report_relay_closed(true),
-                rx,
-                &None,
-            )
-            .await
-            .unwrap();
-        assert!(matches!(
-            result.reason,
-            Some(SubscriptionAutoClosedReason::RelayClosed(ref reason)) if reason == "grace interrupted"
-        ));
-    }
-
-    #[tokio::test]
-    async fn ok_waiter_requires_matching_reply_and_preserves_receive_failure() {
-        let relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
-        let wanted = EventId::from_byte_array([0; 32]);
-        let other = EventId::from_byte_array([1; 32]);
-        let (tx, mut rx) = broadcast::channel(2);
-        tx.send(RelayNotification::Message {
-            message: Box::new(RelayMessage::Ok {
-                event_id: other,
-                status: true,
-                message: Cow::Borrowed("unrelated"),
-            }),
-        })
-        .unwrap();
-        tx.send(RelayNotification::Message {
-            message: Box::new(RelayMessage::Ok {
-                event_id: wanted,
-                status: false,
-                message: Cow::Borrowed("rejected"),
-            }),
-        })
-        .unwrap();
-        let (accepted, message) = relay
-            .inner
-            .wait_for_ok(&mut rx, &wanted, Duration::from_secs(1))
-            .await
-            .unwrap();
-        assert!(!accepted);
-        assert_eq!(message, "rejected");
-
-        let (_silent_tx, mut silent_rx) = broadcast::channel(2);
-        let error = relay
-            .inner
-            .wait_for_ok(&mut silent_rx, &wanted, Duration::from_millis(20))
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), crate::error::ErrorKind::Timeout);
-
-        let (lag_tx, _) = broadcast::channel(2);
-        let mut lagged = lag_tx.subscribe();
-        for _ in 0..8 {
-            lag_tx.send(RelayNotification::Authenticated).unwrap();
-        }
-        let error = relay
-            .inner
-            .wait_for_ok(&mut lagged, &wanted, Duration::from_secs(1))
-            .await
-            .unwrap_err();
-        assert!(
-            StdError::source(&error)
-                .and_then(|source| source.downcast_ref::<broadcast::error::RecvError>())
-                .is_some_and(|source| matches!(source, broadcast::error::RecvError::Lagged(_)))
-        );
-
-        let (closed_tx, mut closed_rx) = broadcast::channel(2);
-        drop(closed_tx);
-        let error = relay
-            .inner
-            .wait_for_ok(&mut closed_rx, &wanted, Duration::from_secs(1))
-            .await
-            .unwrap_err();
-        assert!(
-            StdError::source(&error)
-                .and_then(|source| source.downcast_ref::<broadcast::error::RecvError>())
-                .is_some_and(|source| matches!(source, broadcast::error::RecvError::Closed))
-        );
-    }
-
-    #[tokio::test]
-    async fn reconnect_requested_during_task_teardown_is_not_lost() {
-        reconnect_during_teardown(true, false).await;
-    }
-
-    #[tokio::test]
-    async fn explicit_reconnect_during_teardown_works_without_automatic_reconnect() {
-        reconnect_during_teardown(false, false).await;
-    }
-
-    #[tokio::test]
-    async fn queued_reconnect_ignores_stale_termination_permit() {
-        reconnect_during_teardown(false, true).await;
-    }
-
-    #[tokio::test]
-    async fn connect_after_idle_disconnect_ignores_stored_termination() {
-        let local = MockRelay::run().await.unwrap();
-        let relay = Relay::builder(local.url().await)
-            .opts(RelayOptions::default().reconnect(false))
-            .build();
-        relay.disconnect();
-        assert_eq!(relay.status(), RelayStatus::Terminated);
-
-        relay.connect();
-        relay.wait_for_connection(Duration::from_secs(2)).await;
-        assert_eq!(relay.status(), RelayStatus::Connected);
-        assert_eq!(relay.stats().success(), 1);
-    }
-
-    async fn reconnect_during_teardown(automatic_reconnect: bool, stale_termination: bool) {
-        let local = MockRelay::run().await.unwrap();
-        let relay = Relay::builder(local.url().await)
-            .opts(RelayOptions::default().reconnect(automatic_reconnect))
-            .build();
-        let hook = Arc::new(TeardownHook::default());
-        *relay.inner.atomic.teardown_hook.lock().unwrap() = Some(hook.clone());
-        relay
-            .try_connect()
-            .timeout(Duration::from_secs(2))
-            .await
-            .unwrap();
-
-        tokio::time::timeout(Duration::from_secs(2), hook.started.notified())
-            .await
-            .unwrap();
-        let mut notifications = relay.notifications();
-        let keys = Keys::generate();
-        let subscription_id = relay
-            .subscribe(Filter::new().author(keys.public_key()))
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let notification = notifications
-                    .next()
-                    .await
-                    .expect("notification stream closed before EOSE");
-                if matches!(notification, RelayNotification::Message { message } if matches!(*message, RelayMessage::EndOfStoredEvents(ref id) if id.as_ref() == &subscription_id)) {
-                    break;
-                }
-            }
-        })
-        .await
-        .unwrap();
-
-        relay.disconnect();
-        tokio::time::timeout(Duration::from_secs(2), hook.entered.notified())
-            .await
-            .unwrap();
-        assert_eq!(relay.status(), RelayStatus::Terminated);
-        assert!(relay.inner.is_running());
-
-        if stale_termination {
-            // The old task no longer polls the termination Notify at this gate.
-            relay.inner.atomic.channels.terminate();
-        }
-
-        let ((), ()) = tokio::join!(async { relay.connect() }, async { relay.connect() });
-        assert_eq!(relay.status(), RelayStatus::Pending);
-        hook.release.notify_one();
-
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let notification = notifications
-                    .next()
-                    .await
-                    .expect("notification stream closed before reconnect");
-                if matches!(
-                    notification,
-                    RelayNotification::RelayStatus {
-                        status: RelayStatus::Connected
-                    }
-                ) {
-                    break;
-                }
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(relay.status(), RelayStatus::Connected);
-        assert!(relay.inner.is_running());
-
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let notification = notifications
-                    .next()
-                    .await
-                    .expect("notification stream closed before restored EOSE");
-                if matches!(notification, RelayNotification::Message { message } if matches!(*message, RelayMessage::EndOfStoredEvents(ref id) if id.as_ref() == &subscription_id)) {
-                    break;
-                }
-            }
-        })
-        .await
-        .unwrap();
-
-        let event = EventBuilder::new(Kind::TextNote, "after reconnect")
-            .finalize(&keys)
-            .unwrap();
-        local.add_event(event.clone()).await.unwrap();
-        let received = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let notification = notifications
-                    .next()
-                    .await
-                    .expect("notification stream closed");
-                if let RelayNotification::Event {
-                    subscription_id: received_id,
-                    event,
-                } = notification
-                {
-                    if received_id == subscription_id {
-                        break event.id;
-                    }
-                }
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(received, event.id);
-    }
-
-    #[tokio::test]
-    async fn shutdown_cancels_a_queued_reconnect() {
-        let local = MockRelay::run().await.unwrap();
-        let relay = Relay::new(local.url().await);
-        let hook = Arc::new(TeardownHook::default());
-        *relay.inner.atomic.teardown_hook.lock().unwrap() = Some(hook.clone());
-        relay
-            .try_connect()
-            .timeout(Duration::from_secs(2))
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), hook.started.notified())
-            .await
-            .unwrap();
-
-        relay.disconnect();
-        tokio::time::timeout(Duration::from_secs(2), hook.entered.notified())
-            .await
-            .unwrap();
-        relay.connect();
-        relay.shutdown();
-        hook.release.notify_one();
-        tokio::time::timeout(Duration::from_secs(2), hook.finished.notified())
-            .await
-            .unwrap();
-
-        assert_eq!(relay.status(), RelayStatus::Shutdown);
-        assert!(!relay.inner.is_running());
-    }
-
-    #[tokio::test]
-    async fn try_connect_reports_when_old_task_still_owns_connection() {
-        let local = MockRelay::run().await.unwrap();
-        let relay = Relay::new(local.url().await);
-        let hook = Arc::new(TeardownHook::default());
-        *relay.inner.atomic.teardown_hook.lock().unwrap() = Some(hook.clone());
-        relay
-            .try_connect()
-            .timeout(Duration::from_secs(2))
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), hook.started.notified())
-            .await
-            .unwrap();
-
-        relay.disconnect();
-        tokio::time::timeout(Duration::from_secs(2), hook.entered.notified())
-            .await
-            .unwrap();
-
-        let success_before = relay.stats().success();
-        let mut status_updates = relay.inner.internal_notification_sender.subscribe();
-        let error = relay
-            .try_connect()
-            .timeout(Duration::from_secs(2))
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::State);
-        assert_eq!(relay.status(), RelayStatus::Pending);
-        assert_eq!(relay.stats().success(), success_before);
-        loop {
-            match status_updates.try_recv() {
-                Ok(RelayNotification::RelayStatus {
-                    status: RelayStatus::Connected,
-                }) => panic!("discarded try_connect socket reported Connected"),
-                Ok(_) => {}
-                Err(broadcast::error::TryRecvError::Empty) => break,
-                Err(error) => panic!("unexpected status receiver error: {error}"),
-            }
-        }
-        let mut notifications = relay.notifications();
-        hook.release.notify_one();
-
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while let Some(notification) = notifications.next().await {
-                if matches!(
-                    notification,
-                    RelayNotification::RelayStatus {
-                        status: RelayStatus::Connected
-                    }
-                ) {
-                    break;
-                }
-            }
-        })
-        .await
-        .unwrap();
-    }
+    use crate::relay::{Relay, RelayLimits, RelayOptions};
+    use crate::stream::NotificationStream;
+    use crate::test_utils::{
+        ControlledConnectionPolicy, ControlledRelay, DialReply, PolicyReply, RecordedConnection,
+        TEST_TIMEOUT, connection_gate_close, fake_connection, recording_connection,
+        start_try_connect, wait_for_eose, wait_for_status, wait_for_subscription_event, wait_until,
+    };
+    use crate::transport::websocket::{DefaultWebsocketTransport, WebSocketTransport};
 
     #[derive(Debug)]
     struct CountingAdmitPolicy(Arc<AtomicUsize>);
@@ -3502,6 +2819,84 @@ mod tests {
         assert_eq!(err.to_string(), "subscription not found");
     }
 
+    async fn handle_text_note(
+        relay: &Relay,
+        subscription_id: &SubscriptionId,
+    ) -> Result<(), Error> {
+        let event = EventBuilder::new(Kind::TextNote, "test")
+            .finalize(&Keys::generate())
+            .unwrap();
+        relay
+            .inner
+            .handle_event_msg(subscription_id.clone(), event)
+            .await
+            .map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn test_resubscribe_resets_received_event_count() {
+        let url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let opts = RelayOptions::default()
+            .verify_subscriptions(true)
+            .ban_relay_on_mismatch(true);
+        let relay = Relay::builder(url).opts(opts).build();
+        let subscription_id = SubscriptionId::new("test");
+        let filter = Filter::new().kind(Kind::TextNote).limit(2);
+
+        relay
+            .inner
+            .add_long_lived_subscription(subscription_id.clone(), vec![filter.clone()])
+            .await
+            .unwrap();
+
+        // The connection drops before EOSE.
+        for _ in 0..2 {
+            handle_text_note(&relay, &subscription_id).await.unwrap();
+        }
+
+        relay
+            .inner
+            .update_subscription(&subscription_id, vec![filter], true)
+            .await
+            .unwrap();
+
+        // The relay sends the stored events again for the restored REQ.
+        for _ in 0..2 {
+            handle_text_note(&relay, &subscription_id).await.unwrap();
+        }
+
+        assert_ne!(relay.status(), RelayStatus::Banned);
+    }
+
+    #[tokio::test]
+    async fn test_resubscribe_resets_received_eose() {
+        let url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let opts = RelayOptions::default().verify_subscriptions(true);
+        let relay = Relay::builder(url).opts(opts).build();
+        let subscription_id = SubscriptionId::new("test");
+        let filter = Filter::new().kind(Kind::TextNote).limit(1);
+
+        relay
+            .inner
+            .add_long_lived_subscription(subscription_id.clone(), vec![filter.clone()])
+            .await
+            .unwrap();
+        relay.inner.received_eose(&subscription_id).await;
+
+        relay
+            .inner
+            .update_subscription(&subscription_id, vec![filter], true)
+            .await
+            .unwrap();
+
+        // The limit applies again until the restored REQ reaches EOSE.
+        handle_text_note(&relay, &subscription_id).await.unwrap();
+        let err = handle_text_note(&relay, &subscription_id)
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::LimitExceeded);
+    }
+
     #[tokio::test]
     async fn test_update_auto_closing_subscription_resets_previous_state() {
         let url = RelayUrl::parse("wss://relay.example.com").unwrap();
@@ -3541,388 +2936,6 @@ mod tests {
         assert_eq!(data.received_events.load(Ordering::SeqCst), 0);
     }
 
-    /// A relay that accepts messages into its outbound queue without connecting.
-    fn queueing_relay() -> Relay {
-        let url = RelayUrl::parse("wss://relay.example.com").unwrap();
-        let relay = Relay::new(url);
-        relay.inner.set_status(RelayStatus::Disconnected, false);
-        relay
-    }
-
-    fn outbound_capacity(relay: &Relay) -> usize {
-        relay.inner.atomic.channels.nostr.0.capacity()
-    }
-
-    #[tokio::test]
-    async fn test_batch_msg_queues_messages_in_order() {
-        let relay = queueing_relay();
-        let id = SubscriptionId::new("test");
-        let close = ClientMessage::close(id.clone());
-        let req = ClientMessage::req(id, Filter::new().kind(Kind::TextNote));
-        let expected = vec![close.as_json(), req.as_json()];
-
-        relay.batch_msg(vec![close, req]).await.unwrap();
-
-        let mut rx = relay.inner.atomic.channels.rx_nostr().await;
-        let queued: Vec<String> = vec![rx.try_recv().unwrap().json, rx.try_recv().unwrap().json];
-        assert_eq!(queued, expected);
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[tokio::test]
-    async fn test_batch_msg_queues_nothing_when_queue_cannot_fit_batch() {
-        let relay = queueing_relay();
-        let filler = ClientMessage::close(SubscriptionId::new("filler"));
-
-        // Leave the queue one slot short of the batch.
-        while outbound_capacity(&relay) > 1 {
-            relay.send_msg(filler.clone()).await.unwrap();
-        }
-
-        let id = SubscriptionId::new("test");
-        let batch = vec![
-            ClientMessage::close(id.clone()),
-            ClientMessage::req(id, Filter::new().kind(Kind::TextNote)),
-        ];
-        let err = relay.batch_msg(batch).await.unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::State);
-        assert_eq!(
-            err.to_string(),
-            "can't send message to the transport dispatcher"
-        );
-        assert_eq!(outbound_capacity(&relay), 1);
-
-        let mut rx = relay.inner.atomic.channels.rx_nostr().await;
-        while let Ok(item) = rx.try_recv() {
-            assert_eq!(item.json, filler.as_json());
-        }
-    }
-
-    #[tokio::test]
-    async fn test_batch_msg_capability_failure_queues_nothing() {
-        let event = EventBuilder::new(Kind::TextNote, "batch")
-            .finalize(&Keys::generate())
-            .unwrap();
-        let req = ClientMessage::req(
-            SubscriptionId::new("test"),
-            Filter::new().kind(Kind::TextNote),
-        );
-        let close = ClientMessage::close(SubscriptionId::new("test"));
-
-        // Write disabled: the trailing EVENT rejects the whole batch.
-        let relay = queueing_relay();
-        relay.capabilities().remove(RelayCapabilities::WRITE);
-        let err = relay
-            .batch_msg(vec![req.clone(), ClientMessage::event(event.clone())])
-            .await
-            .unwrap_err();
-        assert_eq!(err.to_string(), Error::write_disabled().to_string());
-        assert_eq!(outbound_capacity(&relay), 1024);
-
-        // Read disabled: the trailing CLOSE rejects the whole batch.
-        let relay = queueing_relay();
-        relay.capabilities().remove(RelayCapabilities::READ);
-        let err = relay
-            .batch_msg(vec![ClientMessage::event(event), close])
-            .await
-            .unwrap_err();
-        assert_eq!(err.to_string(), Error::read_disabled().to_string());
-        assert_eq!(outbound_capacity(&relay), 1024);
-    }
-
-    fn queued_frames(rx: &mut Receiver<JsonMessageItem>) -> Vec<String> {
-        let mut frames = Vec::new();
-        while let Ok(item) = rx.try_recv() {
-            frames.push(item.json);
-        }
-        frames
-    }
-
-    #[tokio::test]
-    async fn test_resubscribe_skips_id_with_queued_req() {
-        let relay = queueing_relay();
-        let id = SubscriptionId::new("live");
-        let filter = Filter::new().kind(Kind::TextNote);
-        relay
-            .inner
-            .add_long_lived_subscription(id.clone(), vec![filter.clone()])
-            .await
-            .unwrap();
-
-        // Re-issue left in the queue by a connection that dropped before sending it.
-        let retarget = Filter::new().kind(Kind::Reaction);
-        let close = ClientMessage::close(id.clone());
-        let req = ClientMessage::req(id.clone(), retarget.clone());
-        relay
-            .batch_msg(vec![close.clone(), req.clone()])
-            .await
-            .unwrap();
-
-        relay.inner.stats.new_success();
-        relay.inner.stats.new_success();
-        relay.inner.resubscribe().await.unwrap();
-
-        let mut rx = relay.inner.atomic.channels.rx_nostr().await;
-        assert_eq!(queued_frames(&mut rx), vec![close.as_json(), req.as_json()]);
-        drop(rx);
-
-        // The queued REQ counts as this connection's REQ, and the registry follows it.
-        assert!(!relay.inner.should_resubscribe(&id).await);
-        assert_eq!(relay.subscription(&id).await, Some(vec![retarget]));
-        assert_eq!(relay.subscription_received_eose(&id).await, Some(false));
-    }
-
-    #[tokio::test]
-    async fn test_resubscribe_sends_req_once_queued_req_left_the_queue() {
-        let relay = queueing_relay();
-        let id = SubscriptionId::new("live");
-        let filter = Filter::new().kind(Kind::TextNote);
-        relay
-            .inner
-            .add_long_lived_subscription(id.clone(), vec![filter.clone()])
-            .await
-            .unwrap();
-        relay
-            .send_msg(ClientMessage::req(id.clone(), filter))
-            .await
-            .unwrap();
-
-        // A sender took the REQ, but the connection dropped before it was written.
-        {
-            let mut rx = relay.inner.atomic.channels.rx_nostr().await;
-            let item = rx.try_recv().unwrap();
-            relay.inner.atomic.channels.dequeued(&item);
-        }
-
-        relay.inner.stats.new_success();
-        relay.inner.stats.new_success();
-        relay.inner.resubscribe().await.unwrap();
-
-        let mut rx = relay.inner.atomic.channels.rx_nostr().await;
-        assert_eq!(queued_frames(&mut rx).len(), 1);
-    }
-
-    /// Serve a relay that answers a `REQ` for an ID already open on the connection
-    /// with `CLOSED duplicate:`, and drops the first connection after its first `REQ`.
-    ///
-    /// Every received frame is reported with the index of its connection.
-    async fn run_duplicate_refusing_relay() -> (RelayUrl, mpsc::UnboundedReceiver<(usize, String)>)
-    {
-        use async_wsocket::native::{self, Message as WsMessage};
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = RelayUrl::parse(&format!("ws://{}", listener.local_addr().unwrap())).unwrap();
-        let (frames_tx, frames_rx) = mpsc::unbounded_channel();
-
-        tokio::spawn(async move {
-            let mut index: usize = 0;
-            while let Ok((stream, _)) = listener.accept().await {
-                let frames_tx = frames_tx.clone();
-                let connection = index;
-                index += 1;
-
-                tokio::spawn(async move {
-                    let mut ws = native::accept_async(stream).await.unwrap();
-                    let mut open: HashSet<SubscriptionId> = HashSet::new();
-
-                    while let Some(Ok(msg)) = ws.next().await {
-                        let WsMessage::Text(text) = msg else {
-                            continue;
-                        };
-                        let _ = frames_tx.send((connection, text.to_string()));
-
-                        match ClientMessage::from_json(text.as_str()) {
-                            Ok(ClientMessage::Req {
-                                subscription_id, ..
-                            }) => {
-                                let id = subscription_id.into_owned();
-                                let reply = if open.insert(id.clone()) {
-                                    RelayMessage::eose(id)
-                                } else {
-                                    RelayMessage::closed(id, "duplicate: subscription already open")
-                                };
-                                ws.send(WsMessage::Text(reply.as_json().into()))
-                                    .await
-                                    .unwrap();
-
-                                if connection == 0 {
-                                    return;
-                                }
-                            }
-                            Ok(ClientMessage::Close(id)) => {
-                                open.remove(&id);
-                            }
-                            _ => (),
-                        }
-                    }
-                });
-            }
-        });
-
-        (url, frames_rx)
-    }
-
-    #[tokio::test]
-    async fn test_reissue_queued_across_reconnect_is_sent_once() {
-        let (url, mut frames) = run_duplicate_refusing_relay().await;
-        let opts = RelayOptions::default()
-            .retry_interval(Duration::from_secs(1))
-            .adjust_retry_interval(false);
-        let relay = Relay::builder(url).opts(opts).build();
-        relay.connect();
-        relay.wait_for_connection(Duration::from_secs(5)).await;
-
-        let id = SubscriptionId::new("live");
-        let filter = Filter::new().kind(Kind::TextNote);
-        relay
-            .subscribe(filter.clone())
-            .with_id(id.clone())
-            .await
-            .unwrap();
-
-        // The relay drops the first connection after its REQ. Queue the re-issue
-        // before the reconnect, so it waits in the outbound queue.
-        time::timeout(Some(Duration::from_secs(5)), async {
-            while relay.status() == RelayStatus::Connected {
-                time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
-        relay
-            .batch_msg(vec![
-                ClientMessage::close(id.clone()),
-                ClientMessage::req(id.clone(), filter),
-            ])
-            .await
-            .unwrap();
-
-        relay.wait_for_connection(Duration::from_secs(5)).await;
-        assert_eq!(relay.status(), RelayStatus::Connected);
-
-        // Give a duplicate REQ time to arrive.
-        let mut reconnect_frames: Vec<String> = Vec::new();
-        let _ = time::timeout(Some(Duration::from_secs(1)), async {
-            while let Some((connection, frame)) = frames.recv().await {
-                if connection == 1 {
-                    reconnect_frames.push(frame);
-                }
-            }
-        })
-        .await;
-
-        let reqs = reconnect_frames
-            .iter()
-            .filter(|frame| frame.starts_with(r#"["REQ","live""#))
-            .count();
-        assert_eq!(reqs, 1, "frames on reconnect: {reconnect_frames:?}");
-        assert!(relay.subscription(&id).await.is_some());
-    }
-
-    #[tokio::test]
-    async fn test_subscription_received_eose_tracks_current_req() {
-        let relay = queueing_relay();
-        let id = SubscriptionId::new("test");
-        let filter = Filter::new().kind(Kind::TextNote);
-        let (tx, _rx) = watch::channel(None);
-        let eose = r#"["EOSE","test"]"#;
-
-        assert_eq!(relay.subscription_received_eose(&id).await, None);
-
-        relay
-            .inner
-            .add_long_lived_subscription(id.clone(), vec![filter.clone()])
-            .await
-            .unwrap();
-        assert_eq!(relay.subscription_received_eose(&id).await, Some(false));
-
-        relay.inner.handle_relay_message(eose, &tx).await;
-        assert_eq!(relay.subscription_received_eose(&id).await, Some(true));
-
-        // A reconnection re-sends the REQ: the flag waits for the new EOSE.
-        relay.inner.stats.new_success();
-        relay.inner.stats.new_success();
-        relay.inner.resubscribe().await.unwrap();
-        assert_eq!(relay.subscription_received_eose(&id).await, Some(false));
-
-        relay.inner.handle_relay_message(eose, &tx).await;
-        assert_eq!(relay.subscription_received_eose(&id).await, Some(true));
-
-        // Updating the filters under the same ID clears it too.
-        let retarget = filter.limit(10);
-        {
-            let subscriptions = relay.inner.atomic.subscriptions.read().await;
-            let data = subscriptions.get(&id).unwrap();
-            data.received_events.store(10, Ordering::SeqCst);
-        }
-        relay
-            .batch_msg(vec![
-                ClientMessage::close(id.clone()),
-                ClientMessage::req(id.clone(), retarget.clone()),
-            ])
-            .await
-            .unwrap();
-        assert_eq!(relay.subscription_received_eose(&id).await, Some(false));
-        assert_eq!(relay.subscription(&id).await, Some(vec![retarget]));
-        {
-            let subscriptions = relay.inner.atomic.subscriptions.read().await;
-            let data = subscriptions.get(&id).unwrap();
-            assert_eq!(data.received_events.load(Ordering::SeqCst), 0);
-        }
-
-        // Updating stored filters without sending a REQ keeps the current phase.
-        relay.inner.handle_relay_message(eose, &tx).await;
-        relay
-            .inner
-            .update_subscription(&id, vec![Filter::new().kind(Kind::Reaction)], false)
-            .await
-            .unwrap();
-        assert_eq!(relay.subscription_received_eose(&id).await, Some(true));
-
-        relay.inner.handle_relay_message(eose, &tx).await;
-        assert_eq!(relay.subscription_received_eose(&id).await, Some(true));
-
-        // The relay removes the subscription on CLOSED.
-        relay
-            .inner
-            .handle_relay_message(r#"["CLOSED","test",""]"#, &tx)
-            .await;
-        assert_eq!(relay.subscription_received_eose(&id).await, None);
-    }
-
-    #[tokio::test]
-    async fn test_resubscribe_restarts_limit_verification() {
-        let relay = queueing_relay();
-        let id = SubscriptionId::new("test");
-        let filter = Filter::new().kind(Kind::TextNote).limit(1);
-        let (tx, _rx) = watch::channel(None);
-
-        relay
-            .inner
-            .add_long_lived_subscription(id.clone(), vec![filter])
-            .await
-            .unwrap();
-        {
-            let subscriptions = relay.inner.atomic.subscriptions.read().await;
-            let data = subscriptions.get(&id).unwrap();
-            data.received_events.store(1, Ordering::SeqCst);
-        }
-        relay
-            .inner
-            .handle_relay_message(r#"["EOSE","test"]"#, &tx)
-            .await;
-
-        relay.inner.stats.new_success();
-        relay.inner.stats.new_success();
-        relay.inner.resubscribe().await.unwrap();
-
-        // The re-sent REQ may return `limit` events again.
-        let subscriptions = relay.inner.atomic.subscriptions.read().await;
-        let data = subscriptions.get(&id).unwrap();
-        assert!(!data.received_eose);
-        assert_eq!(data.received_events.load(Ordering::SeqCst), 0);
-    }
-
     #[tokio::test]
     async fn test_auth_required_closed_keeps_subscription_for_resubscribe() {
         let url = RelayUrl::parse("wss://relay.example.com").unwrap();
@@ -3954,6 +2967,2051 @@ mod tests {
             .unwrap();
 
         assert!(!relay.inner.should_resubscribe(&subscription_id).await);
+    }
+
+    #[tokio::test]
+    async fn ok_waiter_requires_matching_reply_and_preserves_receive_failure() {
+        let relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
+
+        let wanted = EventId::from_byte_array([0; 32]);
+        let other = EventId::from_byte_array([1; 32]);
+
+        let (tx, mut rx) = broadcast::channel(2);
+
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::Ok {
+                event_id: other,
+                status: true,
+                message: Cow::Borrowed("unrelated"),
+            }),
+        })
+        .unwrap();
+
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::Ok {
+                event_id: wanted,
+                status: false,
+                message: Cow::Borrowed("rejected"),
+            }),
+        })
+        .unwrap();
+
+        let (accepted, message) = relay
+            .inner
+            .wait_for_ok(&mut rx, &wanted, Duration::from_secs(1))
+            .await
+            .unwrap();
+
+        assert!(!accepted);
+        assert_eq!(message, "rejected");
+
+        let (_silent_tx, mut silent_rx) = broadcast::channel(2);
+
+        let error = relay
+            .inner
+            .wait_for_ok(&mut silent_rx, &wanted, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::Timeout);
+
+        let (lag_tx, _) = broadcast::channel(2);
+        let mut lagged = lag_tx.subscribe();
+
+        for _ in 0..8 {
+            lag_tx.send(RelayNotification::Authenticated).unwrap();
+        }
+
+        let error = relay
+            .inner
+            .wait_for_ok(&mut lagged, &wanted, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .source()
+                .and_then(|source| source.downcast_ref::<broadcast::error::RecvError>())
+                .is_some_and(|source| matches!(source, broadcast::error::RecvError::Lagged(_)))
+        );
+
+        let (closed_tx, mut closed_rx) = broadcast::channel(2);
+
+        drop(closed_tx);
+
+        let error = relay
+            .inner
+            .wait_for_ok(&mut closed_rx, &wanted, Duration::from_secs(1))
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .source()
+                .and_then(|source| source.downcast_ref::<broadcast::error::RecvError>())
+                .is_some_and(|source| matches!(source, broadcast::error::RecvError::Closed))
+        );
+    }
+
+    async fn wait_for_task_exit(inner: &InnerRelay) {
+        wait_until("connection task to exit", || !inner.is_running()).await;
+    }
+
+    enum ReconnectRequest {
+        Background,
+        WaitForResult,
+    }
+
+    async fn reconnect_while_closing(opts: RelayOptions, request: ReconnectRequest) {
+        let local: MockRelay = MockRelay::run().await.unwrap();
+        let url: RelayUrl = local.url().await;
+
+        let websocket: DefaultWebsocketTransport = DefaultWebsocketTransport;
+
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::with_opts(opts);
+
+        let initial: TokioJoinHandle<Result<(), Error>> = start_try_connect(&relay, TEST_TIMEOUT);
+        let reply: DialReply = transport.next_dial().await;
+
+        let connection = websocket.connect((&url).into(), None).await.unwrap();
+        let (connection, mut close_gate) = connection_gate_close(connection);
+
+        assert!(reply.send(Ok(connection)).is_ok());
+
+        initial.await.unwrap().unwrap();
+
+        let mut notifications: NotificationStream<RelayNotification> = relay.notifications();
+        let keys: Keys = Keys::generate();
+        let subscription: SubscriptionId = relay
+            .subscribe(Filter::new().author(keys.public_key()))
+            .await
+            .unwrap();
+        wait_for_eose(&mut notifications, &subscription).await;
+
+        relay.disconnect();
+
+        close_gate.wait_until_closing().await;
+
+        assert!(relay.inner.is_running());
+
+        // Submit the new request while the previous WebSocket is still closing.
+        let pending: Option<BoxedFuture<'_, Result<(), Error>>> = match request {
+            ReconnectRequest::WaitForResult => {
+                let mut pending: BoxedFuture<'_, Result<(), Error>> =
+                    Box::pin(relay.try_connect().timeout(TEST_TIMEOUT).into_future());
+                assert!(futures::poll!(pending.as_mut()).is_pending());
+                Some(pending)
+            }
+            ReconnectRequest::Background => {
+                relay.connect();
+                relay.connect();
+                None
+            }
+        };
+
+        assert_eq!(relay.status(), RelayStatus::Connecting);
+
+        transport.assert_no_pending_dials();
+
+        close_gate.release();
+
+        let reply: DialReply = transport.next_dial().await;
+        assert!(
+            reply
+                .send(websocket.connect((&url).into(), None).await)
+                .is_ok()
+        );
+        if let Some(pending) = pending {
+            pending.await.unwrap();
+        }
+        wait_for_eose(&mut notifications, &subscription).await;
+
+        let event: Event = EventBuilder::new(Kind::TextNote, "after reconnect")
+            .finalize(&keys)
+            .unwrap();
+        let event_id = event.id;
+        local.add_event(event).await.unwrap();
+        wait_for_subscription_event(&mut notifications, &subscription, &event_id).await;
+
+        assert_eq!(relay.stats().attempts(), 2);
+        assert_eq!(relay.stats().success(), 2);
+
+        transport.assert_no_pending_dials();
+    }
+
+    #[tokio::test]
+    async fn connection_result_wakes_all_callers_and_cannot_be_overwritten() {
+        let attempt: ConnectionAttempt = ConnectionAttempt::new(RequestConnectionKind::Background);
+
+        let mut first: BoxedFuture<'_, ConnectionResult> = Box::pin(attempt.wait_for_result());
+        let mut second: BoxedFuture<'_, ConnectionResult> = Box::pin(attempt.wait_for_result());
+
+        assert!(futures::poll!(first.as_mut()).is_pending());
+        assert!(futures::poll!(second.as_mut()).is_pending());
+
+        attempt.finish(Err(Error::state_msg("shared failure")));
+        attempt.finish(Ok(()));
+
+        let first: Arc<Error> = first.await.unwrap_err();
+        let second: Arc<Error> = second.await.unwrap_err();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(first.to_string(), "shared failure");
+        assert!(Arc::ptr_eq(
+            &first,
+            &attempt.wait_for_result().await.unwrap_err()
+        ));
+    }
+
+    #[tokio::test]
+    async fn recv_client_msg_preserves_messages_for_current_connection() {
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::new();
+
+        let inner: &InnerRelay = &relay.inner;
+
+        relay.connect();
+
+        let reply: DialReply = transport.next_dial().await;
+
+        assert!(reply.send(Ok(fake_connection())).is_ok());
+
+        wait_for_status(&relay, RelayStatus::Connected).await;
+
+        let old_attempt: Arc<ConnectionAttempt> = inner.connection_state().attempt.clone().unwrap();
+
+        // Isolate the queue from the background sender while testing the receive operation.
+        let (tx, mut rx) = mpsc::channel(1);
+        let message: JsonMessageItem = JsonMessageItem {
+            json: "queued message".to_owned(),
+            confirmation: None,
+            pending_req: None,
+        };
+        assert!(tx.try_send(message).is_ok());
+
+        relay.disconnect();
+
+        // After disconnection the "attempt" is taken, so the receiver MUST NOT receive any messages.
+        assert!(inner.recv_client_msg(&mut rx, &old_attempt).await.is_none());
+
+        // The message MUST STILL be in the queue, since the receiver has not consumed it.
+        assert_eq!(rx.len(), 1);
+
+        relay.connect();
+
+        let reply: DialReply = transport.next_dial().await;
+
+        assert!(reply.send(Ok(fake_connection())).is_ok());
+
+        wait_for_status(&relay, RelayStatus::Connected).await;
+
+        // Old "attempt" MUST NOT consume the message.
+        assert!(inner.recv_client_msg(&mut rx, &old_attempt).await.is_none());
+        assert_eq!(rx.len(), 1);
+
+        let current_attempt: Arc<ConnectionAttempt> =
+            inner.connection_state().attempt.clone().unwrap();
+
+        // The current "attempt" MUST consume the message.
+        let received: JsonMessageItem = inner
+            .recv_client_msg(&mut rx, &current_attempt)
+            .await
+            .unwrap();
+        assert_eq!(received.json, "queued message");
+        assert!(rx.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_connection_wakes_do_not_cancel_the_current_dial() {
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::new();
+
+        relay.connect();
+
+        let reply: DialReply = transport.next_dial().await;
+
+        for _ in 0..3 {
+            relay.inner.atomic.channels.connection_changed.notify_one();
+        }
+
+        assert!(reply.send(Ok(fake_connection())).is_ok());
+
+        wait_for_status(&relay, RelayStatus::Connected).await;
+
+        assert_eq!(relay.stats().attempts(), 1);
+        assert_eq!(relay.stats().success(), 1);
+
+        transport.assert_no_pending_dials();
+    }
+
+    #[tokio::test]
+    async fn wait_for_connection_waits_for_retry_but_returns_when_idle() {
+        let opts: RelayOptions = RelayOptions::default()
+            .adjust_retry_interval(false)
+            .retry_interval(Duration::from_secs(1));
+
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::with_opts(opts);
+
+        relay.connect();
+
+        assert!(
+            transport
+                .next_dial()
+                .await
+                .send(Err(Error::state_msg("retry")))
+                .is_ok()
+        );
+
+        wait_for_status(&relay, RelayStatus::Disconnected).await;
+
+        let mut waiting: BoxedFuture<'_, ()> = Box::pin(relay.wait_for_connection(TEST_TIMEOUT));
+
+        assert!(futures::poll!(waiting.as_mut()).is_pending());
+
+        relay.disconnect();
+
+        assert!(futures::poll!(waiting.as_mut()).is_ready());
+        assert_eq!(relay.status(), RelayStatus::Idle);
+        assert!(
+            futures::poll!(Box::pin(relay.wait_for_connection(TEST_TIMEOUT)).as_mut()).is_ready()
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnect_request_survives_websocket_close() {
+        reconnect_while_closing(RelayOptions::default(), ReconnectRequest::Background).await;
+    }
+
+    #[tokio::test]
+    async fn explicit_reconnect_survives_close_without_automatic_reconnect() {
+        reconnect_while_closing(
+            RelayOptions::default().reconnect(false),
+            ReconnectRequest::Background,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn try_connect_waits_for_websocket_close() {
+        reconnect_while_closing(
+            RelayOptions::default().reconnect(false),
+            ReconnectRequest::WaitForResult,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn callers_join_connection_policy_and_share_its_error() {
+        let (policy, mut checks) = ControlledConnectionPolicy::new();
+
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::with_policy(policy);
+
+        let first: TokioJoinHandle<Result<(), Error>> = start_try_connect(&relay, TEST_TIMEOUT);
+
+        let reply: PolicyReply = checks.next_check().await;
+
+        assert_eq!(relay.status(), RelayStatus::Connecting);
+
+        let mut second: BoxedFuture<'_, Result<(), Error>> =
+            Box::pin(relay.try_connect().timeout(TEST_TIMEOUT).into_future());
+        assert!(futures::poll!(second.as_mut()).is_pending());
+
+        let error: Error = Error::policy(IoError::other("policy failure"));
+        reply.send(Err(error)).unwrap();
+
+        for result in [first.await.unwrap(), second.await] {
+            let error: Error = result.unwrap_err();
+            assert_eq!(error.kind(), ErrorKind::Policy);
+            assert_eq!(error.to_string(), "policy failure");
+        }
+
+        assert_eq!(relay.status(), RelayStatus::Idle);
+        assert_eq!(relay.stats().attempts(), 0);
+
+        transport.assert_no_pending_dials();
+        checks.assert_no_pending_checks();
+    }
+
+    #[tokio::test]
+    async fn initial_try_connect_deadline_also_cancels_policy_check() {
+        let (policy, mut checks) = ControlledConnectionPolicy::new();
+
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::with_policy(policy);
+
+        let caller: TokioJoinHandle<Result<(), Error>> =
+            start_try_connect(&relay, Duration::from_millis(20));
+
+        let reply: PolicyReply = checks.next_check().await;
+
+        assert_eq!(
+            caller.await.unwrap().unwrap_err().kind(),
+            ErrorKind::Timeout
+        );
+
+        wait_for_status(&relay, RelayStatus::Idle).await;
+
+        assert!(reply.is_closed());
+        assert_eq!(relay.stats().attempts(), 0);
+        assert!(relay.inner.is_running());
+
+        transport.assert_no_pending_dials();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_try_connect_shares_transport_error_and_source() {
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::new();
+
+        let first: TokioJoinHandle<Result<(), Error>> = start_try_connect(&relay, TEST_TIMEOUT);
+        let reply: DialReply = transport.next_dial().await;
+
+        let mut second: BoxedFuture<'_, Result<(), Error>> =
+            Box::pin(relay.try_connect().timeout(TEST_TIMEOUT).into_future());
+        assert!(futures::poll!(second.as_mut()).is_pending());
+
+        let cause: IoError = IoError::new(IoErrorKind::ConnectionRefused, "refused");
+        let error: Error = Error::other(cause);
+        assert!(reply.send(Err(error)).is_ok());
+
+        for result in [first.await.unwrap(), second.await] {
+            let error: Error = result.unwrap_err();
+
+            assert_eq!(error.kind(), ErrorKind::Transport);
+            assert_eq!(error.to_string(), "refused");
+
+            let mut source: Option<&(dyn StdError + 'static)> = error.source();
+            while let Some(error) = source {
+                if let Some(error) = error.downcast_ref::<IoError>() {
+                    assert_eq!(error.kind(), IoErrorKind::ConnectionRefused);
+                    break;
+                }
+                source = error.source();
+            }
+
+            assert!(source.is_some(), "original transport source was lost");
+        }
+
+        assert_eq!(relay.status(), RelayStatus::Idle);
+        assert_eq!(relay.stats().attempts(), 1);
+        assert!(relay.inner.is_running());
+
+        transport.assert_no_pending_dials();
+    }
+
+    #[tokio::test]
+    async fn joining_caller_timeout_does_not_cancel_shared_dial() {
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::new();
+
+        let first: TokioJoinHandle<Result<(), Error>> = start_try_connect(&relay, TEST_TIMEOUT);
+        let reply: DialReply = transport.next_dial().await;
+
+        let error: Error = relay
+            .try_connect()
+            .timeout(Duration::from_millis(20))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::Timeout);
+        assert_eq!(relay.status(), RelayStatus::Connecting);
+        assert!(!reply.is_closed());
+
+        assert!(reply.send(Ok(fake_connection())).is_ok());
+        first.await.unwrap().unwrap();
+
+        assert_eq!(relay.status(), RelayStatus::Connected);
+        assert_eq!(relay.stats().attempts(), 1);
+    }
+
+    #[tokio::test]
+    async fn dropping_try_connect_only_stops_waiting() {
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::new();
+
+        let caller: TokioJoinHandle<Result<(), Error>> = start_try_connect(&relay, TEST_TIMEOUT);
+        let reply: DialReply = transport.next_dial().await;
+
+        caller.abort();
+
+        assert!(caller.await.unwrap_err().is_cancelled());
+        assert!(!reply.is_closed());
+
+        assert!(reply.send(Ok(fake_connection())).is_ok());
+
+        wait_for_status(&relay, RelayStatus::Connected).await;
+
+        assert_eq!(relay.stats().attempts(), 1);
+    }
+
+    #[tokio::test]
+    async fn initial_try_connect_timeout_leaves_task_idle_without_retries() {
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::new();
+
+        let caller: TokioJoinHandle<Result<(), Error>> =
+            start_try_connect(&relay, Duration::from_millis(20));
+        let reply: DialReply = transport.next_dial().await;
+
+        assert_eq!(
+            caller.await.unwrap().unwrap_err().kind(),
+            ErrorKind::Timeout
+        );
+
+        wait_for_status(&relay, RelayStatus::Idle).await;
+
+        assert!(reply.is_closed());
+        assert!(relay.inner.is_running());
+
+        transport.assert_no_pending_dials();
+
+        let handle: &JoinHandle<()> = relay.inner.atomic.connection_task_handle.get().unwrap();
+
+        let retry: TokioJoinHandle<Result<(), Error>> = start_try_connect(&relay, TEST_TIMEOUT);
+
+        assert!(
+            transport
+                .next_dial()
+                .await
+                .send(Ok(fake_connection()))
+                .is_ok()
+        );
+
+        retry.await.unwrap().unwrap();
+
+        assert_eq!(relay.stats().attempts(), 2);
+        assert!(ptr::eq(
+            handle,
+            relay.inner.atomic.connection_task_handle.get().unwrap()
+        ));
+    }
+
+    #[tokio::test]
+    async fn try_connect_timeout_includes_waiting_for_close() {
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::new();
+
+        let initial: TokioJoinHandle<Result<(), Error>> = start_try_connect(&relay, TEST_TIMEOUT);
+
+        let (connection, mut close_gate) = connection_gate_close(fake_connection());
+
+        assert!(transport.next_dial().await.send(Ok(connection)).is_ok());
+
+        initial.await.unwrap().unwrap();
+
+        relay.disconnect();
+
+        close_gate.wait_until_closing().await;
+
+        let error: Error = relay
+            .try_connect()
+            .timeout(Duration::from_millis(20))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::Timeout);
+
+        transport.assert_no_pending_dials();
+
+        close_gate.release();
+
+        wait_for_status(&relay, RelayStatus::Idle).await;
+
+        assert_eq!(relay.stats().attempts(), 1);
+    }
+
+    #[tokio::test]
+    async fn superseded_handshake_cannot_publish_connected() {
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::new();
+
+        let first: TokioJoinHandle<Result<(), Error>> = start_try_connect(&relay, TEST_TIMEOUT);
+        let reply: DialReply = transport.next_dial().await;
+
+        let mut updates: BroadcastReceiver<RelayNotification> =
+            relay.inner.internal_notification_sender.subscribe();
+
+        // Replace the attempt without yielding after completing its handshake,
+        // so the connection task cannot accept the superseded connection.
+        assert!(reply.send(Ok(fake_connection())).is_ok());
+
+        relay.disconnect();
+        relay.connect();
+        relay.disconnect();
+        relay.connect();
+
+        let second: DialReply = transport.next_dial().await;
+
+        assert_eq!(
+            first.await.unwrap().unwrap_err().kind(),
+            ErrorKind::Rejected
+        );
+        assert_eq!(relay.stats().success(), 0);
+
+        while let Ok(notification) = updates.try_recv() {
+            assert!(!matches!(
+                notification,
+                RelayNotification::RelayStatus {
+                    status: RelayStatus::Connected
+                }
+            ));
+        }
+
+        assert!(second.send(Ok(fake_connection())).is_ok());
+
+        wait_for_status(&relay, RelayStatus::Connected).await;
+
+        assert_eq!(relay.stats().attempts(), 2);
+        assert_eq!(relay.stats().success(), 1);
+
+        transport.assert_no_pending_dials();
+    }
+
+    #[tokio::test]
+    async fn try_connect_joins_next_scheduled_retry() {
+        let opts: RelayOptions = RelayOptions::default()
+            .adjust_retry_interval(false)
+            .retry_interval(Duration::from_secs(1));
+
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::with_opts(opts);
+
+        relay.connect();
+
+        assert!(
+            transport
+                .next_dial()
+                .await
+                .send(Err(Error::state_msg("first failure")))
+                .is_ok()
+        );
+
+        wait_for_status(&relay, RelayStatus::Disconnected).await;
+
+        let mut caller: BoxedFuture<'_, Result<(), Error>> =
+            Box::pin(relay.try_connect().timeout(TEST_TIMEOUT).into_future());
+
+        assert!(futures::poll!(caller.as_mut()).is_pending());
+        transport.assert_no_pending_dials();
+        assert!(
+            transport
+                .next_dial()
+                .await
+                .send(Ok(fake_connection()))
+                .is_ok()
+        );
+
+        caller.await.unwrap();
+
+        assert_eq!(relay.stats().attempts(), 2);
+    }
+
+    #[tokio::test]
+    async fn terminal_operations_cancel_pending_reconnects_and_stop_task() {
+        for terminal in [RelayStatus::Banned, RelayStatus::Shutdown] {
+            let ControlledRelay {
+                relay,
+                mut transport,
+            } = ControlledRelay::new();
+
+            let first: TokioJoinHandle<Result<(), Error>> = start_try_connect(&relay, TEST_TIMEOUT);
+            let (connection, mut close_gate) = connection_gate_close(fake_connection());
+
+            assert!(transport.next_dial().await.send(Ok(connection)).is_ok());
+
+            first.await.unwrap().unwrap();
+
+            relay.disconnect();
+            close_gate.wait_until_closing().await;
+
+            let mut pending: BoxedFuture<'_, Result<(), Error>> =
+                Box::pin(relay.try_connect().timeout(TEST_TIMEOUT).into_future());
+
+            assert!(futures::poll!(pending.as_mut()).is_pending());
+
+            match terminal {
+                RelayStatus::Banned => relay.ban(),
+                _ => relay.shutdown(),
+            }
+            let error: Error = pending.await.unwrap_err();
+
+            assert_eq!(error.kind(), ErrorKind::State);
+            assert_eq!(
+                error.to_string(),
+                match terminal {
+                    RelayStatus::Banned => "relay banned",
+                    _ => "shutdown",
+                }
+            );
+
+            wait_for_task_exit(&relay.inner).await;
+
+            assert!(close_gate.is_cancelled());
+
+            relay.connect();
+
+            assert_eq!(relay.status(), terminal);
+            assert!(relay.inner.connection_state().attempt.is_none());
+            assert_eq!(relay.stats().attempts(), 1);
+
+            transport.assert_no_pending_dials();
+        }
+    }
+
+    #[tokio::test]
+    async fn ban_and_shutdown_stop_idle_tasks() {
+        for terminal in [RelayStatus::Banned, RelayStatus::Shutdown] {
+            for idle in [RelayStatus::Idle, RelayStatus::Sleeping] {
+                let opts: RelayOptions =
+                    RelayOptions::default().sleep_when_idle(SleepWhenIdle::Enabled {
+                        timeout: Duration::ZERO,
+                    });
+
+                let ControlledRelay {
+                    relay,
+                    mut transport,
+                } = ControlledRelay::with_opts(opts);
+
+                let first: TokioJoinHandle<Result<(), Error>> =
+                    start_try_connect(&relay, TEST_TIMEOUT);
+
+                assert!(
+                    transport
+                        .next_dial()
+                        .await
+                        .send(Ok(fake_connection()))
+                        .is_ok()
+                );
+
+                first.await.unwrap().unwrap();
+
+                match idle {
+                    RelayStatus::Sleeping => wait_for_status(&relay, idle).await,
+                    _ => relay.disconnect(),
+                }
+
+                match terminal {
+                    RelayStatus::Banned => relay.ban(),
+                    _ => relay.shutdown(),
+                }
+
+                wait_for_task_exit(&relay.inner).await;
+
+                assert_eq!(relay.status(), terminal);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn last_drop_shuts_down_idle_connection_task() {
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::new();
+
+        let first: TokioJoinHandle<Result<(), Error>> = start_try_connect(&relay, TEST_TIMEOUT);
+
+        assert!(
+            transport
+                .next_dial()
+                .await
+                .send(Ok(fake_connection()))
+                .is_ok()
+        );
+
+        first.await.unwrap().unwrap();
+
+        relay.disconnect();
+
+        let inner: InnerRelay = relay.inner.clone();
+        let clone: Relay = relay.clone();
+
+        drop(relay);
+
+        assert_eq!(inner.status(), RelayStatus::Idle);
+        assert!(inner.is_running());
+
+        drop(clone);
+        wait_for_task_exit(&inner).await;
+
+        assert_eq!(inner.status(), RelayStatus::Shutdown);
+        assert_eq!(Arc::strong_count(&inner.atomic), 1);
+    }
+
+    #[tokio::test]
+    async fn disconnect_before_first_connect_does_not_cancel_new_attempt() {
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::with_opts(RelayOptions::default().reconnect(false));
+
+        relay.disconnect();
+        relay.connect();
+
+        assert!(
+            transport
+                .next_dial()
+                .await
+                .send(Ok(fake_connection()))
+                .is_ok()
+        );
+
+        wait_for_status(&relay, RelayStatus::Connected).await;
+
+        assert_eq!(relay.stats().attempts(), 1);
+        assert_eq!(relay.stats().success(), 1);
+    }
+
+    #[tokio::test]
+    async fn subscription_restoration_uses_connection_counter() {
+        let relay: Relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
+
+        let id: SubscriptionId = SubscriptionId::new("generation");
+        let filters: Vec<Filter> = vec![Filter::new().kind(Kind::TextNote)];
+        relay
+            .inner
+            .add_long_lived_subscription(id.clone(), filters.clone())
+            .await
+            .unwrap();
+
+        relay.inner.stats.new_success();
+
+        assert!(!relay.inner.should_resubscribe(&id).await);
+
+        relay.inner.stats.new_success();
+
+        assert!(relay.inner.should_resubscribe(&id).await);
+
+        relay
+            .inner
+            .update_subscription(&id, filters, true)
+            .await
+            .unwrap();
+
+        assert!(!relay.inner.should_resubscribe(&id).await);
+
+        relay.inner.stats.new_success();
+
+        assert!(relay.inner.should_resubscribe(&id).await);
+    }
+
+    enum QueuedReq {
+        Subscribe,
+        CloseAndReq,
+    }
+
+    /// Replies like a relay that rejects a REQ for an already-open subscription ID.
+    fn reply_rejecting_duplicate_reqs(connection: &RecordedConnection, frames: &[String]) {
+        let mut open: HashSet<SubscriptionId> = HashSet::new();
+
+        for frame in frames {
+            match ClientMessage::from_json(frame) {
+                Ok(ClientMessage::Req {
+                    subscription_id, ..
+                }) => {
+                    let id: SubscriptionId = subscription_id.into_owned();
+                    let reply: RelayMessage = if open.insert(id.clone()) {
+                        RelayMessage::eose(id)
+                    } else {
+                        RelayMessage::closed(id, "duplicate: subscription already open")
+                    };
+                    connection.reply(reply);
+                }
+                Ok(ClientMessage::Close(id)) => {
+                    open.remove(id.as_ref());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Waits until the frames queued so far are written, and returns the barrier ID.
+    async fn flush_outbound(relay: &Relay) -> SubscriptionId {
+        let barrier: SubscriptionId = SubscriptionId::new("barrier");
+        relay
+            .send_msg(ClientMessage::close(barrier.clone()))
+            .wait_until_sent(TEST_TIMEOUT)
+            .await
+            .unwrap();
+        barrier
+    }
+
+    async fn queued_req_is_sent_once_after_reconnect(queued: QueuedReq) {
+        let opts: RelayOptions = RelayOptions::default()
+            .adjust_retry_interval(false)
+            .retry_interval(Duration::from_secs(1));
+
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::with_opts(opts);
+
+        let id: SubscriptionId = SubscriptionId::new("live");
+        let filter: Filter = Filter::new().kind(Kind::TextNote);
+
+        relay.connect();
+
+        let (connection, first) = recording_connection();
+        assert!(transport.next_dial().await.send(Ok(connection)).is_ok());
+        wait_for_status(&relay, RelayStatus::Connected).await;
+
+        if let QueuedReq::CloseAndReq = queued {
+            relay
+                .subscribe(filter.clone())
+                .with_id(id.clone())
+                .await
+                .unwrap();
+        }
+
+        // Otherwise an unwritten REQ would be carried over to the next session.
+        flush_outbound(&relay).await;
+        first.close();
+        wait_for_status(&relay, RelayStatus::Disconnected).await;
+
+        match queued {
+            QueuedReq::Subscribe => {
+                relay
+                    .subscribe(filter.clone())
+                    .with_id(id.clone())
+                    .await
+                    .unwrap();
+            }
+            QueuedReq::CloseAndReq => {
+                relay
+                    .send_msg(ClientMessage::close(id.clone()))
+                    .await
+                    .unwrap();
+                relay
+                    .send_msg(ClientMessage::req(id.clone(), filter))
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let (connection, mut second) = recording_connection();
+        assert!(transport.next_dial().await.send(Ok(connection)).is_ok());
+        wait_for_status(&relay, RelayStatus::Connected).await;
+
+        // Restored and queued frames precede the barrier in the outbound channel.
+        let barrier: SubscriptionId = flush_outbound(&relay).await;
+
+        let frames: Vec<String> = second.sent_text();
+        let reqs: usize = frames
+            .iter()
+            .filter(|frame| frame.starts_with(r#"["REQ","live""#))
+            .count();
+        assert_eq!(reqs, 1, "frames on reconnected session: {frames:?}");
+
+        let mut notifications: NotificationStream<RelayNotification> = relay.notifications();
+        reply_rejecting_duplicate_reqs(&second, &frames);
+        second.reply(RelayMessage::eose(barrier.clone()));
+        wait_for_eose(&mut notifications, &barrier).await;
+
+        assert!(relay.inner.has_subscription(&id).await);
+        assert!(!relay.inner.should_resubscribe(&id).await);
+    }
+
+    #[tokio::test]
+    async fn subscription_queued_before_disconnect_is_sent_once_after_reconnect() {
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::new();
+        let id: SubscriptionId = SubscriptionId::new("live");
+        let filter: Filter = Filter::new().kind(Kind::TextNote);
+
+        relay.connect();
+
+        let (connection, mut first) = recording_connection();
+        let reply: DialReply = transport.next_dial().await;
+
+        assert!(reply.send(Ok(connection)).is_ok());
+
+        wait_for_status(&relay, RelayStatus::Connected).await;
+        flush_outbound(&relay).await;
+        first.sent_text();
+
+        relay
+            .subscribe(filter.clone())
+            .with_id(id.clone())
+            .await
+            .unwrap();
+
+        // Do not yield between queueing the REQ and invalidating the sender.
+        relay.disconnect();
+        relay.connect();
+
+        let (connection, mut second) = recording_connection();
+        let reply: DialReply = transport.next_dial().await;
+
+        assert!(reply.send(Ok(connection)).is_ok());
+
+        wait_for_status(&relay, RelayStatus::Connected).await;
+        flush_outbound(&relay).await;
+
+        assert!(first.sent_text().is_empty());
+
+        let expected: String = ClientMessage::req(id.clone(), filter).as_json();
+        let frames: Vec<String> = second.sent_text();
+
+        assert_eq!(
+            frames.iter().filter(|frame| **frame == expected).count(),
+            1,
+            "frames on reconnected session: {frames:?}"
+        );
+        assert!(relay.subscription(&id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn subscription_queued_while_disconnected_is_sent_once() {
+        queued_req_is_sent_once_after_reconnect(QueuedReq::Subscribe).await;
+    }
+
+    #[tokio::test]
+    async fn close_and_req_queued_while_disconnected_are_sent_once() {
+        queued_req_is_sent_once_after_reconnect(QueuedReq::CloseAndReq).await;
+    }
+
+    #[tokio::test]
+    async fn failed_req_queue_keeps_subscription_restorable() {
+        let opts: RelayOptions = RelayOptions::default()
+            .adjust_retry_interval(false)
+            .retry_interval(Duration::from_secs(1));
+
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::with_opts(opts);
+
+        let filter: Filter = Filter::new().kind(Kind::TextNote);
+
+        relay.connect();
+
+        let (connection, first) = recording_connection();
+        assert!(transport.next_dial().await.send(Ok(connection)).is_ok());
+        wait_for_status(&relay, RelayStatus::Connected).await;
+
+        let id: SubscriptionId = relay.subscribe(filter.clone()).await.unwrap();
+        flush_outbound(&relay).await;
+        first.close();
+        wait_for_status(&relay, RelayStatus::Disconnected).await;
+
+        relay.inner.subscription_closed(&id).await;
+
+        // Fill the outbound channel so the REQ can't be queued.
+        while relay
+            .send_msg(ClientMessage::close(SubscriptionId::new("filler")))
+            .await
+            .is_ok()
+        {}
+
+        assert!(
+            relay
+                .send_msg(ClientMessage::req(id.clone(), filter))
+                .await
+                .is_err()
+        );
+
+        let subscriptions = relay.inner.atomic.subscriptions.read().await;
+        let data: &SubscriptionData = subscriptions.get(&id).unwrap();
+        assert_eq!(data.subscribed_connection, 1);
+        assert!(data.closed);
+        assert!(!data.pending_req_counter.as_ref().unwrap().has_pending());
+        drop(subscriptions);
+
+        assert!(relay.inner.should_resubscribe(&id).await);
+    }
+
+    #[tokio::test]
+    async fn queued_req_resets_limit_tracking_when_dispatched_on_next_session() {
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::with_opts(RelayOptions::default().verify_subscriptions(true));
+        let id: SubscriptionId = SubscriptionId::new("live");
+        let filter: Filter = Filter::new().kind(Kind::TextNote).limit(1);
+
+        relay.connect();
+
+        let (connection, first) = recording_connection();
+        assert!(transport.next_dial().await.send(Ok(connection)).is_ok());
+        wait_for_status(&relay, RelayStatus::Connected).await;
+
+        relay
+            .subscribe(filter.clone())
+            .with_id(id.clone())
+            .await
+            .unwrap();
+        flush_outbound(&relay).await;
+
+        let mut notifications = relay.notifications();
+        let event = EventBuilder::new(Kind::TextNote, "stored event")
+            .finalize(&Keys::generate())
+            .unwrap();
+        first.reply(RelayMessage::event(id.clone(), event));
+        first.reply(RelayMessage::eose(id.clone()));
+        wait_for_eose(&mut notifications, &id).await;
+
+        relay.disconnect();
+        relay
+            .send_msg(ClientMessage::req(id.clone(), filter))
+            .await
+            .unwrap();
+
+        // Queueing alone must leave the previous query's tracking intact.
+        {
+            let subscriptions = relay.inner.atomic.subscriptions.read().await;
+            let data = subscriptions.get(&id).unwrap();
+            assert!(data.received_eose);
+            assert_eq!(data.received_events.load(Ordering::SeqCst), 1);
+        }
+
+        relay.connect();
+
+        let (connection, _second) = recording_connection();
+        assert!(transport.next_dial().await.send(Ok(connection)).is_ok());
+        wait_for_status(&relay, RelayStatus::Connected).await;
+        flush_outbound(&relay).await;
+
+        let subscriptions = relay.inner.atomic.subscriptions.read().await;
+        let data: &SubscriptionData = subscriptions.get(&id).unwrap();
+        assert_eq!(data.subscribed_connection, 2);
+        assert!(!data.received_eose);
+        assert_eq!(data.received_events.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn pending_req_counter_does_not_underflow() {
+        let counter = PendingReqCounter::default();
+
+        counter.decrement();
+        counter.decrement();
+
+        assert!(!counter.has_pending());
+    }
+
+    #[test]
+    fn pending_req_counter_tracks_requests_until_all_are_dropped() {
+        let counter = PendingReqCounter::default();
+        let id = SubscriptionId::new("live");
+        let first = counter.track(id.clone());
+        let second = counter.track(id);
+
+        assert!(counter.has_pending());
+
+        drop(first);
+
+        assert!(counter.has_pending());
+
+        drop(second);
+
+        assert!(!counter.has_pending());
+    }
+
+    #[tokio::test]
+    async fn cancelled_req_dispatch_releases_pending_count() {
+        let controlled = ControlledRelay::new();
+        let relay = &controlled.relay;
+        let mut queue = relay.inner.atomic.channels.rx_nostr().await;
+
+        relay.connect();
+        let id = relay.subscribe(Filter::new()).await.unwrap();
+        let request = queue.try_recv().unwrap().pending_req.unwrap();
+
+        // Make dispatch wait for the subscription lock, then cancel it.
+        let subscriptions = relay.inner.atomic.subscriptions.read().await;
+        let data = subscriptions.get(&id).unwrap();
+        let pending_count = data.pending_req_counter.as_ref().unwrap();
+        let mut dispatch = Box::pin(async move {
+            relay.inner.subscription_req_started(&request).await;
+        });
+        assert!(futures::poll!(dispatch.as_mut()).is_pending());
+        assert!(pending_count.has_pending());
+
+        drop(dispatch);
+
+        assert!(!pending_count.has_pending());
+    }
+
+    #[tokio::test]
+    async fn old_queued_req_does_not_update_reused_subscription_id() {
+        let controlled = ControlledRelay::new();
+        let relay = &controlled.relay;
+        let mut queue = relay.inner.atomic.channels.rx_nostr().await;
+        let id = SubscriptionId::new("reused");
+
+        relay.connect();
+        relay
+            .subscribe(Filter::new())
+            .with_id(id.clone())
+            .await
+            .unwrap();
+        let old_request = queue.try_recv().unwrap().pending_req.unwrap();
+
+        relay.unsubscribe(&id).await.unwrap();
+        relay
+            .subscribe(Filter::new())
+            .with_id(id.clone())
+            .await
+            .unwrap();
+
+        relay.inner.subscription_req_started(&old_request).await;
+        drop(old_request);
+
+        let subscriptions = relay.inner.atomic.subscriptions.read().await;
+        let data = subscriptions.get(&id).unwrap();
+        assert_eq!(data.subscribed_connection, 1);
+        assert!(data.pending_req_counter.as_ref().unwrap().has_pending());
+    }
+
+    #[tokio::test]
+    async fn subscription_queued_before_first_connection_is_sent_once() {
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::new();
+
+        relay.connect();
+
+        let reply: DialReply = transport.next_dial().await;
+
+        let id: SubscriptionId = relay
+            .subscribe(Filter::new().kind(Kind::TextNote))
+            .await
+            .unwrap();
+
+        let (connection, mut recorded) = recording_connection();
+        assert!(reply.send(Ok(connection)).is_ok());
+        wait_for_status(&relay, RelayStatus::Connected).await;
+
+        flush_outbound(&relay).await;
+
+        let req: String = format!(r#"["REQ","{id}""#);
+        let frames: Vec<String> = recorded.sent_text();
+        let reqs: usize = frames
+            .iter()
+            .filter(|frame| frame.starts_with(&req))
+            .count();
+        assert_eq!(reqs, 1, "frames on first session: {frames:?}");
+    }
+
+    #[tokio::test]
+    async fn auto_closing_lag_before_eose_is_not_completion() {
+        let relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
+        let id = SubscriptionId::new("lagged-before-eose");
+        let (tx, rx) = broadcast::channel(2);
+        for _ in 0..8 {
+            tx.send(RelayNotification::Authenticated).unwrap();
+        }
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::EndOfStoredEvents(Cow::Owned(id.clone()))),
+        })
+        .unwrap();
+
+        let result = relay
+            .inner
+            .handle_auto_closing(
+                &id,
+                &[Filter::new()],
+                SubscribeAutoCloseOptions::default(),
+                rx,
+                &None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result.reason,
+            Some(SubscriptionAutoClosedReason::Lagged(skipped)) if skipped > 0
+        ));
+    }
+
+    #[tokio::test]
+    async fn auto_closing_receiver_closure_is_not_completion() {
+        let relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
+        let id = SubscriptionId::new("closed-receiver");
+        let (tx, rx) = broadcast::channel(2);
+        drop(tx);
+
+        let result = relay
+            .inner
+            .handle_auto_closing(
+                &id,
+                &[Filter::new()],
+                SubscribeAutoCloseOptions::default(),
+                rx,
+                &None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result.reason,
+            Some(SubscriptionAutoClosedReason::ReceiverClosed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn post_eose_grace_lag_is_not_completion() {
+        let id = SubscriptionId::new("grace-lag");
+        let (tx, mut rx) = broadcast::channel(2);
+        for _ in 0..8 {
+            tx.send(RelayNotification::Authenticated).unwrap();
+        }
+
+        let reason = post_eose_grace(&id, Duration::from_secs(2), &mut rx, &None, true).await;
+        assert!(matches!(
+            reason,
+            Some(SubscriptionAutoClosedReason::Lagged(skipped)) if skipped > 0
+        ));
+    }
+
+    #[tokio::test]
+    async fn auto_closing_eose_and_limit_have_distinct_reasons() {
+        let relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
+        let id = SubscriptionId::new("completed-eose");
+        let (tx, rx) = broadcast::channel(2);
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::EndOfStoredEvents(Cow::Owned(id.clone()))),
+        })
+        .unwrap();
+        let result = relay
+            .inner
+            .handle_auto_closing(
+                &id,
+                &[Filter::new()],
+                SubscribeAutoCloseOptions::default(),
+                rx,
+                &None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result.reason,
+            Some(SubscriptionAutoClosedReason::Completed)
+        ));
+
+        let id = SubscriptionId::new("reached-limit");
+        let (tx, rx) = broadcast::channel(2);
+        let event = EventBuilder::new(Kind::TextNote, "limit")
+            .finalize(&Keys::generate())
+            .unwrap();
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::Event {
+                subscription_id: Cow::Owned(id.clone()),
+                event: Cow::Owned(event),
+            }),
+        })
+        .unwrap();
+        let result = relay
+            .inner
+            .handle_auto_closing(
+                &id,
+                &[Filter::new()],
+                SubscribeAutoCloseOptions::default().exit_policy(ReqExitPolicy::WaitForEvents(1)),
+                rx,
+                &None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result.reason,
+            Some(SubscriptionAutoClosedReason::LimitReached)
+        ));
+    }
+
+    #[tokio::test]
+    async fn reporting_grace_does_not_complete_on_matching_closed() {
+        let relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
+        let id = SubscriptionId::generate();
+        let (tx, rx) = broadcast::channel(4);
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::EndOfStoredEvents(Cow::Owned(id.clone()))),
+        })
+        .unwrap();
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::Closed {
+                subscription_id: Cow::Owned(SubscriptionId::generate()),
+                message: Cow::Borrowed("unrelated"),
+            }),
+        })
+        .unwrap();
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::Closed {
+                subscription_id: Cow::Owned(id.clone()),
+                message: Cow::Borrowed("grace interrupted"),
+            }),
+        })
+        .unwrap();
+        let result = relay
+            .inner
+            .handle_auto_closing(
+                &id,
+                &[Filter::new()],
+                SubscribeAutoCloseOptions::default()
+                    .exit_policy(ReqExitPolicy::WaitDurationAfterEOSE(Duration::from_secs(2)))
+                    .report_relay_closed(true),
+                rx,
+                &None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result.reason,
+            Some(SubscriptionAutoClosedReason::RelayClosed(ref reason)) if reason == "grace interrupted"
+        ));
+    }
+
+    #[tokio::test]
+    async fn reporting_request_does_not_complete_on_early_unprefixed_closed() {
+        let relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
+        for (policy, message) in [
+            (ReqExitPolicy::ExitOnEOSE, "temporarily unavailable"),
+            (ReqExitPolicy::WaitForEvents(2), ""),
+        ] {
+            let id = SubscriptionId::generate();
+            let (tx, rx) = broadcast::channel(2);
+            tx.send(RelayNotification::Message {
+                message: Box::new(RelayMessage::Closed {
+                    subscription_id: Cow::Owned(id.clone()),
+                    message: Cow::Borrowed(message),
+                }),
+            })
+            .unwrap();
+            let result = relay
+                .inner
+                .handle_auto_closing(
+                    &id,
+                    &[Filter::new()],
+                    SubscribeAutoCloseOptions::default()
+                        .exit_policy(policy)
+                        .report_relay_closed(true),
+                    rx,
+                    &None,
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                result.reason,
+                Some(SubscriptionAutoClosedReason::RelayClosed(ref reason)) if reason == message
+            ));
+        }
+
+        let id = SubscriptionId::generate();
+        let (tx, rx) = broadcast::channel(2);
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::Closed {
+                subscription_id: Cow::Owned(id.clone()),
+                message: Cow::Borrowed("legacy shortcut"),
+            }),
+        })
+        .unwrap();
+        let result = relay
+            .inner
+            .handle_auto_closing(
+                &id,
+                &[Filter::new()],
+                SubscribeAutoCloseOptions::default(),
+                rx,
+                &None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result.reason,
+            Some(SubscriptionAutoClosedReason::Completed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn acquisition_first_does_not_steal_live_first_sighting() {
+        let url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let mut relay = Relay::builder(url)
+            .opts(RelayOptions::default().verify_subscriptions(true))
+            .build();
+        let (sender, mut notifications) = broadcast::channel(8);
+        relay.set_notification_sender(sender);
+        let event = EventBuilder::new(Kind::TextNote, "acquired then live")
+            .finalize(&Keys::generate())
+            .unwrap();
+        let filter = Filter::new().id(event.id);
+        let acquire_id = relay.inner.acquisition_subscription_id();
+        relay
+            .inner
+            .add_acquisition_subscription(acquire_id.clone(), vec![filter.clone()])
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            relay
+                .inner
+                .handle_event_msg(acquire_id.clone(), event.clone())
+                .await
+                .unwrap(),
+            Some(RelayMessage::Event { .. })
+        ));
+        assert_eq!(
+            relay
+                .inner
+                .state
+                .database()
+                .check_id(&event.id)
+                .await
+                .unwrap(),
+            DatabaseEventStatus::NotExistent
+        );
+        assert!(matches!(
+            notifications.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        let live_id = SubscriptionId::new("live");
+        relay
+            .inner
+            .add_long_lived_subscription(live_id.clone(), vec![filter])
+            .await
+            .unwrap();
+        relay
+            .inner
+            .handle_event_msg(live_id.clone(), event.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            relay
+                .inner
+                .state
+                .database()
+                .check_id(&event.id)
+                .await
+                .unwrap(),
+            DatabaseEventStatus::Saved
+        );
+        assert!(matches!(
+            notifications.try_recv(),
+            Ok(ClientNotification::Event { subscription_id, event: received, .. })
+                if subscription_id == live_id && received.id == event.id
+        ));
+        relay
+            .inner
+            .handle_event_msg(acquire_id, event)
+            .await
+            .unwrap();
+        assert!(matches!(
+            notifications.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn acquisition_still_rejects_invalid_signature_and_filter_mismatch() {
+        let relay = Relay::builder(RelayUrl::parse("wss://relay.example.com").unwrap())
+            .opts(RelayOptions::default().verify_subscriptions(true))
+            .build();
+        let event = EventBuilder::new(Kind::TextNote, "valid")
+            .finalize(&Keys::generate())
+            .unwrap();
+        let id = relay.inner.acquisition_subscription_id();
+        relay
+            .inner
+            .add_acquisition_subscription(id.clone(), vec![Filter::new().id(event.id)])
+            .await
+            .unwrap();
+        let mut forged = event.clone();
+        forged.content = "forged".into();
+        assert!(
+            relay
+                .inner
+                .handle_event_msg(id.clone(), forged)
+                .await
+                .is_err()
+        );
+        let unrelated = EventBuilder::new(Kind::TextNote, "unrelated")
+            .finalize(&Keys::generate())
+            .unwrap();
+        assert!(
+            relay
+                .inner
+                .handle_event_msg(id.clone(), unrelated.clone())
+                .await
+                .is_err()
+        );
+        for event in [event, unrelated] {
+            assert_eq!(
+                relay
+                    .inner
+                    .state
+                    .database()
+                    .check_id(&event.id)
+                    .await
+                    .unwrap(),
+                DatabaseEventStatus::NotExistent
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn late_acquisition_id_is_discarded_without_changing_raw_req_ids() {
+        let url = RelayUrl::parse("wss://relay.example.com").unwrap();
+        let mut relay = Relay::new(url.clone());
+        let (sender, mut notifications) = broadcast::channel(8);
+        relay.set_notification_sender(sender);
+        let other = Relay::new(url);
+        let event = EventBuilder::new(Kind::TextNote, "late")
+            .finalize(&Keys::generate())
+            .unwrap();
+        let id = relay.inner.acquisition_subscription_id();
+        relay
+            .inner
+            .add_acquisition_subscription(id.clone(), vec![Filter::new().id(event.id)])
+            .await
+            .unwrap();
+        relay.inner.remove_subscription(&id).await;
+        assert!(
+            relay
+                .inner
+                .handle_event_msg(id.clone(), event.clone())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            relay
+                .inner
+                .state
+                .database()
+                .check_id(&event.id)
+                .await
+                .unwrap(),
+            DatabaseEventStatus::NotExistent
+        );
+        assert!(matches!(
+            notifications.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        // The namespace belongs to one relay instance, including its clones
+        // and reconnects. Another relay's raw REQ retains prior behavior.
+        assert!(matches!(
+            other
+                .inner
+                .handle_event_msg(id, event.clone())
+                .await
+                .unwrap(),
+            Some(RelayMessage::Event { .. })
+        ));
+        assert_eq!(
+            other
+                .inner
+                .state
+                .database()
+                .check_id(&event.id)
+                .await
+                .unwrap(),
+            DatabaseEventStatus::Saved
+        );
+        let raw = EventBuilder::new(Kind::TextNote, "raw request")
+            .finalize(&Keys::generate())
+            .unwrap();
+        relay
+            .inner
+            .handle_event_msg(SubscriptionId::new("sdk-acq-user-chosen"), raw.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            relay
+                .inner
+                .state
+                .database()
+                .check_id(&raw.id)
+                .await
+                .unwrap(),
+            DatabaseEventStatus::Saved
+        );
+        assert!(matches!(
+            notifications.try_recv(),
+            Ok(ClientNotification::Event { event: received, .. }) if received.id == raw.id
+        ));
+
+        // A registered caller auto-close using a colliding private-prefix ID
+        // retains its ordinary behavior; registration, not spelling, owns it.
+        let caller = EventBuilder::new(Kind::TextNote, "caller registration")
+            .finalize(&Keys::generate())
+            .unwrap();
+        let caller_id = relay.inner.acquisition_subscription_id();
+        relay
+            .inner
+            .add_auto_closing_subscription(caller_id.clone(), vec![Filter::new().id(caller.id)])
+            .await
+            .unwrap();
+        relay
+            .inner
+            .handle_event_msg(caller_id.clone(), caller.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            relay
+                .inner
+                .state
+                .database()
+                .check_id(&caller.id)
+                .await
+                .unwrap(),
+            DatabaseEventStatus::Saved
+        );
+        assert!(matches!(
+            notifications.try_recv(),
+            Ok(ClientNotification::Event { subscription_id, event: received, .. })
+                if subscription_id == caller_id && received.id == caller.id
+        ));
+
+        let mut limits = RelayLimits::default();
+        limits.events.max_size = Some(1);
+        let limited = Relay::builder(RelayUrl::parse("wss://limited.example.com").unwrap())
+            .opts(RelayOptions::default().limits(limits))
+            .build();
+        let late_id = limited.inner.acquisition_subscription_id();
+        limited
+            .inner
+            .add_acquisition_subscription(late_id.clone(), vec![Filter::new().id(event.id)])
+            .await
+            .unwrap();
+        limited.inner.remove_subscription(&late_id).await;
+        assert!(
+            limited
+                .inner
+                .handle_event_msg(late_id, event)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn req_resent_on_same_connection_resets_limit_tracking_when_dispatched() {
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::with_opts(RelayOptions::default().verify_subscriptions(true));
+        let id: SubscriptionId = SubscriptionId::new("live");
+        let filter: Filter = Filter::new().kind(Kind::TextNote).limit(1);
+
+        relay.connect();
+
+        let (connection, recorded) = recording_connection();
+        assert!(transport.next_dial().await.send(Ok(connection)).is_ok());
+        wait_for_status(&relay, RelayStatus::Connected).await;
+
+        relay
+            .subscribe(filter.clone())
+            .with_id(id.clone())
+            .await
+            .unwrap();
+        flush_outbound(&relay).await;
+
+        let mut notifications: NotificationStream<RelayNotification> = relay.notifications();
+        let event: Event = EventBuilder::new(Kind::TextNote, "stored event")
+            .finalize(&Keys::generate())
+            .unwrap();
+        recorded.reply(RelayMessage::event(id.clone(), event));
+        recorded.reply(RelayMessage::eose(id.clone()));
+        wait_for_eose(&mut notifications, &id).await;
+
+        relay
+            .send_msg(ClientMessage::close(id.clone()))
+            .await
+            .unwrap();
+        relay
+            .send_msg(ClientMessage::req(id.clone(), filter))
+            .await
+            .unwrap();
+        flush_outbound(&relay).await;
+
+        // The relay answers the new REQ with a new stored-events query.
+        let subscriptions = relay.inner.atomic.subscriptions.read().await;
+        let data: &SubscriptionData = subscriptions.get(&id).unwrap();
+        assert_eq!(data.subscribed_connection, 1);
+        assert!(!data.received_eose);
+        assert_eq!(data.received_events.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn subscription_received_eose_tracks_current_req() {
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::new();
+        let id: SubscriptionId = SubscriptionId::new("live");
+
+        assert_eq!(relay.subscription_received_eose(&id).await, None);
+
+        relay.connect();
+
+        let (connection, recorded) = recording_connection();
+        assert!(transport.next_dial().await.send(Ok(connection)).is_ok());
+        wait_for_status(&relay, RelayStatus::Connected).await;
+
+        relay
+            .subscribe(Filter::new().kind(Kind::TextNote))
+            .with_id(id.clone())
+            .await
+            .unwrap();
+        flush_outbound(&relay).await;
+
+        assert_eq!(relay.subscription_received_eose(&id).await, Some(false));
+
+        let mut notifications: NotificationStream<RelayNotification> = relay.notifications();
+        recorded.reply(RelayMessage::eose(id.clone()));
+        wait_for_eose(&mut notifications, &id).await;
+
+        assert_eq!(relay.subscription_received_eose(&id).await, Some(true));
+    }
+
+    /// Returns the `CLOSE` and `REQ` messages that reissue the subscription.
+    fn reissue_batch(id: &SubscriptionId, filter: &Filter) -> Vec<ClientMessage<'static>> {
+        vec![
+            ClientMessage::close(id.clone()),
+            ClientMessage::req(id.clone(), filter.clone()),
+        ]
+    }
+
+    #[tokio::test]
+    async fn batch_reissue_restarts_eose_and_limit_tracking() {
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::with_opts(RelayOptions::default().verify_subscriptions(true));
+        let id: SubscriptionId = SubscriptionId::new("live");
+        let filter: Filter = Filter::new().kind(Kind::TextNote).limit(1);
+
+        relay.connect();
+
+        let (connection, mut recorded) = recording_connection();
+        assert!(transport.next_dial().await.send(Ok(connection)).is_ok());
+        wait_for_status(&relay, RelayStatus::Connected).await;
+
+        relay
+            .subscribe(filter.clone())
+            .with_id(id.clone())
+            .await
+            .unwrap();
+        flush_outbound(&relay).await;
+        recorded.sent_text();
+
+        let mut notifications: NotificationStream<RelayNotification> = relay.notifications();
+        let stored: Event = EventBuilder::new(Kind::TextNote, "stored event")
+            .finalize(&Keys::generate())
+            .unwrap();
+        recorded.reply(RelayMessage::event(id.clone(), stored.clone()));
+        recorded.reply(RelayMessage::eose(id.clone()));
+        wait_for_eose(&mut notifications, &id).await;
+
+        assert_eq!(relay.subscription_received_eose(&id).await, Some(true));
+
+        relay.batch_msg(reissue_batch(&id, &filter)).await.unwrap();
+        let barrier: SubscriptionId = flush_outbound(&relay).await;
+
+        let [close, req]: [String; 2] = [
+            ClientMessage::close(id.clone()).as_json(),
+            ClientMessage::req(id.clone(), filter.clone()).as_json(),
+        ];
+        assert_eq!(
+            recorded.sent_text(),
+            vec![close, req, ClientMessage::close(barrier).as_json()]
+        );
+
+        // Dispatching the REQ on the same connection starts a new stored-events query.
+        {
+            let subscriptions = relay.inner.atomic.subscriptions.read().await;
+            let data: &SubscriptionData = subscriptions.get(&id).unwrap();
+            assert!(!data.received_eose);
+            assert_eq!(data.received_events.load(Ordering::SeqCst), 0);
+        }
+
+        // The relay sends the stored event again, within the limit of the new query.
+        recorded.reply(RelayMessage::event(id.clone(), stored));
+        recorded.reply(RelayMessage::eose(id.clone()));
+        wait_for_eose(&mut notifications, &id).await;
+
+        assert_eq!(relay.subscription_received_eose(&id).await, Some(true));
+
+        let subscriptions = relay.inner.atomic.subscriptions.read().await;
+        let data: &SubscriptionData = subscriptions.get(&id).unwrap();
+        assert_eq!(data.received_events.load(Ordering::SeqCst), 1);
+    }
+
+    async fn batch_queues_nothing_without_room_for_every_message(free_slots: usize) {
+        let controlled = ControlledRelay::new();
+        let relay = &controlled.relay;
+        // Holding the queue keeps the connection task from draining it.
+        let mut queue = relay.inner.atomic.channels.rx_nostr().await;
+        let sender: &Sender<JsonMessageItem> = &relay.inner.atomic.channels.nostr.0;
+        let filler: ClientMessage = ClientMessage::close(SubscriptionId::new("filler"));
+
+        relay.connect();
+        let filter: Filter = Filter::new();
+        let id: SubscriptionId = relay.subscribe(filter.clone()).await.unwrap();
+        drop(queue.try_recv().unwrap());
+
+        while sender.capacity() > free_slots {
+            relay.send_msg(filler.clone()).await.unwrap();
+        }
+
+        let err: Error = relay
+            .batch_msg(reissue_batch(&id, &filter))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::State);
+        assert_eq!(sender.capacity(), free_slots);
+
+        while let Ok(item) = queue.try_recv() {
+            assert_eq!(item.json, filler.as_json());
+        }
+
+        let subscriptions = relay.inner.atomic.subscriptions.read().await;
+        let data: &SubscriptionData = subscriptions.get(&id).unwrap();
+        assert!(!data.pending_req_counter.as_ref().unwrap().has_pending());
+    }
+
+    #[tokio::test]
+    async fn batch_into_full_queue_queues_nothing() {
+        batch_queues_nothing_without_room_for_every_message(0).await;
+    }
+
+    #[tokio::test]
+    async fn batch_into_queue_with_one_free_slot_queues_nothing() {
+        batch_queues_nothing_without_room_for_every_message(1).await;
+    }
+
+    #[tokio::test]
+    async fn batch_reissued_while_disconnected_is_sent_once_after_reconnect() {
+        let opts: RelayOptions = RelayOptions::default()
+            .adjust_retry_interval(false)
+            .retry_interval(Duration::from_secs(1));
+
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::with_opts(opts);
+        let id: SubscriptionId = SubscriptionId::new("live");
+        let filter: Filter = Filter::new().kind(Kind::TextNote);
+
+        relay.connect();
+
+        let (connection, first) = recording_connection();
+        assert!(transport.next_dial().await.send(Ok(connection)).is_ok());
+        wait_for_status(&relay, RelayStatus::Connected).await;
+
+        relay
+            .subscribe(filter.clone())
+            .with_id(id.clone())
+            .await
+            .unwrap();
+        flush_outbound(&relay).await;
+
+        let mut notifications: NotificationStream<RelayNotification> = relay.notifications();
+        first.reply(RelayMessage::eose(id.clone()));
+        wait_for_eose(&mut notifications, &id).await;
+
+        first.close();
+        wait_for_status(&relay, RelayStatus::Disconnected).await;
+
+        relay.batch_msg(reissue_batch(&id, &filter)).await.unwrap();
+
+        // Queueing alone leaves the tracking of the previous REQ intact.
+        assert_eq!(relay.subscription_received_eose(&id).await, Some(true));
+
+        let (connection, mut second) = recording_connection();
+        assert!(transport.next_dial().await.send(Ok(connection)).is_ok());
+        wait_for_status(&relay, RelayStatus::Connected).await;
+        let barrier: SubscriptionId = flush_outbound(&relay).await;
+
+        // The queued frames replace the automatic restoration of the subscription.
+        let [close, req]: [String; 2] = [
+            ClientMessage::close(id.clone()).as_json(),
+            ClientMessage::req(id.clone(), filter.clone()).as_json(),
+        ];
+        let frames: Vec<String> = second.sent_text();
+        assert_eq!(
+            frames,
+            vec![close, req, ClientMessage::close(barrier.clone()).as_json()]
+        );
+
+        assert_eq!(relay.subscription_received_eose(&id).await, Some(false));
+
+        reply_rejecting_duplicate_reqs(&second, &frames);
+        second.reply(RelayMessage::eose(barrier.clone()));
+        wait_for_eose(&mut notifications, &barrier).await;
+
+        assert!(relay.inner.has_subscription(&id).await);
+        assert_eq!(relay.subscription_received_eose(&id).await, Some(true));
+    }
+
+    #[tokio::test]
+    async fn batch_capability_failure_queues_nothing() {
+        let event: Event = EventBuilder::new(Kind::TextNote, "batch")
+            .finalize(&Keys::generate())
+            .unwrap();
+        let id: SubscriptionId = SubscriptionId::new("test");
+
+        let cases = [
+            // Write disabled: the trailing EVENT rejects the whole batch.
+            (
+                RelayCapabilities::WRITE,
+                vec![
+                    ClientMessage::req(id.clone(), Filter::new()),
+                    ClientMessage::event(event.clone()),
+                ],
+                Error::write_disabled(),
+            ),
+            // Read disabled: the trailing CLOSE rejects the whole batch.
+            (
+                RelayCapabilities::READ,
+                vec![
+                    ClientMessage::event(event.clone()),
+                    ClientMessage::close(id.clone()),
+                ],
+                Error::read_disabled(),
+            ),
+        ];
+
+        for (capability, batch, expected) in cases {
+            let controlled = ControlledRelay::new();
+            let relay = &controlled.relay;
+            let queue = relay.inner.atomic.channels.rx_nostr().await;
+
+            relay.connect();
+            relay.capabilities().remove(capability);
+
+            let err: Error = relay.batch_msg(batch).await.unwrap_err();
+            assert_eq!(err.to_string(), expected.to_string());
+            assert!(queue.is_empty());
+        }
     }
 }
 
