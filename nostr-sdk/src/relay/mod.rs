@@ -1,19 +1,16 @@
 //! Relay
 
-use std::borrow::Cow;
 use std::cmp;
 use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_utility::time;
-use futures::{Stream, StreamExt};
 use nostr_database::prelude::*;
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::broadcast;
 
 mod api;
 mod builder;
@@ -40,7 +37,7 @@ pub use self::status::*;
 use crate::client::ClientNotification;
 use crate::error::Error;
 use crate::shared::SharedState;
-use crate::stream::{NotificationStream, NotificationUpdate, ReportingNotificationStream};
+use crate::stream::NotificationStream;
 
 /// Subscription auto-closed reason
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,10 +198,15 @@ impl Relay {
         self.inner.subscription(id).await
     }
 
-    /// Check if `EOSE` was received for the subscription on the current connection.
+    /// Check if the relay answered the current `REQ` of a subscription with `EOSE`.
     ///
-    /// The flag resets whenever the subscription's `REQ` is sent again, for example
-    /// when it is restored after a reconnection.
+    /// `EOSE` is recorded even when notification receivers fall behind,
+    /// so this tells a receiver that missed notifications whether the relay
+    /// finished sending the stored events of the subscription.
+    ///
+    /// It returns `Some(false)` from when a new `REQ` for the subscription is sent
+    /// (e.g., when it is restored after a reconnection or sent again with [`Relay::batch_msg`])
+    /// until the relay answers it with `EOSE`.
     ///
     /// Returns `None` if the subscription isn't registered.
     #[inline]
@@ -236,75 +238,24 @@ impl Relay {
     ///
     /// The stream terminates when the relay shutdowns or is banned.
     ///
-    /// This legacy stream silently skips notifications lost when its receiver
-    /// falls behind. Use [`Relay::notifications_with_gaps`] when coverage matters.
+    /// Notifications lost when this receiver falls behind are skipped.
+    /// Use [`NotificationStream::with_gaps`] to observe such losses.
     ///
     /// <div class="warning">When you call this method, you subscribe to the notifications channel from that precise moment. Anything received by relay/s before that moment is not included in the channel!</div>
     #[inline]
-    pub fn notifications(&self) -> Pin<Box<dyn Stream<Item = RelayNotification> + Send>> {
+    pub fn notifications(&self) -> NotificationStream<RelayNotification> {
         // If the relay is permanently unusable, return an empty stream
         let status: RelayStatus = self.status();
         if status.is_banned() || status.is_shutdown() {
-            return Box::pin(futures::stream::empty());
+            return NotificationStream::empty();
         }
 
         // Subscribe to notifications
         let rx = self.inner.internal_notification_sender.subscribe();
 
-        // Create a oneshot channel
-        let (tx, rx_done) = oneshot::channel();
-        let mut tx: Option<oneshot::Sender<()>> = Some(tx);
-
-        Box::pin(
-            NotificationStream::new(rx)
-                .inspect(move |notification| {
-                    if let RelayNotification::RelayStatus { status } = &notification {
-                        if status.is_banned() || status.is_shutdown() {
-                            // Take the sender and send the oneshot notification
-                            if let Some(tx) = tx.take() {
-                                let _ = tx.send(());
-                            }
-                        }
-                    }
-                })
-                .take_until(rx_done),
-        )
-    }
-
-    /// Get a relay notification stream that reports loss to this receiver.
-    ///
-    /// A [`NotificationUpdate::Lagged`] item reports notifications skipped by
-    /// this receiver only. The stream continues after a gap. It starts at the
-    /// moment this method is called and terminates when the relay is shut down
-    /// or banned. Dropping it does not stop the relay.
-    #[inline]
-    pub fn notifications_with_gaps(
-        &self,
-    ) -> Pin<Box<dyn Stream<Item = NotificationUpdate<RelayNotification>> + Send>> {
-        let status = self.status();
-        if status.is_banned() || status.is_shutdown() {
-            return Box::pin(futures::stream::empty());
-        }
-
-        let rx = self.inner.internal_notification_sender.subscribe();
-        let (tx, rx_done) = oneshot::channel();
-        let mut tx: Option<oneshot::Sender<()>> = Some(tx);
-
-        Box::pin(
-            ReportingNotificationStream::new(rx)
-                .inspect(move |update| {
-                    if let NotificationUpdate::Notification(RelayNotification::RelayStatus {
-                        status,
-                    }) = update
-                    {
-                        if status.is_banned() || status.is_shutdown() {
-                            if let Some(tx) = tx.take() {
-                                let _ = tx.send(());
-                            }
-                        }
-                    }
-                })
-                .take_until(rx_done),
+        NotificationStream::new(
+            rx,
+            |notification| matches!(notification, RelayNotification::RelayStatus { status } if status.is_banned() || status.is_shutdown()),
         )
     }
 
@@ -312,18 +263,17 @@ impl Relay {
     ///
     /// # Overview
     ///
-    /// If the relay’s status is not [`RelayStatus::Initialized`] or [`RelayStatus::Terminated`],
-    /// this method returns immediately without doing anything.
-    /// Otherwise, the connection task will be spawned, which will attempt to connect to relay.
+    /// Requests a connection when the relay is initialized, idle or sleeping.
+    /// The connection task is spawned once and retained until ban or shutdown.
+    /// Requests made while an old WebSocket is closing are retained.
     ///
     /// This method returns immediately and doesn't provide any information on if the connection was successful or not.
-    /// A request made while the previous task is stopping is retained and starts
-    /// after that task releases ownership.
     ///
     /// # Automatic reconnection
     ///
     /// By default, in case of disconnection, the connection task will automatically attempt to reconnect.
     /// This behavior can be disabled by changing [`RelayOptions::reconnect`] option.
+    #[inline]
     pub fn connect(&self) {
         self.inner.request_connect();
     }
@@ -331,21 +281,18 @@ impl Relay {
     /// Waits for relay connection
     ///
     /// Wait for relay connection at most for the specified `timeout`.
-    /// The code continues when the relay is connected or the `timeout` is reached.
+    /// Returns when connected, when the relay becomes idle, sleeping, banned or shut down,
+    /// or when the timeout is reached.
     pub async fn wait_for_connection(&self, timeout: Duration) {
+        // Subscribe before reading status so a concurrent transition cannot be missed.
+        let mut notifications = self.inner.internal_notification_sender.subscribe();
+
         let status: RelayStatus = self.status();
 
-        // Immediately returns if the relay is already connected, if it's terminated or banned.
-        if status.is_connected()
-            || status.is_terminated()
-            || status.is_banned()
-            || status.is_shutdown()
-        {
+        // Immediately returns if the relay is already connected, if it's idle, banned or shut down.
+        if status.is_connected() || status.is_idle() || status.is_banned() || status.is_shutdown() {
             return;
         }
-
-        // Subscribe to notifications
-        let mut notifications = self.inner.internal_notification_sender.subscribe();
 
         // Set timeout
         time::timeout(Some(timeout), async {
@@ -355,12 +302,11 @@ impl Relay {
                     match status {
                         // Waiting for connection
                         RelayStatus::Initialized
-                        | RelayStatus::Pending
                         | RelayStatus::Connecting
                         | RelayStatus::Disconnected => {}
-                        // Connected or terminated/banned/sleeping/shutdown
+                        // Connected or idle/banned/sleeping/shutdown
                         RelayStatus::Connected
-                        | RelayStatus::Terminated
+                        | RelayStatus::Idle
                         | RelayStatus::Banned
                         | RelayStatus::Sleeping
                         | RelayStatus::Shutdown => break,
@@ -375,16 +321,18 @@ impl Relay {
     ///
     /// # Overview
     ///
-    /// If the relay’s status is not [`RelayStatus::Initialized`] or [`RelayStatus::Terminated`],
-    /// this method returns immediately without doing anything.
-    /// Otherwise, attempts to establish a connection without spawning the connection task if it fails.
-    /// This means that if the connection fails, no automatic retries are scheduled.
-    /// Use [`Relay::connect`] if you want to immediately spawn a connection task,
-    /// regardless of whether the initial connection succeeds.
+    /// Returns immediately if already connected. Otherwise, requests a connection
+    /// or waits for the current attempt (the next scheduled retry if disconnected).
+    /// Concurrent callers share that attempt, each with their own timeout.
     ///
-    /// Returns an error if the connection fails or if the relay has been banned.
-    /// If an older connection task still owns the relay, this returns a state
-    /// error and queues a fresh reconnect rather than claiming the new socket.
+    /// A newly requested attempt that fails does not schedule automatic retries.
+    /// Use [`Relay::connect`] to enable retries after an initial failure.
+    ///
+    /// The timeout includes waiting for an old WebSocket to close and admission policy checks.
+    /// Dropping the future only stops waiting; the connection attempt continues within
+    /// its assigned timeout. A caller joining an existing attempt does not change its timeout.
+    ///
+    /// Returns an error on connection failure, timeout, disconnect, ban or shutdown.
     ///
     /// # Automatic reconnection
     ///
@@ -395,11 +343,9 @@ impl Relay {
         TryConnect::new(self)
     }
 
-    /// Disconnect from relay and set status to [`RelayStatus::Terminated`].
+    /// Disconnect from relay and set status to [`RelayStatus::Idle`].
     ///
-    /// This requests termination; the old connection task may still be
-    /// releasing its resources when this method returns. A subsequent
-    /// [`Relay::connect`] request is retained during that interval.
+    /// The persistent task closes the WebSocket and waits for another connection request.
     #[inline]
     pub fn disconnect(&self) {
         self.inner.disconnect()
@@ -431,11 +377,12 @@ impl Relay {
     /// (i.e., the relay isn't operational, it lacks the read or write capability,
     /// or the outbound queue can't fit the whole batch), nothing is queued.
     ///
-    /// A `REQ` for a registered subscription replaces its stored filters and
-    /// resets its `EOSE` state, like re-sending it with [`Relay::send_msg`].
+    /// A `REQ` for a registered subscription is tracked like one sent with [`Relay::send_msg`]:
+    /// restoration on reconnect doesn't send another `REQ` while it's queued, and its `EOSE`
+    /// state resets when it's sent.
     #[inline]
     pub async fn batch_msg(&self, msgs: Vec<ClientMessage<'_>>) -> Result<(), Error> {
-        self.inner.send_msgs(msgs).await
+        self.inner.send_msg_batch(msgs).await
     }
 
     /// Send event and wait for `OK` relay msg
@@ -495,35 +442,8 @@ impl Relay {
     ///
     /// A successful zero is returned only for a matching COUNT response.
     /// Timeout, notification loss, closure, or relay rejection return an error.
-    pub async fn count_events(&self, filter: Filter, timeout: Duration) -> Result<usize, Error> {
-        let id = SubscriptionId::generate();
-        let mut notifications = self.inner.internal_notification_sender.subscribe();
-        let msg = ClientMessage::Count {
-            subscription_id: Cow::Borrowed(&id),
-            filter: Cow::Owned(filter),
-        };
-        self.send_msg(msg).await?;
-
-        let result = match time::timeout(
-            Some(timeout),
-            receive_count_reply(&mut notifications, &id),
-        )
-        .await
-        {
-            Some(result) => result,
-            None => Err(Error::timeout()),
-        };
-
-        // Unsubscribe
-        let close_result = self.send_msg(ClientMessage::close(id)).await;
-
-        match result {
-            Ok(count) => {
-                close_result?;
-                Ok(count)
-            }
-            Err(error) => Err(error),
-        }
+    pub fn count_events(&self, filter: Filter) -> CountEvents<'_> {
+        CountEvents::new(self, filter)
     }
 
     /// Sync events with relays (negentropy reconciliation)
@@ -533,173 +453,22 @@ impl Relay {
     }
 }
 
-async fn receive_count_reply(
-    notifications: &mut broadcast::Receiver<RelayNotification>,
-    id: &SubscriptionId,
-) -> Result<usize, Error> {
-    loop {
-        match notifications.recv().await {
-            Ok(RelayNotification::Message { message }) => match *message {
-                RelayMessage::Count {
-                    subscription_id,
-                    count,
-                } if subscription_id.as_ref() == id => return Ok(count),
-                RelayMessage::Closed {
-                    subscription_id,
-                    message,
-                } if subscription_id.as_ref() == id => {
-                    return Err(Error::relay_msg(message.into_owned()));
-                }
-                _ => {}
-            },
-            Ok(RelayNotification::RelayStatus { status }) if status.is_disconnected() => {
-                return Err(Error::not_connected());
-            }
-            Ok(_) => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::borrow::Cow;
     use std::collections::HashSet;
     use std::future::Future;
-    use std::net::SocketAddr;
     use std::pin::Pin;
     use std::sync::Arc;
 
-    use async_utility::time;
-    use nostr::message::MachineReadablePrefix;
+    use futures::StreamExt;
+    use tokio::time;
 
     use super::*;
     use crate::error::{Error, ErrorKind};
     use crate::local_relay::*;
     use crate::policy::{AdmitPolicy, AdmitStatus};
-
-    #[derive(Debug)]
-    struct RejectCount;
-
-    impl QueryPolicy for RejectCount {
-        fn admit_query<'a>(
-            &'a self,
-            _query: &'a mut Filter,
-            _addr: &'a SocketAddr,
-        ) -> Pin<Box<dyn Future<Output = QueryPolicyResult> + Send + 'a>> {
-            Box::pin(async {
-                QueryPolicyResult::reject(MachineReadablePrefix::Blocked, "count rejected")
-            })
-        }
-    }
-
-    #[tokio::test]
-    async fn count_requires_a_matching_response() {
-        let (tx, mut notifications) = broadcast::channel(4);
-        let id = SubscriptionId::new("expected-count");
-        let other_id = SubscriptionId::new("other-count");
-
-        tx.send(RelayNotification::Message {
-            message: Box::new(RelayMessage::Count {
-                subscription_id: Cow::Owned(other_id),
-                count: 99,
-            }),
-        })
-        .unwrap();
-        tx.send(RelayNotification::Message {
-            message: Box::new(RelayMessage::Count {
-                subscription_id: Cow::Owned(id.clone()),
-                count: 0,
-            }),
-        })
-        .unwrap();
-
-        assert_eq!(
-            receive_count_reply(&mut notifications, &id).await.unwrap(),
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn count_receive_loss_and_closure_are_errors() {
-        let id = SubscriptionId::new("missing-count");
-        let (tx, mut notifications) = broadcast::channel(2);
-        for _ in 0..8 {
-            tx.send(RelayNotification::Authenticated).unwrap();
-        }
-        let error = receive_count_reply(&mut notifications, &id)
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Other);
-        assert!(error.to_string().contains("lagged"));
-
-        let (tx, mut notifications) = broadcast::channel(2);
-        drop(tx);
-        let error = receive_count_reply(&mut notifications, &id)
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Other);
-        assert!(error.to_string().contains("closed"));
-    }
-
-    #[tokio::test]
-    async fn count_disconnect_is_reported_before_timeout() {
-        let id = SubscriptionId::new("interrupted-count");
-        let (tx, mut notifications) = broadcast::channel(2);
-        tx.send(RelayNotification::RelayStatus {
-            status: RelayStatus::Disconnected,
-        })
-        .unwrap();
-
-        let error = tokio::time::timeout(
-            Duration::from_secs(1),
-            receive_count_reply(&mut notifications, &id),
-        )
-        .await
-        .unwrap()
-        .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::State);
-        assert!(error.to_string().contains("not connected"));
-    }
-
-    #[tokio::test]
-    async fn count_with_no_matches_returns_zero() {
-        let local = LocalRelay::builder().build();
-        local.run().await.unwrap();
-        let relay = new_relay(local.url().await, RelayOptions::default());
-        relay
-            .try_connect()
-            .timeout(Duration::from_secs(2))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            relay
-                .count_events(Filter::new(), Duration::from_secs(2))
-                .await
-                .unwrap(),
-            0
-        );
-    }
-
-    #[tokio::test]
-    async fn count_without_count_reply_reports_rejection() {
-        let local = LocalRelay::builder().query_policy(RejectCount).build();
-        local.run().await.unwrap();
-        let relay = new_relay(local.url().await, RelayOptions::default());
-        relay
-            .try_connect()
-            .timeout(Duration::from_secs(2))
-            .await
-            .unwrap();
-
-        let error = relay
-            .count_events(Filter::new(), Duration::from_secs(2))
-            .await
-            .unwrap_err();
-        assert_eq!(error.kind(), ErrorKind::Rejected);
-        assert!(error.to_string().contains("count rejected"));
-    }
+    use crate::relay::constants::WEBSOCKET_TX_TIMEOUT;
+    use crate::test_utils::setup_relay;
 
     #[derive(Debug)]
     struct CustomTestPolicy {
@@ -731,8 +500,7 @@ mod tests {
         let url = mock.url().await;
 
         // Sender
-        let relay: Relay = new_relay(url.clone(), RelayOptions::default());
-        relay.connect();
+        let relay: Relay = setup_relay(url.clone()).await;
 
         // Subscribe
         let filter = Filter::new().kind(Kind::TextNote);
@@ -744,7 +512,7 @@ mod tests {
     fn check_relay_is_sleeping(relay: &Relay) {
         assert_eq!(relay.status(), RelayStatus::Sleeping);
         assert!(relay.status().can_connect());
-        assert!(!relay.inner.is_running());
+        assert!(relay.inner.is_running());
     }
 
     #[tokio::test]
@@ -765,9 +533,19 @@ mod tests {
 
         assert_eq!(relay.status(), RelayStatus::Connected);
 
+        // Complete a protocol exchange before shutting down the server.
+        relay.count_events(Filter::new()).await.unwrap();
+
         mock.shutdown();
 
-        time::sleep(Duration::from_millis(100)).await;
+        let timeout: Duration = WEBSOCKET_TX_TIMEOUT + Duration::from_secs(2);
+        time::timeout(timeout, async {
+            while relay.status() != RelayStatus::Disconnected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
 
         assert_eq!(relay.status(), RelayStatus::Disconnected);
 
@@ -792,13 +570,22 @@ mod tests {
 
         assert_eq!(relay.status(), RelayStatus::Connected);
 
+        // Complete a protocol exchange before shutting down the server.
+        relay.count_events(Filter::new()).await.unwrap();
+
         mock.shutdown();
 
-        time::sleep(Duration::from_millis(100)).await;
+        let timeout: Duration = WEBSOCKET_TX_TIMEOUT + Duration::from_secs(2);
+        time::timeout(timeout, async {
+            while relay.status() != RelayStatus::Idle {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
 
-        assert_eq!(relay.status(), RelayStatus::Terminated);
-
-        assert!(!relay.inner.is_running());
+        assert_eq!(relay.status(), RelayStatus::Idle);
+        assert!(relay.inner.is_running());
     }
 
     #[tokio::test]
@@ -823,9 +610,8 @@ mod tests {
 
         time::sleep(Duration::from_millis(100)).await;
 
-        assert_eq!(relay.status(), RelayStatus::Terminated);
-
-        assert!(!relay.inner.is_running());
+        assert_eq!(relay.status(), RelayStatus::Idle);
+        assert!(relay.inner.is_running());
     }
 
     #[tokio::test]
@@ -853,9 +639,8 @@ mod tests {
 
         time::sleep(Duration::from_millis(100)).await;
 
-        assert_eq!(relay.status(), RelayStatus::Terminated);
-
-        assert!(!relay.inner.is_running());
+        assert_eq!(relay.status(), RelayStatus::Idle);
+        assert!(relay.inner.is_running());
     }
 
     #[tokio::test]
@@ -920,9 +705,8 @@ mod tests {
 
         time::sleep(Duration::from_millis(100)).await;
 
-        assert_eq!(relay.status(), RelayStatus::Terminated);
-
-        assert!(!relay.inner.is_running());
+        assert_eq!(relay.status(), RelayStatus::Idle);
+        assert!(relay.inner.is_running());
     }
 
     #[tokio::test]
@@ -949,9 +733,8 @@ mod tests {
 
         time::sleep(Duration::from_millis(100)).await;
 
-        assert_eq!(relay.status(), RelayStatus::Terminated);
-
-        assert!(!relay.inner.is_running());
+        assert_eq!(relay.status(), RelayStatus::Idle);
+        assert!(relay.inner.is_running());
     }
 
     #[tokio::test]
@@ -980,9 +763,8 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::Rejected);
         assert_eq!(err.to_string(), "received termination request");
 
-        assert_eq!(relay.status(), RelayStatus::Terminated);
-
-        assert!(!relay.inner.is_running());
+        assert_eq!(relay.status(), RelayStatus::Idle);
+        assert!(relay.inner.is_running());
     }
 
     #[tokio::test]
@@ -1006,6 +788,13 @@ mod tests {
         relay.ban();
 
         assert_eq!(relay.status(), RelayStatus::Banned);
+        time::timeout(Duration::from_secs(2), async {
+            while relay.inner.is_running() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
 
         // Retry to connect
         let res = relay.try_connect().timeout(Duration::from_secs(2)).await;
@@ -1151,7 +940,7 @@ mod tests {
 
         // The relay handles frames sequentially, so EOSE order mirrors arrival order.
         let mut received: Vec<SubscriptionId> = Vec::new();
-        time::timeout(Some(Duration::from_secs(5)), async {
+        time::timeout(Duration::from_secs(5), async {
             while received.len() < ids.len() {
                 if let Some(RelayNotification::Message { message }) = notifications.next().await {
                     if let RelayMessage::EndOfStoredEvents(id) = *message {
@@ -1208,8 +997,8 @@ mod tests {
 
         time::sleep(Duration::from_secs(2)).await;
 
-        assert_eq!(relay.status(), RelayStatus::Terminated);
-        assert!(!relay.inner.is_running());
+        assert_eq!(relay.status(), RelayStatus::Idle);
+        assert!(relay.inner.is_running());
 
         // Retry to connect
         let res = relay.try_connect().timeout(Duration::from_secs(2)).await;
@@ -1217,8 +1006,8 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::Rejected);
         assert_eq!(err.to_string(), "connection rejected: reason=banned");
 
-        assert_eq!(relay.status(), RelayStatus::Terminated);
-        assert!(!relay.inner.is_running());
+        assert_eq!(relay.status(), RelayStatus::Idle);
+        assert!(relay.inner.is_running());
     }
 
     #[tokio::test]

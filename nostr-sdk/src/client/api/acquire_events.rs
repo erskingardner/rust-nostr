@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use async_utility::task;
-use futures::future::{AbortHandle, join_all};
+use futures::future::{AbortHandle, Abortable, join_all};
 use nostr::types::RelayUrl;
 use tokio::sync::{oneshot, watch};
 
@@ -119,7 +119,9 @@ impl Client {
             let relays = join_all(futures).await.into_iter().collect();
             let _ = result_tx.send(AcquisitionReport { relays });
         };
-        let abort = task::abortable(work);
+        // Detached: `abort` cancels the work, and dropping its join handle doesn't.
+        let (abort, abort_registration) = AbortHandle::new_pair();
+        task::spawn(Abortable::new(work, abort_registration));
         Ok(AcquisitionHandle {
             cancel: cancel_tx,
             abort,
@@ -220,7 +222,8 @@ mod tests {
         let client = setup_client(left_url.clone()).await;
         client.add_relay(&right_url).await.unwrap();
         client
-            .try_connect_relay(right_url.clone(), Duration::from_secs(3))
+            .try_connect_relay(right_url.clone())
+            .timeout(Duration::from_secs(3))
             .await
             .unwrap();
         let mut notifications = client.notifications();
@@ -636,7 +639,7 @@ mod tests {
             .subscribe(Filter::new().kind(Kind::Metadata))
             .await
             .unwrap();
-        let mut live = connection.notifications_with_gaps();
+        let mut live = connection.notifications().with_gaps();
         let byte_budget = 64 * 1024;
         let handle = client
             .acquire_events(
@@ -655,12 +658,10 @@ mod tests {
         relay.add_event(live_event.clone()).await.unwrap();
         timeout(Duration::from_secs(2), async {
             loop {
-                if let Some(crate::stream::NotificationUpdate::Notification(
-                    RelayNotification::Event {
-                        subscription_id,
-                        event,
-                    },
-                )) = live.next().await
+                if let Some(Ok(RelayNotification::Event {
+                    subscription_id,
+                    event,
+                })) = live.next().await
                 {
                     if subscription_id == live_id && event.id == live_event.id {
                         break;
@@ -753,7 +754,8 @@ mod tests {
             .await
             .unwrap();
         client
-            .try_connect_relay(&url, Duration::from_secs(3))
+            .try_connect_relay(&url)
+            .timeout(Duration::from_secs(3))
             .await
             .unwrap();
         let connection = client.pool().relay(&url).await.unwrap();
@@ -817,7 +819,7 @@ mod tests {
             .await
             .unwrap();
         let baseline = connection.inner.active_subscription_count().await;
-        let mut notifications = connection.notifications_with_gaps();
+        let mut notifications = connection.notifications().with_gaps();
         let limits = AcquisitionLimits::new(1, 1_000, 2_000_000, Duration::from_secs(5))
             .policy(ReqExitPolicy::WaitDurationAfterEOSE(Duration::from_secs(5)));
         let handle = client
@@ -857,7 +859,7 @@ mod tests {
         });
         timeout(Duration::from_secs(1), async {
             loop {
-                if let Some(crate::stream::NotificationUpdate::Notification(
+                if let Some(Ok(
                     RelayNotification::Message { message },
                 )) = notifications.next().await
                 {
@@ -878,12 +880,10 @@ mod tests {
         relay.add_event(during_pressure.clone()).await.unwrap();
         timeout(Duration::from_secs(1), async {
             loop {
-                if let Some(crate::stream::NotificationUpdate::Notification(
-                    RelayNotification::Event {
-                        subscription_id,
-                        event,
-                    },
-                )) = notifications.next().await
+                if let Some(Ok(RelayNotification::Event {
+                    subscription_id,
+                    event,
+                })) = notifications.next().await
                 {
                     if subscription_id == live_id && event.id == during_pressure.id {
                         break;
@@ -950,12 +950,10 @@ mod tests {
         relay.add_event(control.clone()).await.unwrap();
         timeout(Duration::from_secs(1), async {
             loop {
-                if let Some(crate::stream::NotificationUpdate::Notification(
-                    RelayNotification::Event {
-                        subscription_id,
-                        event,
-                    },
-                )) = notifications.next().await
+                if let Some(Ok(RelayNotification::Event {
+                    subscription_id,
+                    event,
+                })) = notifications.next().await
                 {
                     if subscription_id == live_id && event.id == control.id {
                         break;
@@ -1025,19 +1023,17 @@ mod tests {
         let _ = release.send(());
         assert_eq!(connection.inner.active_subscription_count().await, baseline);
 
-        let mut notifications = connection.notifications_with_gaps();
+        let mut notifications = connection.notifications().with_gaps();
         let control = EventBuilder::new(Kind::Metadata, "setup cleanup live")
             .finalize(&Keys::generate())
             .unwrap();
         relay.add_event(control.clone()).await.unwrap();
         timeout(Duration::from_secs(1), async {
             loop {
-                if let Some(crate::stream::NotificationUpdate::Notification(
-                    RelayNotification::Event {
-                        subscription_id,
-                        event,
-                    },
-                )) = notifications.next().await
+                if let Some(Ok(RelayNotification::Event {
+                    subscription_id,
+                    event,
+                })) = notifications.next().await
                 {
                     if subscription_id == live_id && event.id == control.id {
                         break;

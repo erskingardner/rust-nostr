@@ -6,14 +6,11 @@
 
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::pin::Pin;
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
-use futures::{Stream, StreamExt};
 use nostr::prelude::*;
 use nostr_database::prelude::*;
-use tokio::sync::oneshot;
 
 mod api;
 mod builder;
@@ -34,7 +31,7 @@ use crate::proxy::Proxy;
 use crate::relay::{
     Relay, RelayCapabilities, RelayLimits, RelayOptions, SleepWhenIdle, SyncOptions,
 };
-use crate::stream::{NotificationStream, NotificationUpdate, ReportingNotificationStream};
+use crate::stream::NotificationStream;
 
 #[derive(Debug)]
 struct ClientConfig {
@@ -194,71 +191,45 @@ impl Client {
     ///
     /// The stream terminates when the client shutdowns.
     ///
-    /// This legacy stream silently skips notifications lost when its receiver
-    /// falls behind. Use [`Client::notifications_with_gaps`] when coverage matters.
+    /// Notifications lost when this receiver falls behind are skipped.
+    /// Use [`NotificationStream::with_gaps`] to observe such losses.
     ///
     /// <div class="warning">When you call this method, you subscribe to the notifications channel from that precise moment. Anything received by relay/s before that moment is not included in the channel!</div>
+    ///
+    /// # Examples
+    ///
+    /// ## Report notification gaps
+    ///
+    /// ```rust,no_run
+    /// # use nostr_sdk::prelude::*;
+    /// # async fn example(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
+    /// // Create the stream before subscribing so it can observe the response.
+    /// let mut notifications = client.notifications().with_gaps();
+    /// client.subscribe(Filter::new().kind(Kind::TextNote)).await?;
+    ///
+    /// while let Some(update) = notifications.next().await {
+    ///     match update {
+    ///         Ok(ClientNotification::Event { event, .. }) => println!("{}", event.id),
+    ///         Ok(ClientNotification::Shutdown) => break,
+    ///         Ok(_) => {}
+    ///         Err(gap) => {
+    ///             eprintln!("Skipped {} notifications", gap.skipped);
+    ///             // Reacquire any subscription coverage the application requires.
+    ///         }
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
     #[inline]
-    pub fn notifications(&self) -> Pin<Box<dyn Stream<Item = ClientNotification> + Send>> {
+    pub fn notifications(&self) -> NotificationStream<ClientNotification> {
         if self.is_shutdown() {
-            return Box::pin(futures::stream::empty());
+            return NotificationStream::empty();
         }
 
         // Subscribe to notifications
         let rx = self.pool().notifications();
-
-        // Create a oneshot channel
-        let (tx, rx_done) = oneshot::channel();
-        let mut tx: Option<oneshot::Sender<()>> = Some(tx);
-
-        Box::pin(
-            NotificationStream::new(rx)
-                .inspect(move |notification| {
-                    if let ClientNotification::Shutdown = &notification {
-                        // Take the sender and send the oneshot notification
-                        if let Some(tx) = tx.take() {
-                            let _ = tx.send(());
-                        }
-                    }
-                })
-                .take_until(rx_done),
-        )
-    }
-
-    /// Get a notification stream that reports loss to this receiver.
-    ///
-    /// A [`NotificationUpdate::Lagged`] item means this receiver missed the
-    /// reported number of notifications. It does not count unique events or
-    /// identify affected subscriptions. Reception continues after a gap; callers
-    /// must explicitly reacquire any coverage they require.
-    ///
-    /// The stream starts at the moment this method is called. It emits
-    /// [`ClientNotification::Shutdown`] and then terminates on client shutdown.
-    /// A stream created after shutdown is empty. Dropping the stream ends only
-    /// this receiver; it does not stop the client.
-    #[inline]
-    pub fn notifications_with_gaps(
-        &self,
-    ) -> Pin<Box<dyn Stream<Item = NotificationUpdate<ClientNotification>> + Send>> {
-        if self.is_shutdown() {
-            return Box::pin(futures::stream::empty());
-        }
-
-        let rx = self.pool().notifications();
-        let (tx, rx_done) = oneshot::channel();
-        let mut tx: Option<oneshot::Sender<()>> = Some(tx);
-
-        Box::pin(
-            ReportingNotificationStream::new(rx)
-                .inspect(move |update| {
-                    if let NotificationUpdate::Notification(ClientNotification::Shutdown) = update {
-                        if let Some(tx) = tx.take() {
-                            let _ = tx.send(());
-                        }
-                    }
-                })
-                .take_until(rx_done),
-        )
+        NotificationStream::new(rx, |notification| notification.is_shutdown())
     }
 
     /// Get relays from the relay pool.
@@ -462,41 +433,75 @@ impl Client {
 
     /// Connect to a previously added relay.
     ///
-    /// This queues a connection request and returns before the relay is
-    /// connected. After [`Client::disconnect_relay`], it also works while the
-    /// previous connection task is still closing. Observe a fresh connected
-    /// status or live subscription traffic before treating the relay as ready.
+    /// Attempts to initiate a connection with a single relay.
+    ///
+    /// At most **one connection per relay** is allowed at any time.
+    /// If the relay is already connected or currently attempting to connect,
+    /// this method does nothing.
+    ///
+    /// If the relay is sleeping or otherwise inactive, its persistent
+    /// connection task is started or woken to initiate a connection.
+    ///
+    /// For further details, see the documentation of [`Relay::connect`].
+    ///
+    /// # Configuration
+    ///
+    /// By default:
+    ///
+    /// - Doesn't wait that relays connect
+    ///
+    /// To customize this behavior, the returned [`ConnectRelay`] can be
+    /// configured before awaiting it:
+    ///
+    /// - [`ConnectRelay::and_wait`]: wait for the relay to connect at most for the specified `timeout`
     #[inline]
-    pub async fn connect_relay<'a, U>(&self, url: U) -> Result<(), Error>
+    pub fn connect_relay<'client, 'url, U>(&'client self, url: U) -> ConnectRelay<'client, 'url>
     where
-        U: Into<RelayUrlArg<'a>>,
+        U: Into<RelayUrlArg<'url>>,
     {
-        let url: RelayUrlArg<'a> = url.into();
-        let url: Cow<RelayUrl> = url.try_as_relay_url()?;
-        self.pool().connect_relay(&url).await
+        let url: RelayUrlArg<'url> = url.into();
+        ConnectRelay::new(self, url)
     }
 
     /// Try to connect to a previously added relay.
     ///
-    /// This is a one-shot connection attempt, not a task-exit barrier. If the
-    /// previous task still owns the relay after [`Client::disconnect_relay`],
-    /// it returns a state error and queues a fresh connection. Use
-    /// [`Client::connect_relay`] for immediate reactivation without retiring
-    /// and replacing the relay object.
+    /// Attempts to initiate a connection with a single relay.
+    ///
+    /// At most **one connection per relay** is allowed at any time.
+    /// Returns immediately if already connected; otherwise waits for the current
+    /// attempt or next scheduled retry, or requests a connection if inactive.
+    ///
+    /// A newly requested attempt that fails does not schedule automatic retries.
+    /// The connection task remains available until ban or shutdown.
+    /// Dropping the future only stops waiting for the result.
+    ///
+    /// Use [`Client::connect_relay`] to enable retries after an initial failure.
+    ///
+    /// For further details, see the documentation of [`Relay::try_connect`].
+    ///
+    /// # Configuration
+    ///
+    /// By default:
+    ///
+    /// - Connection timeout is set to 15 secs
+    ///
+    /// To customize this behavior, the returned [`TryConnectRelay`] can be
+    /// configured before awaiting it:
+    ///
+    /// - [`TryConnectRelay::timeout`]: set a maximum timeout
     #[inline]
-    pub async fn try_connect_relay<'a, U>(&self, url: U, timeout: Duration) -> Result<(), Error>
+    pub fn try_connect_relay<'client, 'url, U>(
+        &'client self,
+        url: U,
+    ) -> TryConnectRelay<'client, 'url>
     where
-        U: Into<RelayUrlArg<'a>>,
+        U: Into<RelayUrlArg<'url>>,
     {
-        let url: RelayUrlArg<'a> = url.into();
-        let url: Cow<RelayUrl> = url.try_as_relay_url()?;
-        self.pool().try_connect_relay(&url, timeout).await
+        let url: RelayUrlArg<'url> = url.into();
+        TryConnectRelay::new(self, url)
     }
 
-    /// Disconnect relay.
-    ///
-    /// This requests termination and publishes `Terminated` status, but does
-    /// not wait for the connection task or WebSocket close to finish.
+    /// Disconnect relay
     #[inline]
     pub async fn disconnect_relay<'a, U>(&self, url: U) -> Result<(), Error>
     where
@@ -515,8 +520,8 @@ impl Client {
     /// If a relay is already connected or currently attempting to connect,
     /// this method does nothing for that relay.
     ///
-    /// If a relay is disconnected, sleeping, or otherwise inactive, a
-    /// background task is spawned to initiate a connection.
+    /// If a relay is sleeping or otherwise inactive, its persistent
+    /// connection task is started or woken to initiate a connection.
     ///
     /// For further details, see the documentation of [`Relay::connect`].
     ///
@@ -554,16 +559,14 @@ impl Client {
     /// Attempts to initiate a connection with relays.
     ///
     /// At most **one connection per relay** is allowed at any time.
-    /// If a relay is already connected or currently attempting to connect,
-    /// this method does nothing for that relay.
+    /// Returns immediately for connected relays. For other relays, waits for
+    /// the current attempt or next scheduled retry, or requests a connection if inactive.
     ///
-    /// If the initial connection attempt succeeds, a background task is spawned
-    /// to maintain the connection and handle future reconnections.
-    /// If the initial attempt fails, no background task is spawned and no
-    /// automatic retries are scheduled.
+    /// A newly requested attempt that fails does not schedule automatic retries.
+    /// Connection tasks remain available until ban or shutdown.
+    /// Dropping the future only stops waiting for results.
     ///
-    /// Use [`Client::connect`] if you want to always spawn a background
-    /// connection task, regardless of whether the initial attempt succeeds.
+    /// Use [`Client::connect`] to enable retries after an initial failure.
     ///
     /// For further details, see the documentation of [`Relay::try_connect`].
     ///
@@ -1254,191 +1257,13 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
-    use std::num::NonZeroUsize;
-
-    use nostr::event::{EventBuilder, FinalizeEvent, Kind};
-    use nostr::key::Keys;
+    use futures::StreamExt;
     use nostr_gossip_memory::prelude::*;
 
     use super::*;
     use crate::error::ErrorKind;
     use crate::local_relay::*;
-    use crate::relay::{RelayNotification, RelayStatus};
-
-    #[tokio::test]
-    async fn test_notification_gap_reporting_is_receiver_local() {
-        let local = LocalRelay::builder().build();
-        local.run().await.unwrap();
-
-        let url = local.url().await;
-        let client = Client::builder()
-            .notification_channel_size(NonZeroUsize::new(4).unwrap())
-            .build();
-        client
-            .add_relay(&url)
-            .notification_channel_size(4)
-            .and_connect()
-            .await
-            .unwrap();
-
-        let relay = client.relay(&url).await.unwrap().unwrap();
-        let mut fast_client = client.notifications_with_gaps();
-        let mut slow_client = client.notifications_with_gaps();
-        let mut fast_relay = relay.notifications_with_gaps();
-        let mut slow_relay = relay.notifications_with_gaps();
-        let keys = Keys::generate();
-        let id = client
-            .subscribe(Filter::new().author(keys.public_key()))
-            .await
-            .unwrap()
-            .value;
-
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match fast_client.next().await {
-                    Some(NotificationUpdate::Notification(ClientNotification::Message {
-                        message,
-                        ..
-                    })) => {
-                        if matches!(*message, RelayMessage::EndOfStoredEvents(ref received) if received.as_ref() == &id) {
-                            break;
-                        }
-                    }
-                    Some(NotificationUpdate::Lagged { .. }) => panic!("active client receiver lagged"),
-                    None => panic!("client stream closed before EOSE"),
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match fast_relay.next().await {
-                    Some(NotificationUpdate::Notification(RelayNotification::Message {
-                        message,
-                    })) => {
-                        if matches!(*message, RelayMessage::EndOfStoredEvents(ref received) if received.as_ref() == &id) {
-                            break;
-                        }
-                    }
-                    Some(NotificationUpdate::Lagged { .. }) => panic!("active relay receiver lagged"),
-                    None => panic!("relay stream closed before EOSE"),
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .unwrap();
-
-        let mut sent = Vec::new();
-        for n in 0..64 {
-            let event = EventBuilder::new(Kind::TextNote, format!("notification-{n}"))
-                .finalize(&keys)
-                .unwrap();
-            sent.push(event.id);
-            local.add_event(event).await.unwrap();
-
-            let received_client = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    match fast_client.next().await {
-                        Some(NotificationUpdate::Notification(ClientNotification::Event {
-                            event,
-                            ..
-                        })) => break event.id,
-                        Some(NotificationUpdate::Lagged { .. }) => {
-                            panic!("active client receiver lagged")
-                        }
-                        None => panic!("client stream closed before event"),
-                        _ => {}
-                    }
-                }
-            })
-            .await
-            .unwrap();
-            let received_relay = tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    match fast_relay.next().await {
-                        Some(NotificationUpdate::Notification(RelayNotification::Event {
-                            event,
-                            ..
-                        })) => break event.id,
-                        Some(NotificationUpdate::Lagged { .. }) => {
-                            panic!("active relay receiver lagged")
-                        }
-                        None => panic!("relay stream closed before event"),
-                        _ => {}
-                    }
-                }
-            })
-            .await
-            .unwrap();
-            assert_eq!(received_client, sent[n]);
-            assert_eq!(received_relay, sent[n]);
-        }
-
-        let first_client = tokio::time::timeout(Duration::from_secs(5), slow_client.next())
-            .await
-            .unwrap()
-            .unwrap();
-        let first_relay = tokio::time::timeout(Duration::from_secs(5), slow_relay.next())
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(first_client, NotificationUpdate::Lagged { skipped } if skipped > 0));
-        assert!(matches!(first_relay, NotificationUpdate::Lagged { skipped } if skipped > 0));
-        assert!(matches!(
-            slow_client.next().await,
-            Some(NotificationUpdate::Notification(_))
-        ));
-        assert!(matches!(
-            slow_relay.next().await,
-            Some(NotificationUpdate::Notification(_))
-        ));
-
-        // Previous SDK receipt does not consume an event from the relay.
-        // Bounded explicit reacquisition returns every ID after receiver loss.
-        let mut reacquired_ids = HashSet::new();
-        for batch in sent.chunks(2) {
-            let reacquired = client
-                .fetch_events(Filter::new().ids(batch.to_vec()))
-                .timeout(Duration::from_secs(5))
-                .await
-                .unwrap();
-            reacquired_ids.extend(reacquired.iter().map(|event| event.id));
-        }
-        assert_eq!(reacquired_ids, sent.into_iter().collect());
-
-        client.shutdown().await;
-
-        tokio::time::timeout(Duration::from_secs(5), async {
-            let mut saw_client_shutdown = false;
-            while let Some(update) = slow_client.next().await {
-                if matches!(
-                    update,
-                    NotificationUpdate::Notification(ClientNotification::Shutdown)
-                ) {
-                    saw_client_shutdown = true;
-                }
-            }
-            assert!(saw_client_shutdown);
-        })
-        .await
-        .unwrap();
-
-        tokio::time::timeout(Duration::from_secs(5), async {
-            let mut saw_relay_shutdown = false;
-            while let Some(update) = slow_relay.next().await {
-                if matches!(update, NotificationUpdate::Notification(RelayNotification::RelayStatus { status }) if status.is_shutdown()) {
-                    saw_relay_shutdown = true;
-                }
-            }
-            assert!(saw_relay_shutdown);
-        })
-        .await
-        .unwrap();
-    }
+    use crate::relay::RelayStatus;
 
     #[tokio::test]
     async fn test_shutdown() {
