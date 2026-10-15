@@ -313,7 +313,10 @@ mod tests {
 
         assert_eq!(err.kind(), ErrorKind::Invalid);
         assert_eq!(err.to_string(), "subscription ID already exists");
-        assert_eq!(relay.subscription(&id).await.unwrap(), vec![first_filter]);
+        assert_eq!(
+            relay.subscription(&id).await.unwrap().filters(),
+            [first_filter]
+        );
     }
 
     #[tokio::test]
@@ -348,7 +351,10 @@ mod tests {
 
         assert_eq!(err.kind(), ErrorKind::Invalid);
         assert_eq!(err.to_string(), "subscription ID already exists");
-        assert_eq!(relay.subscription(&id).await.unwrap(), vec![first_filter]);
+        assert_eq!(
+            relay.subscription(&id).await.unwrap().filters(),
+            [first_filter]
+        );
     }
 
     #[tokio::test]
