@@ -60,6 +60,7 @@
 - Restore subscriptions after reconnections within the same second  (https://github.com/nostrdevkit/nostr/pull/1491).
 - Reset subscription EOSE and event-limit tracking when a subscription is restored, so a relay isn't flagged for resending stored events.
 - Avoid duplicate subscription `REQ`s after reconnecting.
+- Reset subscription EOSE and event-limit tracking when a `REQ` is sent again on the same connection.
 
 ### Deprecated
 

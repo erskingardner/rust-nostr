@@ -627,15 +627,18 @@ impl InnerRelay {
             return;
         }
 
-        // A queued REQ may have survived an earlier session without being dispatched.
-        let connection: usize = self.stats.success();
+        // Every REQ starts a new stored-events query, also when sent again on the same
+        // connection. Frames the relay sent for the previous REQ before handling the
+        // CLOSE may still arrive after this reset:
+        // - its EOSE sets the flag early, which is acceptable because the filters are
+        //   the same, so that EOSE covers the same stored events;
+        // - its events count toward the limit of the new REQ.
+        data.received_eose = false;
+        *data.received_events.get_mut() = 0;
 
-        if connection > data.subscribed_connection {
-            data.received_eose = false;
-            *data.received_events.get_mut() = 0;
-        }
-
-        data.subscribed_connection = connection;
+        // Record the session that sends the REQ, since a queued REQ may have survived
+        // an earlier session without being dispatched.
+        data.subscribed_connection = self.stats.success();
         data.closed = false;
     }
 
@@ -3856,6 +3859,54 @@ mod tests {
         let subscriptions = relay.inner.atomic.subscriptions.read().await;
         let data: &SubscriptionData = subscriptions.get(&id).unwrap();
         assert_eq!(data.subscribed_connection, 2);
+        assert!(!data.received_eose);
+        assert_eq!(data.received_events.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn req_resent_on_same_connection_resets_limit_tracking_when_dispatched() {
+        let ControlledRelay {
+            relay,
+            mut transport,
+        } = ControlledRelay::with_opts(RelayOptions::default().verify_subscriptions(true));
+        let id: SubscriptionId = SubscriptionId::new("live");
+        let filter: Filter = Filter::new().kind(Kind::TextNote).limit(1);
+
+        relay.connect();
+
+        let (connection, recorded) = recording_connection();
+        assert!(transport.next_dial().await.send(Ok(connection)).is_ok());
+        wait_for_status(&relay, RelayStatus::Connected).await;
+
+        relay
+            .subscribe(filter.clone())
+            .with_id(id.clone())
+            .await
+            .unwrap();
+        flush_outbound(&relay).await;
+
+        let mut notifications: NotificationStream<RelayNotification> = relay.notifications();
+        let event: Event = EventBuilder::new(Kind::TextNote, "stored event")
+            .finalize(&Keys::generate())
+            .unwrap();
+        recorded.reply(RelayMessage::event(id.clone(), event));
+        recorded.reply(RelayMessage::eose(id.clone()));
+        wait_for_eose(&mut notifications, &id).await;
+
+        relay
+            .send_msg(ClientMessage::close(id.clone()))
+            .await
+            .unwrap();
+        relay
+            .send_msg(ClientMessage::req(id.clone(), filter))
+            .await
+            .unwrap();
+        flush_outbound(&relay).await;
+
+        // The relay answers the new REQ with a new stored-events query.
+        let subscriptions = relay.inner.atomic.subscriptions.read().await;
+        let data: &SubscriptionData = subscriptions.get(&id).unwrap();
+        assert_eq!(data.subscribed_connection, 1);
         assert!(!data.received_eose);
         assert_eq!(data.received_events.load(Ordering::SeqCst), 0);
     }
