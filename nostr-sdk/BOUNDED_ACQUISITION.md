@@ -111,9 +111,12 @@ lost EVENT input into an empty page. Other connections and ordinary live
 subscriptions remain registered.
 The counters and timestamp are request-local scalar state. With `ExitOnEOSE`,
 the connection reader freezes them at EOSE, before notifying the collector.
-Other policies freeze them when their auto-closing handler stops; collector
-termination also freezes them. Queued live input or a malformed frame after
-termination cannot change the page's outcome. There is no raw-event metadata queue. Registration
+Queued input after that EOSE cannot change the page's outcome. Other policies
+freeze evidence when their asynchronous auto-closing handler stops; collector
+termination also freezes it. Count-based policies do not promise a wire-order
+cutoff at the n-th validated event: additional frames processed before the
+handler closes can produce a raw-budget or input-loss outcome. There is no
+raw-event metadata queue. Registration
 attributes evidence to the exact request ID under the subscription registry
 lock; simultaneous requests and ordinary live subscription traffic do not
 share it. Closed generated IDs cannot update a completed report or populate the
