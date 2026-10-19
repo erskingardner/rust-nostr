@@ -320,14 +320,14 @@ mod tests {
     const SECRET_KEY_B: &str = "nsec1ufnus6pju578ste3v90xd5m2decpuzpql2295m3sknqcjzyys9ls0qlc85"; // 79dff8f82963424e0bb02708a22e44b4980893e3a4be0fa3cb60a43b946764e3
 
     const KEY_A_RELAYS: [(&str, Option<RelayMetadata>); 4] = [
-        ("wss://relay.damus.io", None),
+        ("wss://relay.example", None),
         ("wss://relay.nostr.bg", None),
         ("wss://nos.lol", Some(RelayMetadata::Write)),
         ("wss://nostr.mom", Some(RelayMetadata::Read)),
     ];
 
     const KEY_B_RELAYS: [(&str, Option<RelayMetadata>); 4] = [
-        ("wss://relay.damus.io", Some(RelayMetadata::Write)),
+        ("wss://relay.example", Some(RelayMetadata::Write)),
         ("wss://relay.nostr.info", None),
         ("wss://relay.rip", Some(RelayMetadata::Write)),
         ("wss://relay.snort.social", Some(RelayMetadata::Read)),
@@ -364,7 +364,7 @@ mod tests {
         let keys_a = Keys::parse(SECRET_KEY_A).unwrap();
         let keys_b = Keys::parse(SECRET_KEY_B).unwrap();
 
-        let damus_url = RelayUrl::parse("wss://relay.damus.io").unwrap();
+        let damus_url = RelayUrl::parse("wss://relay.example").unwrap();
         let nostr_bg_url = RelayUrl::parse("wss://relay.nostr.bg").unwrap();
         let nos_lol_url = RelayUrl::parse("wss://nos.lol").unwrap();
         let nostr_mom_url = RelayUrl::parse("wss://nostr.mom").unwrap();

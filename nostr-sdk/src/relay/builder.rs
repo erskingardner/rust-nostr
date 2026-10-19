@@ -93,7 +93,7 @@ impl RelayBuilder {
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let keys = Keys::generate();
     /// let authenticator = SignerAuthenticator::new(keys);
-    /// let url = RelayUrl::parse("wss://relay.damus.io")?;
+    /// let url = RelayUrl::parse("wss://relay.example")?;
     /// let client = Relay::builder(url).authenticator(authenticator).build();
     /// # Ok(())
     /// # }

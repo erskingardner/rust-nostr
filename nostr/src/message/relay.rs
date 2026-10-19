@@ -12,8 +12,10 @@ use core::fmt;
 use serde::de::{self, SeqAccess, Visitor};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Deserializer as JsonDeserializer;
 
 use super::SubscriptionId;
+use crate::error::Error;
 use crate::event::{Event, EventId};
 use crate::util::impl_json_methods;
 
@@ -235,7 +237,53 @@ pub enum RelayMessage<'a> {
     },
 }
 
+/// Input attribution retained by a single relay-message parse.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub enum RelayMessageContext {
+    /// The message type could not be decoded, or parsing succeeded.
+    #[default]
+    Unknown,
+    /// A decoded message type other than EVENT cannot contain EVENT input.
+    NonEvent,
+    /// An EVENT failed to parse, with its subscription ID when available.
+    Event(Option<SubscriptionId>),
+}
+
 impl RelayMessage<'_> {
+    /// Deserialize once, preserving the type and subscription of lost input.
+    ///
+    /// Clears `context` before parsing and on success. On failure, preserves a
+    /// decoded EVENT subscription ID or identifies non-EVENT control input.
+    /// No second parse or subscription-ID copy is made.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same JSON decoding errors as [`Self::from_json`].
+    pub fn from_json_with_context<T>(
+        json: T,
+        context: &mut RelayMessageContext,
+    ) -> Result<Self, Error>
+    where
+        T: AsRef<[u8]>,
+    {
+        *context = RelayMessageContext::Unknown;
+        let mut deserializer: JsonDeserializer<_> = JsonDeserializer::from_slice(json.as_ref());
+        let message: Self = deserializer.deserialize_seq(RelayMessageVisitor {
+            context: &mut *context,
+        })?;
+        if let Err(error) = deserializer.end() {
+            if let Self::Event {
+                subscription_id, ..
+            } = message
+            {
+                *context = RelayMessageContext::Event(Some(subscription_id.into_owned()));
+            }
+            return Err(error.into());
+        }
+        *context = RelayMessageContext::Unknown;
+        Ok(message)
+    }
+
     /// Create `EVENT` message
     #[inline]
     pub fn event(subscription_id: SubscriptionId, event: Event) -> Self {
@@ -406,13 +454,17 @@ impl<'de> Deserialize<'de> for RelayMessage<'_> {
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_seq(RelayMessageVisitor)
+        deserializer.deserialize_seq(RelayMessageVisitor {
+            context: &mut RelayMessageContext::Unknown,
+        })
     }
 }
 
-struct RelayMessageVisitor;
+struct RelayMessageVisitor<'a> {
+    context: &'a mut RelayMessageContext,
+}
 
-impl<'de> Visitor<'de> for RelayMessageVisitor {
+impl<'de> Visitor<'de> for RelayMessageVisitor<'_> {
     type Value = RelayMessage<'static>;
 
     fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
@@ -440,13 +492,32 @@ impl<'de> Visitor<'de> for RelayMessageVisitor {
         }
 
         let message_type: String = next!();
+        *self.context = if message_type == "EVENT" {
+            RelayMessageContext::Event(None)
+        } else {
+            RelayMessageContext::NonEvent
+        };
 
         let message: RelayMessage<'static> = match message_type.as_str() {
             // ["EVENT", <subscription id>, <event JSON>]
-            "EVENT" => RelayMessage::Event {
-                subscription_id: Cow::Owned(next!()),
-                event: Cow::Owned(next!()),
-            },
+            "EVENT" => {
+                let subscription_id: SubscriptionId = next!();
+                let event: Event = match seq.next_element() {
+                    Ok(Some(event)) => event,
+                    Ok(None) => {
+                        *self.context = RelayMessageContext::Event(Some(subscription_id));
+                        return Err(malformed());
+                    }
+                    Err(error) => {
+                        *self.context = RelayMessageContext::Event(Some(subscription_id));
+                        return Err(error);
+                    }
+                };
+                RelayMessage::Event {
+                    subscription_id: Cow::Owned(subscription_id),
+                    event: Cow::Owned(event),
+                }
+            }
             // ["OK", <event_id>, <true|false>, <message>]
             "OK" => RelayMessage::Ok {
                 event_id: next!(),
@@ -488,7 +559,22 @@ impl<'de> Visitor<'de> for RelayMessageVisitor {
             _ => return Err(malformed()),
         };
 
-        while seq.next_element::<de::IgnoredAny>()?.is_some() {}
+        loop {
+            match seq.next_element::<de::IgnoredAny>() {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(error) => {
+                    if let RelayMessage::Event {
+                        subscription_id, ..
+                    } = message
+                    {
+                        *self.context =
+                            RelayMessageContext::Event(Some(subscription_id.into_owned()));
+                    }
+                    return Err(error);
+                }
+            }
+        }
 
         Ok(message)
     }
@@ -625,6 +711,36 @@ mod tests {
             RelayMessage::from_json(valid_eose_msg).unwrap(),
             handled_valid_eose_msg
         );
+    }
+
+    #[test]
+    fn parse_loss_keeps_subscription() {
+        for json in [
+            r#"["EVENT","request"]"#,
+            r#"["EVENT","request",{}]"#,
+            r#"["EVENT","request",{"created_at":"invalid"}]"#,
+            r#"["EVENT","request",{"content":"unterminated"#,
+        ] {
+            let mut context = RelayMessageContext::Unknown;
+            assert!(RelayMessage::from_json_with_context(json, &mut context).is_err());
+            assert_eq!(
+                context,
+                RelayMessageContext::Event(Some(SubscriptionId::new("request")))
+            );
+            assert!(RelayMessage::from_json(json).is_err());
+        }
+        for (json, expected) in [
+            (r#"["EVENT",7,{}]"#, RelayMessageContext::Event(None)),
+            (r#"["NOTICE",{}]"#, RelayMessageContext::NonEvent),
+            (r#"["OK","invalid",true]"#, RelayMessageContext::NonEvent),
+            (r#"["UNKNOWN",{}]"#, RelayMessageContext::NonEvent),
+            ("[", RelayMessageContext::Unknown),
+            (r#"["EOSE","request"]"#, RelayMessageContext::Unknown),
+        ] {
+            let mut context = RelayMessageContext::Event(Some(SubscriptionId::new("stale")));
+            let _ = RelayMessage::from_json_with_context(json, &mut context);
+            assert_eq!(context, expected);
+        }
     }
     #[test]
     fn test_handle_invalid_eose() {
@@ -775,6 +891,29 @@ mod tests {
         for message in messages {
             let json: String = message.as_json();
             assert_eq!(RelayMessage::from_json(&json).unwrap(), message, "{json}");
+            let mut context = RelayMessageContext::Event(Some(sub()));
+            assert_eq!(
+                RelayMessage::from_json_with_context(&json, &mut context).unwrap(),
+                message
+            );
+            assert_eq!(context, RelayMessageContext::Unknown);
+            if let RelayMessage::Event {
+                subscription_id, ..
+            } = &message
+            {
+                for malformed in [
+                    alloc::format!("{json} trailing"),
+                    json[..json.len() - 1].to_owned(),
+                    alloc::format!("{},invalid]", &json[..json.len() - 1]),
+                ] {
+                    assert!(
+                        RelayMessage::from_json_with_context(&malformed, &mut context).is_err()
+                    );
+                    assert!(
+                        matches!(&context, RelayMessageContext::Event(Some(id)) if id == subscription_id.as_ref())
+                    );
+                }
+            }
         }
     }
 

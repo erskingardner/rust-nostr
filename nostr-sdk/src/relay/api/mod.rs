@@ -9,8 +9,8 @@ mod try_connect;
 mod unsubscribe;
 mod unsubscribe_all;
 
-pub(crate) use self::acquire_events::acquire_relay;
 pub use self::acquire_events::*;
+pub(crate) use self::acquire_events::{RawAcquisition, acquire_relay};
 pub use self::fetch_events::*;
 pub use self::send_event::*;
 pub use self::send_msg::*;
