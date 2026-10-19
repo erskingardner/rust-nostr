@@ -194,11 +194,11 @@ mod tests {
     async fn test_add_relay() {
         let client = Client::default();
 
-        let res = client.add_relay("wss://relay.example").await.unwrap();
+        let res = client.add_relay("wss://relay.damus.io").await.unwrap();
         assert!(res);
 
         // Try to re-add it
-        let res = client.add_relay("wss://relay.example").await.unwrap();
+        let res = client.add_relay("wss://relay.damus.io").await.unwrap();
         assert!(!res);
     }
 
@@ -207,11 +207,11 @@ mod tests {
         let client = Client::default();
 
         // Add relay
-        let res = client.add_relay("wss://relay.example").await.unwrap();
+        let res = client.add_relay("wss://relay.damus.io").await.unwrap();
         assert!(res);
 
         // Verify capabilities
-        let relay = client.relay("wss://relay.example").await.unwrap().unwrap();
+        let relay = client.relay("wss://relay.damus.io").await.unwrap().unwrap();
         assert_eq!(
             relay.capabilities().load(),
             RelayCapabilities::READ | RelayCapabilities::WRITE
@@ -224,26 +224,26 @@ mod tests {
 
         // Add relay with READ capability
         let res = client
-            .add_relay("wss://relay.example")
+            .add_relay("wss://relay.damus.io")
             .capabilities(RelayCapabilities::READ)
             .await
             .unwrap();
         assert!(res);
 
         // Verify capabilities
-        let relay = client.relay("wss://relay.example").await.unwrap().unwrap();
+        let relay = client.relay("wss://relay.damus.io").await.unwrap().unwrap();
         assert_eq!(relay.capabilities().load(), RelayCapabilities::READ);
 
         // Try to re-add relay with GOSSIP capability
         let res = client
-            .add_relay("wss://relay.example")
+            .add_relay("wss://relay.damus.io")
             .capabilities(RelayCapabilities::GOSSIP)
             .await
             .unwrap();
         assert!(!res); // Already exists, so must return false
 
         // Verify capabilities
-        let relay = client.relay("wss://relay.example").await.unwrap().unwrap();
+        let relay = client.relay("wss://relay.damus.io").await.unwrap().unwrap();
         assert_eq!(
             relay.capabilities().load(),
             RelayCapabilities::READ | RelayCapabilities::GOSSIP
@@ -252,7 +252,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_relay_rejected_by_policy() {
-        let rejected = RelayUrl::parse("wss://relay.example").unwrap();
+        let rejected = RelayUrl::parse("wss://relay.damus.io").unwrap();
         let client = Client::builder()
             .admit_policy(RejectRelayPolicy {
                 rejected_relays: HashSet::from([rejected.clone()]),
@@ -272,13 +272,13 @@ mod tests {
         let proxy: Proxy = Proxy::all(addr);
         let client = Client::builder().proxy(proxy).build();
 
-        client.add_relay("wss://relay.example").await.unwrap();
+        client.add_relay("wss://relay.damus.io").await.unwrap();
         client
             .add_relay("ws://oxtrdevav64z64yb7x6rjg4ntzqjhedm5b5zjqulugknhzr46ny2qbad.onion")
             .await
             .unwrap();
 
-        let relay = client.relay("wss://relay.example").await.unwrap().unwrap();
+        let relay = client.relay("wss://relay.damus.io").await.unwrap().unwrap();
         assert_eq!(relay.proxy(), Some(addr));
 
         let relay = client
@@ -295,13 +295,13 @@ mod tests {
         let proxy: Proxy = Proxy::onion(addr);
         let client = Client::builder().proxy(proxy).build();
 
-        client.add_relay("wss://relay.example").await.unwrap();
+        client.add_relay("wss://relay.damus.io").await.unwrap();
         client
             .add_relay("ws://oxtrdevav64z64yb7x6rjg4ntzqjhedm5b5zjqulugknhzr46ny2qbad.onion")
             .await
             .unwrap();
 
-        let relay = client.relay("wss://relay.example").await.unwrap().unwrap();
+        let relay = client.relay("wss://relay.damus.io").await.unwrap().unwrap();
         assert!(relay.proxy().is_none());
 
         let relay = client

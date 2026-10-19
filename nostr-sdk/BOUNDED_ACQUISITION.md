@@ -44,26 +44,20 @@ for (url, outcome) in report.relays {
 ## Resource contract
 
 Limits are per relay, and the call rejects more than `max_relays` selected
-targets. All selected relays run concurrently. `max_items` counts parsed raw
-EVENTs attributed to the registered request ID, including filtered events,
-duplicates, and the first over-limit item. That first overflow frame still
-passes through normal validation. If valid, it contributes to the validated
-notification counters but is not retained, even if earlier raw events were
-filtered. If rejected, it contributes only to raw evidence. Further frames for
-the exhausted request are discarded before event validation. Previously
-forwarded validated notifications drain through the existing bounded queue
-before item-budget termination, unless cancellation, deadline or another
-terminal failure interrupts them.
+targets. All selected relays run concurrently. `max_items` counts raw EVENTs
+received for the request, including filtered events, duplicates and the first
+over-limit item. That overflow frame is still validated and, if valid, counted
+in the validated counters, but it is never retained. Later frames for the
+exhausted request are discarded before validation. Validated notifications
+already queued are drained before the request ends, unless it is cancelled,
+times out or fails first.
 
 `max_event_bytes` counts `Event::as_json().len()` for validated EVENT
 notifications, including duplicates and the first over-budget notification.
 This is a serialized event JSON estimate, excluding EVENT envelope, subscription
 ID, WebSocket framing, TLS, and retransmission. Rejected raw events do not
-consume this byte budget. The raw item cap and deadline bound request-owned
-processing of rejected events; connection message limits bound individual
-incoming messages. Neither budget bounds all bytes or parsing work arriving on
-the shared connection, including frames discarded during teardown. Raw evidence
-does not serialize events or retain another event copy.
+consume it; the item cap, deadline and connection message limit bound their
+processing.
 
 Once exactly at a budget, the request waits for its normal terminal message or
 the next event. It never silently drops a possible new event and then reports
@@ -84,51 +78,35 @@ temporary string, and an over-budget item can be larger than the budget.
 
 ### Raw evidence and validated results
 
-Each `RelayAcquisition` exposes two separate views of the request:
+Each `RelayAcquisition` exposes two views of the request:
 
-- `raw_received_items: usize` counts successfully parsed EVENTs while the
-  request owns its subscription, before event size, tag, subscription/filter,
-  expiry, signature, admission-policy or database ID-deletion filtering. It
-  includes duplicates and the first over-item-budget frame, and then stops.
-- `oldest_raw_created_at: Option<nostr::types::Timestamp>` is the minimum `created_at`
-  of those counted raw EVENTs, or `None` when none were counted.
+- `raw_received_items` counts parsed EVENTs for the request before size, tag,
+  filter, expiry, signature, admission or deletion checks. It includes
+  duplicates and the first over-budget frame, then stops.
+  `oldest_raw_created_at` is the minimum `created_at` among them.
 - `events`, `received_items`, `received_event_bytes`, `duplicates` and the
-  high-water counters describe validated notifications and bounded retained
-  events. Expired or signature-invalid events never enter this view. Existing
-  all-valid traffic accounting includes the first over-budget notification.
+  high-water counters cover only validated notifications.
 
-Malformed messages and frames rejected before EVENT parsing are absent from raw
-evidence. If the single-pass parser decoded an EVENT subscription ID before
-failing, that exact active acquisition terminates with `InvalidMessage` rather
-than treating a later EOSE as an empty completed page. The first attributable
-parse loss is recorded; subsequent frames cannot restore completion. This
-uses the already-decoded ID without another parse, queue or ID copy. When the
-EVENT ID or message type cannot be decoded, or the connection rejects a message's
-size before parsing, all active acquisitions on that connection become
-`InvalidMessage`. A decoded non-EVENT message type cannot contain EVENT input;
-its parse failure does not invalidate acquisitions. A later EOSE cannot turn
-lost EVENT input into an empty page. Other connections and ordinary live
-subscriptions remain registered.
-The counters and timestamp are request-local scalar state. With `ExitOnEOSE`,
-the connection reader freezes them at EOSE, before notifying the collector.
-Queued input after that EOSE cannot change the page's outcome. Other policies
-freeze evidence when their asynchronous auto-closing handler stops; collector
-termination also freezes it. Count-based policies do not promise a wire-order
-cutoff at the n-th validated event: additional frames processed before the
-handler closes can produce a raw-budget or input-loss outcome. There is no
-raw-event metadata queue. Registration
-attributes evidence to the exact request ID under the subscription registry
-lock; simultaneous requests and ordinary live subscription traffic do not
-share it. Closed generated IDs cannot update a completed report or populate the
-shared event cache.
+A completed page can therefore hold 256 expired or invalid raw events and no
+validated ones while older valid history remains. The raw count and timestamp
+distinguish that case from a genuinely empty page. They are untrusted paging
+hints, not admission, a coverage certificate or a cursor: duplicate or
+dishonest timestamps and relay truncation still need caller-owned paging
+policy, and stepping one second below a saturated boundary can skip ties.
 
-Raw evidence is untrusted paging input, not admission, a coverage certificate,
-or a reusable cursor. A completed page can contain 256 raw expired or invalid
-events and no validated events while older valid history remains available.
-Its raw count and timestamp let a caller distinguish that case from an empty
-raw page. Duplicate timestamps, dishonest timestamps and relay truncation still
-require caller-owned bounded paging policy; subtracting one from a saturated
-boundary timestamp can skip events tied at that timestamp.
+Messages that fail to parse are not counted. If the parser decoded the EVENT
+subscription ID, only that acquisition ends as `InvalidMessage`. If the message
+type or EVENT ID could not be decoded, or the message exceeded the connection
+size limit, every active acquisition on that connection ends as
+`InvalidMessage`. Malformed non-EVENT messages do not affect acquisitions. A
+later EOSE cannot turn lost input into an empty completed page, and live
+subscriptions are unaffected.
+
+Evidence is scalar per-request state attributed under the subscription registry
+lock; there is no raw-event queue. With `ExitOnEOSE` it freezes at EOSE in wire
+order, so input queued after EOSE cannot change the outcome. Other policies
+freeze it when the auto-closing handler stops, so count-based policies have no
+wire-order cutoff at the n-th validated event.
 
 Connection-level buffers are shared by all subscriptions. The default relay
 notification broadcast has 2,048 slots; its occupants can include parsed
@@ -161,9 +139,10 @@ rejected without a retained tombstone or connection-wide teardown.
 
 Each relay reports `Completed`, `ExitLimitReached`, `ItemBudgetExceeded`,
 `ByteBudgetExceeded`, `Cancelled`, `TimedOut`, `Disconnected`, `ReceiveLoss`,
-`InvalidMessage`, `ReceiverClosed`, `AuthenticationFailed`, `Rejected`, `RelayClosed`, or setup
-`Failed`. An unprefixed relay `CLOSED` before the request exit policy is
-satisfied is `RelayClosed`, including during the post-EOSE grace interval.
+`InvalidMessage`, `ReceiverClosed`, `AuthenticationFailed`, `Rejected`,
+`RelayClosed`, or setup `Failed`. An unprefixed relay `CLOSED` before the
+request exit policy is satisfied is `RelayClosed`, including during the
+post-EOSE grace interval.
 Only `Completed` satisfies the chosen request exit policy. This says nothing
 about durable MDK admission or full historical coverage. A configured relay
 count exit policy is incomplete even if the relay stopped normally. There is
@@ -175,7 +154,7 @@ unknown missing history efficiently.
 
 The test `finite_explicit_id_reacquisition_preserves_partial_and_reports_traffic`
 stores eight known events. One three-item-budget query returns three events
-and `ItemBudgetExceeded` after four raw EVENTs and four validated notifications. Four
+and `ItemBudgetExceeded` after four received EVENTs. Four
 two-ID batches then acquire all eight IDs. A measured run used five requests,
 12 EVENT notifications, 4,176 estimated serialized event bytes, 6,695
 connection text bytes received, and 1,020 connection text bytes sent (7,715
@@ -205,14 +184,9 @@ request's retained-state high-water counters. These are local latency samples,
 not service-level guarantees. Run them with
 `cargo test -p nostr-sdk --lib acquire_events -- --nocapture`.
 
-The loopback socket tests `raw_full_page_finds_older`,
-`raw_mixed_page_keeps_ties`, `raw_limits_and_cancel_cleanup`,
-`raw_requests_keep_evidence`, `raw_filtered_overflow_counts` and
-`raw_parse_loss_is_incomplete` exercise raw
-filtered-page evidence through the client API. The full-page case covers both
-256 expired events and 256 invalid signatures above an older valid event.
-The remaining cases cover mixed pages, duplicate timestamp boundaries,
-over-limit accounting after filtering, cancellation, late replies after CLOSE,
-overlapping acquisition/live subscription IDs, and attributable parser loss
-followed by EOSE. These tests can be selected
-with `cargo test -p nostr-sdk --lib client::api::acquire_events::tests::raw_ -- --nocapture`.
+The loopback socket tests named `raw_*` exercise filtered-page evidence
+through the client API: a full page of expired or invalid-signature events above
+an older valid event, mixed pages and timestamp ties, overflow after filtering,
+cancellation and late replies, overlapping IDs, and parse loss followed by EOSE.
+Run them with
+`cargo test -p nostr-sdk --lib client::api::acquire_events::tests::raw_ -- --nocapture`.

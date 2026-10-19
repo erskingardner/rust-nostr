@@ -34,19 +34,13 @@
 - Add `Client::acquire_events` for per-relay bounded batches with item and
   serialized-event-byte budgets, cancellable partial results, and explicit
   terminal outcomes.
-- Add `RelayAcquisition::raw_received_items` and `oldest_raw_created_at` for
-  request-local paging evidence before event filtering. The item budget also
-  bounds expired, invalid or otherwise rejected raw EVENTs; validated traffic
-  counters and byte-budget accounting remain separate. Raw evidence does not
-  admit events or certify historical coverage.
-- Report `AcquisitionEnd::InvalidMessage` when EVENT parsing fails after its
-  active acquisition ID was decoded, so a subsequent EOSE cannot report an
-  empty completed page. Known IDs isolate the failure to that request;
-  unclassified parse or size rejection keeps all acquisitions on that
-  connection incomplete without changing unrelated live subscriptions.
-  Malformed non-EVENT control messages do not invalidate acquisitions.
-  Raw evidence freezes at EOSE for the default policy and when other policies
-  stop, so queued post-termination input cannot alter a completed page.
+- Add `RelayAcquisition::raw_received_items` and `oldest_raw_created_at`, which
+  describe the EVENTs a relay sent before filtering so callers can page past
+  pages of rejected events. The item budget now also counts rejected EVENTs;
+  the byte budget still counts only validated ones.
+- Add `AcquisitionEnd::InvalidMessage`, reported when a relay message that may
+  carry an acquisition's EVENT fails to parse, so a later EOSE cannot report an
+  empty completed page.
 - Add `StreamEvents::with_outcomes` for relay and client requests so callers
   can distinguish completion, reached limits, and endpoint errors.
 - Add bounded `FetchEvents::with_outcomes` for aggregate client fetches with

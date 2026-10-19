@@ -132,7 +132,7 @@ mod tests {
     fn test_proxy_all() {
         let proxy: Proxy = Proxy::all(ADDR);
 
-        let clearnet_url = RelayUrl::parse("wss://relay.example").unwrap();
+        let clearnet_url = RelayUrl::parse("wss://relay.damus.io").unwrap();
         let onion_url =
             RelayUrl::parse("ws://2jsnlhfnelig5acq6iacydmzdbdmg7xwunm4xl6qwbvzacw4lwrjmlyd.onion")
                 .unwrap();
@@ -145,7 +145,7 @@ mod tests {
     fn test_proxy_onion() {
         let proxy: Proxy = Proxy::onion(ADDR);
 
-        let clearnet_url = RelayUrl::parse("wss://relay.example").unwrap();
+        let clearnet_url = RelayUrl::parse("wss://relay.damus.io").unwrap();
         let onion_url =
             RelayUrl::parse("ws://2jsnlhfnelig5acq6iacydmzdbdmg7xwunm4xl6qwbvzacw4lwrjmlyd.onion")
                 .unwrap();
@@ -164,7 +164,7 @@ mod tests {
             }
         });
 
-        let damus_url = RelayUrl::parse("wss://relay.example").unwrap();
+        let damus_url = RelayUrl::parse("wss://relay.damus.io").unwrap();
         let example_url = RelayUrl::parse("wss://example.com").unwrap();
 
         assert!(proxy.get_addr(&damus_url).is_none());
