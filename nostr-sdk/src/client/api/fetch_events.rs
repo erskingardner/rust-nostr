@@ -304,6 +304,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn aggregate_fetch_reports_reached_event_limit() {
+        let local = LocalRelay::new();
+        local.run().await.unwrap();
+        let keys = Keys::generate();
+        for i in 0..2 {
+            let event = EventBuilder::new(Kind::TextNote, i.to_string())
+                .finalize(&keys)
+                .unwrap();
+            local.add_event(event).await.unwrap();
+        }
+
+        let url = local.url().await;
+        let client = setup_client(url.clone()).await;
+        let outcome = client
+            .fetch_events(Filter::new().author(keys.public_key()))
+            .policy(ReqExitPolicy::WaitForEvents(1))
+            .timeout(Duration::from_secs(2))
+            .with_outcomes()
+            .await
+            .unwrap();
+
+        assert!(!outcome.truncated);
+        assert_eq!(outcome.events.len(), 1);
+        assert!(matches!(
+            outcome.relays.get(&url),
+            Some(FetchRelayOutcome::LimitReached)
+        ));
+    }
+
+    #[tokio::test]
     async fn aggregate_fetch_empty_completion_is_not_failure() {
         let local = LocalRelay::new();
         local.run().await.unwrap();
