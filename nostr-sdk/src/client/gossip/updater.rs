@@ -280,6 +280,7 @@ impl Client {
                     None,
                     Some(self.config().gossip_config.fetch_timeout),
                     ReqExitPolicy::ExitOnEOSE,
+                    true,
                 )
                 .await?;
 
@@ -296,6 +297,9 @@ impl Client {
                         tracing::error!(%url, error = %e, "Failed to fetch outdated gossip data from relay.");
                     }
                     RelayStreamEvent::Completed => {}
+                    RelayStreamEvent::LimitReached => {
+                        tracing::warn!(%url, "Gossip fetch reached its event limit.");
+                    }
                 }
             }
         }
@@ -339,6 +343,7 @@ impl Client {
                 None,
                 Some(self.config().gossip_config.fetch_timeout),
                 ReqExitPolicy::ExitOnEOSE,
+                true,
             )
             .await?;
 
@@ -351,6 +356,9 @@ impl Client {
                 }
                 RelayStreamEvent::Error(e) => {
                     tracing::error!(%url, error = %e, "Failed to fetch missing gossip data from relay.");
+                }
+                RelayStreamEvent::LimitReached => {
+                    tracing::warn!(%url, "Missing gossip fetch reached its event limit.");
                 }
             }
         }
