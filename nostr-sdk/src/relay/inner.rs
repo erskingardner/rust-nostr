@@ -4322,29 +4322,28 @@ mod tests {
         })
         .unwrap();
 
-        // Unrelated notifications keep arriving, but only events reset the idle timeout.
-        tokio::spawn(async move {
-            loop {
+        // Unrelated notifications keep arriving for 500 ms, but only events reset the idle
+        // timeout: the handler must end before they stop.
+        let notifier = async {
+            for _ in 0..50 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
-                if tx.send(RelayNotification::Authenticated).is_err() {
-                    break;
-                }
+                let _ = tx.send(RelayNotification::Authenticated);
             }
-        });
-
-        let result = time::timeout(
-            Some(Duration::from_secs(2)),
+        };
+        let filters: [Filter; 1] = [Filter::new()];
+        let handler = time::timeout(
+            Some(Duration::from_millis(400)),
             relay.inner.handle_auto_closing(
                 &id,
-                &[Filter::new()],
+                &filters,
                 SubscribeAutoCloseOptions::default().idle_timeout(Some(Duration::from_millis(100))),
                 rx,
                 &None,
             ),
-        )
-        .await
-        .unwrap()
-        .unwrap();
+        );
+
+        let (result, ()) = tokio::join!(handler, notifier);
+        let result = result.unwrap().unwrap();
         assert!(matches!(
             result.reason,
             Some(SubscriptionAutoClosedReason::TimedOut)
@@ -4380,6 +4379,17 @@ mod tests {
             activity_rx.try_recv(),
             Ok(SubscriptionActivity::ReceivedEvent(received)) if received.id == event.id
         ));
+
+        // Without a stream, the event is dropped and the grace period still elapses.
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::Event {
+                subscription_id: Cow::Owned(id.clone()),
+                event: Cow::Owned(event),
+            }),
+        })
+        .unwrap();
+        let reason = post_eose_grace(&id, Duration::from_millis(50), &mut rx, &None, true).await;
+        assert!(reason.is_none());
     }
 
     #[tokio::test]

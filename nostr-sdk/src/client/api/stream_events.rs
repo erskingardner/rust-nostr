@@ -179,58 +179,42 @@ mod tests {
         client.add_relay(&healthy_url).and_connect().await.unwrap();
         client.add_relay(&failing_url).and_connect().await.unwrap();
 
-        let mut stream = client
+        let stream = client
             .stream_events(Filter::new().author(keys.public_key()))
             .timeout(Duration::from_secs(2))
             .with_outcomes()
             .await
             .unwrap();
+        let outcomes: Vec<(RelayUrl, RelayStreamEvent)> =
+            tokio::time::timeout(Duration::from_secs(3), stream.collect())
+                .await
+                .unwrap();
 
-        let mut saw_event = false;
-        let mut saw_completion = false;
-        let mut saw_failure = false;
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while let Some((url, outcome)) = stream.next().await {
-                match outcome {
-                    RelayStreamEvent::Event(event) if url == healthy_url => {
-                        assert_eq!(event.id, expected.id);
-                        saw_event = true;
-                    }
-                    RelayStreamEvent::Completed if url == healthy_url => {
-                        saw_completion = true;
-                    }
-                    RelayStreamEvent::Error(error) if url == failing_url => {
-                        assert!(error.to_string().contains("query rejected"));
-                        saw_failure = true;
-                    }
-                    other => panic!("unexpected outcome from {url}: {other:?}"),
-                }
-            }
-        })
-        .await
-        .unwrap();
-        assert!(saw_event);
-        assert!(saw_completion);
-        assert!(saw_failure);
+        // The healthy relay sends its event and completes, the failing one rejects the query.
+        assert_eq!(outcomes.len(), 3);
+        assert!(outcomes.iter().any(|(url, outcome)| *url == healthy_url
+            && matches!(outcome, RelayStreamEvent::Event(event) if event.id == expected.id)));
+        assert!(
+            outcomes.iter().any(|(url, outcome)| *url == healthy_url
+                && matches!(outcome, RelayStreamEvent::Completed))
+        );
+        assert!(outcomes.iter().any(|(url, outcome)| *url == failing_url
+            && matches!(outcome, RelayStreamEvent::Error(error) if error.to_string().contains("query rejected"))));
 
-        let mut stream = client
+        let stream = client
             .stream_events(Filter::new().author(keys.public_key()))
             .policy(ReqExitPolicy::WaitForEvents(1))
             .timeout(Duration::from_secs(2))
             .with_outcomes()
             .await
             .unwrap();
-        let mut saw_limit = false;
-        tokio::time::timeout(Duration::from_secs(3), async {
-            while let Some((url, outcome)) = stream.next().await {
-                if url == healthy_url && matches!(outcome, RelayStreamEvent::LimitReached) {
-                    saw_limit = true;
-                }
-            }
-        })
-        .await
-        .unwrap();
-        assert!(saw_limit);
+        let outcomes: Vec<(RelayUrl, RelayStreamEvent)> =
+            tokio::time::timeout(Duration::from_secs(3), stream.collect())
+                .await
+                .unwrap();
+
+        assert!(outcomes.iter().any(|(url, outcome)| *url == healthy_url
+            && matches!(outcome, RelayStreamEvent::LimitReached)));
     }
 
     #[tokio::test]
