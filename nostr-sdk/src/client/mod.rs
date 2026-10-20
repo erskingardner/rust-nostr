@@ -933,6 +933,10 @@ impl Client {
     /// Creates a short-lived event subscription and returns a list of events.
     /// Compared to [`Client::stream_events`], this buffers events internally and returns them only after the stream terminates.
     ///
+    /// Awaiting the builder returns the events of the healthy relays, even if another relay fails,
+    /// and may return partial events after a timeout or disconnection.
+    /// Use [`FetchEvents::with_outcomes`] to also get the terminal outcome of each relay.
+    ///
     /// For long-lived subscriptions, use [`Client::subscribe`].
     ///
     /// # Configuration

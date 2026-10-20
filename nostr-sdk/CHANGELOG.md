@@ -48,6 +48,7 @@
 - Add `LocalRelayBuilder::new_event_channel_size` for customizing the size of the channel used to notify new received events
 - Add opt-in receiver gap reporting with `NotificationStream::with_gaps()`.
 - Add `StreamEvents::with_outcomes` to relay and client requests, to distinguish completion from reached event limits, timeouts, disconnections and relay errors.
+- Add `FetchEvents::with_outcomes` to the client, to get the fetched events together with the terminal outcome of each relay and whether the buffer limit truncated them.
 
 ### Fixed
 

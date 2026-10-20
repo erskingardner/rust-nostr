@@ -1,15 +1,45 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::future::IntoFuture;
 use std::time::Duration;
 
 use futures::StreamExt;
 use nostr::event::Event;
+use nostr::filter::Filter;
+use nostr::types::url::RelayUrl;
 
 use super::req_target::ReqTarget;
 use super::stream_events::StreamEvents;
+use super::util::build_targets;
 use crate::client::{Client, Error};
 use crate::future::BoxedFuture;
-use crate::relay::{DEFAULT_FETCH_EVENTS_LIMIT, ReqExitPolicy};
+use crate::relay::{DEFAULT_FETCH_EVENTS_LIMIT, RelayStreamEvent, ReqExitPolicy};
+
+/// The terminal outcome of one relay in a fetch.
+#[derive(Debug)]
+pub enum FetchRelayOutcome {
+    /// Collection stopped before this relay produced a terminal outcome.
+    Incomplete,
+    /// This relay satisfied the configured exit policy, including EOSE when requested.
+    Completed,
+    /// This relay reached the configured event count; more matching events may exist.
+    LimitReached,
+    /// This relay failed to satisfy the configured exit policy.
+    Failed(Error),
+}
+
+/// Events and per-relay outcomes of a fetch.
+///
+/// A relay's [`FetchRelayOutcome::Completed`] only describes its configured exit policy;
+/// it doesn't mean that every matching event was received.
+#[derive(Debug)]
+pub struct FetchEventsOutcome {
+    /// Unique events collected before the request ended or reached the buffer limit.
+    pub events: BTreeSet<Event>,
+    /// Outcome of each selected relay, including relays that returned no events.
+    pub relays: HashMap<RelayUrl, FetchRelayOutcome>,
+    /// Whether the buffer limit stopped the collection early.
+    pub truncated: bool,
+}
 
 /// Fetch events
 #[must_use = "Does nothing unless you await!"]
@@ -58,6 +88,63 @@ impl<'client, 'url> FetchEvents<'client, 'url> {
     pub fn max_events(mut self, max: usize) -> Self {
         self.max_events = max;
         self
+    }
+
+    /// Fetch events together with the terminal outcome of each selected relay.
+    ///
+    /// A relay failure doesn't stop the other relays, and the events received
+    /// before a timeout or disconnection are kept.
+    ///
+    /// Unlike awaiting the builder, reaching the [`FetchEvents::max_events`] limit isn't an error:
+    /// the events collected so far are returned with [`FetchEventsOutcome::truncated`] set,
+    /// and the outstanding requests are canceled.
+    pub async fn with_outcomes(self) -> Result<FetchEventsOutcome, Error> {
+        // Build targets
+        let targets: HashMap<RelayUrl, Vec<Filter>> =
+            build_targets(self.client, self.target).await?;
+
+        // A relay is incomplete until it reports a terminal outcome
+        let relays: HashMap<RelayUrl, FetchRelayOutcome> = targets
+            .keys()
+            .map(|url| (url.clone(), FetchRelayOutcome::Incomplete))
+            .collect();
+
+        // Stream events
+        let mut stream = self
+            .client
+            .pool()
+            .stream_events(targets, None, self.timeout, self.policy, true)
+            .await?;
+
+        let mut outcome: FetchEventsOutcome = FetchEventsOutcome {
+            events: BTreeSet::new(),
+            relays,
+            truncated: false,
+        };
+
+        while let Some((url, item)) = stream.next().await {
+            match item {
+                RelayStreamEvent::Event(event) => {
+                    if outcome.events.len() >= self.max_events && !outcome.events.contains(&event) {
+                        outcome.truncated = true;
+                        break;
+                    }
+
+                    outcome.events.insert(event);
+                }
+                RelayStreamEvent::Error(e) => {
+                    outcome.relays.insert(url, FetchRelayOutcome::Failed(e));
+                }
+                RelayStreamEvent::Completed => {
+                    outcome.relays.insert(url, FetchRelayOutcome::Completed);
+                }
+                RelayStreamEvent::LimitReached => {
+                    outcome.relays.insert(url, FetchRelayOutcome::LimitReached);
+                }
+            }
+        }
+
+        Ok(outcome)
     }
 }
 
@@ -110,18 +197,133 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::net::SocketAddr;
+    use std::pin::Pin;
     use std::time::Duration;
 
     use nostr::event::{EventBuilder, FinalizeEvent, Kind};
-    use nostr::filter::Filter;
     use nostr::key::Keys;
+    use nostr::message::MachineReadablePrefix;
 
+    use super::*;
     use crate::authenticator::SignerAuthenticator;
     use crate::error::ErrorKind;
-    use crate::local_relay::LocalRelay;
+    use crate::local_relay::{LocalRelay, QueryPolicy, QueryPolicyResult};
     use crate::test_utils::{
         setup_client, setup_client_with_authenticator, setup_nip42_read_local_relay,
     };
+
+    #[derive(Debug)]
+    struct RejectQuery;
+
+    impl QueryPolicy for RejectQuery {
+        fn admit_query<'a>(
+            &'a self,
+            _query: &'a mut Filter,
+            _addr: &'a SocketAddr,
+        ) -> Pin<Box<dyn Future<Output = QueryPolicyResult> + Send + 'a>> {
+            Box::pin(async {
+                QueryPolicyResult::reject(MachineReadablePrefix::Blocked, "query rejected")
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn aggregate_fetch_retains_events_and_endpoint_failures() {
+        let healthy = LocalRelay::builder().build();
+        healthy.run().await.unwrap();
+        let failing = LocalRelay::builder().query_policy(RejectQuery).build();
+        failing.run().await.unwrap();
+
+        let keys = Keys::generate();
+        let expected = EventBuilder::new(Kind::TextNote, "healthy event")
+            .finalize(&keys)
+            .unwrap();
+        healthy.add_event(expected.clone()).await.unwrap();
+
+        let healthy_url = healthy.url().await;
+        let failing_url = failing.url().await;
+        let client = Client::new();
+        client.add_relay(&healthy_url).and_connect().await.unwrap();
+        client.add_relay(&failing_url).and_connect().await.unwrap();
+
+        let outcome = client
+            .fetch_events(Filter::new().author(keys.public_key()))
+            .timeout(Duration::from_secs(2))
+            .with_outcomes()
+            .await
+            .unwrap();
+
+        assert!(!outcome.truncated);
+        assert_eq!(outcome.events.len(), 1);
+        assert_eq!(
+            outcome.events.first().map(|event| event.id),
+            Some(expected.id)
+        );
+        assert!(matches!(
+            outcome.relays.get(&healthy_url),
+            Some(FetchRelayOutcome::Completed)
+        ));
+        match outcome.relays.get(&failing_url) {
+            Some(FetchRelayOutcome::Failed(error)) => {
+                assert!(error.to_string().contains("query rejected"));
+            }
+            other => panic!("unexpected failing-relay outcome: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn aggregate_fetch_exposes_truncation_and_cancels_request() {
+        let local = LocalRelay::new();
+        local.run().await.unwrap();
+        let keys = Keys::generate();
+        for i in 0..5 {
+            let event = EventBuilder::new(Kind::TextNote, i.to_string())
+                .finalize(&keys)
+                .unwrap();
+            local.add_event(event).await.unwrap();
+        }
+
+        let url = local.url().await;
+        let client = setup_client(url.clone()).await;
+        let outcome = client
+            .fetch_events(Filter::new().author(keys.public_key()))
+            .max_events(3)
+            .timeout(Duration::from_secs(2))
+            .with_outcomes()
+            .await
+            .unwrap();
+
+        assert!(outcome.truncated);
+        assert_eq!(outcome.events.len(), 3);
+        assert!(matches!(
+            outcome.relays.get(&url),
+            Some(FetchRelayOutcome::Incomplete)
+        ));
+    }
+
+    #[tokio::test]
+    async fn aggregate_fetch_empty_completion_is_not_failure() {
+        let local = LocalRelay::new();
+        local.run().await.unwrap();
+        let url = local.url().await;
+        let client = setup_client(url.clone()).await;
+
+        let outcome = client
+            .fetch_events(Filter::new().kind(Kind::Metadata))
+            .timeout(Duration::from_secs(2))
+            .with_outcomes()
+            .await
+            .unwrap();
+
+        assert!(outcome.events.is_empty());
+        assert!(!outcome.truncated);
+        assert!(matches!(
+            outcome.relays.get(&url),
+            Some(FetchRelayOutcome::Completed)
+        ));
+    }
 
     #[tokio::test]
     async fn test_client_fetch_events_dont_resubscribes_after_auth_required_closed_without_authenticator()
