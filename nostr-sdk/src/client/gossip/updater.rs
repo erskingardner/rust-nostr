@@ -632,7 +632,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetches_newer_gossip_list_from_failed_sync_relays() {
-        let local = LocalRelay::new();
+        // Reject every negentropy request, so the sync fails and the client falls back to a REQ.
+        let local = LocalRelay::builder()
+            .max_negentropy_subscriptions(0)
+            .build();
         local.run().await.unwrap();
         let url = local.url().await;
 
@@ -660,7 +663,7 @@ mod tests {
         let connect_output = client.try_connect().timeout(Duration::from_secs(3)).await;
         assert_eq!(connect_output.success.len(), 1);
 
-        // The negentropy sync fails, so the client asks the relay for a list newer than the stored one.
+        // The client asks the relay for a list newer than the stored one.
         sync_nip65(&client, keys.public_key()).await;
 
         let filter: Filter = Filter::new()
