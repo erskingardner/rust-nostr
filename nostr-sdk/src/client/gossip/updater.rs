@@ -503,12 +503,13 @@ impl Client {
 #[cfg(test)]
 mod tests {
     use nostr_gossip_memory::prelude::*;
+    use nostr_memory::MemoryDatabase;
 
     use super::*;
-    use crate::client::GossipConfig;
+    use crate::client::{ClientBuilder, GossipConfig};
     use crate::local_relay::*;
 
-    fn client_with_gossip() -> Client {
+    fn client_builder_with_gossip() -> ClientBuilder {
         let gossip = NostrGossipMemory::unbounded();
         let config = GossipConfig::default()
             .sync_initial_timeout(Duration::from_nanos(1))
@@ -516,10 +517,11 @@ mod tests {
             .fetch_timeout(Duration::from_secs(2))
             .no_background_refresh();
 
-        Client::builder()
-            .gossip(gossip)
-            .gossip_config(config)
-            .build()
+        Client::builder().gossip(gossip).gossip_config(config)
+    }
+
+    fn client_with_gossip() -> Client {
+        client_builder_with_gossip().build()
     }
 
     async fn assert_nip65_status(
@@ -626,6 +628,46 @@ mod tests {
         sync_nip65(&client, public_key).await;
 
         assert_nip65_status(&client, public_key, GossipPublicKeyStatus::Updated).await;
+    }
+
+    #[tokio::test]
+    async fn test_fetches_newer_gossip_list_from_failed_sync_relays() {
+        let local = LocalRelay::new();
+        local.run().await.unwrap();
+        let url = local.url().await;
+
+        let keys = Keys::generate();
+        let stored: Event =
+            RelayList::new([(RelayUrl::parse("wss://old.example.com").unwrap(), None)])
+                .into_event_builder()
+                .custom_created_at(Timestamp::from_secs(1_000))
+                .finalize(&keys)
+                .unwrap();
+        let newer: Event =
+            RelayList::new([(RelayUrl::parse("wss://new.example.com").unwrap(), None)])
+                .into_event_builder()
+                .custom_created_at(Timestamp::from_secs(2_000))
+                .finalize(&keys)
+                .unwrap();
+        local.add_event(newer.clone()).await.unwrap();
+
+        let client = client_builder_with_gossip()
+            .database(MemoryDatabase::unbounded())
+            .build();
+        client.database().save_event(&stored).await.unwrap();
+        client.add_relay(&url).await.unwrap();
+
+        let connect_output = client.try_connect().timeout(Duration::from_secs(3)).await;
+        assert_eq!(connect_output.success.len(), 1);
+
+        // The negentropy sync fails, so the client asks the relay for a list newer than the stored one.
+        sync_nip65(&client, keys.public_key()).await;
+
+        let filter: Filter = Filter::new()
+            .author(keys.public_key())
+            .kind(Kind::RelayList);
+        let events: BTreeSet<Event> = client.database().query(filter).await.unwrap();
+        assert!(events.iter().any(|event| event.id == newer.id));
     }
 
     #[tokio::test]

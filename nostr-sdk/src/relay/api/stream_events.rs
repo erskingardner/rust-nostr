@@ -355,12 +355,10 @@ mod tests {
         ))
         .await
         .unwrap();
-        match stream.next().await {
-            Some(RelayStreamEvent::Error(error)) => {
-                assert!(error.to_string().contains("lagged"));
-            }
-            other => panic!("expected receiver loss, got {other:?}"),
-        }
+        assert!(matches!(
+            stream.next().await,
+            Some(RelayStreamEvent::Error(error)) if error.to_string().contains("lagged")
+        ));
         assert!(stream.next().await.is_none());
 
         let (tx, rx) = mpsc::channel(2);
@@ -371,12 +369,10 @@ mod tests {
         ))
         .await
         .unwrap();
-        match stream.next().await {
-            Some(RelayStreamEvent::Error(error)) => {
-                assert!(error.to_string().contains("closed"));
-            }
-            other => panic!("expected receiver closure, got {other:?}"),
-        }
+        assert!(matches!(
+            stream.next().await,
+            Some(RelayStreamEvent::Error(error)) if error.to_string().contains("closed")
+        ));
         assert!(stream.next().await.is_none());
     }
 
