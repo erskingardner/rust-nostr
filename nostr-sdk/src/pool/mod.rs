@@ -846,16 +846,9 @@ impl RelayPool {
                                                     break;
                                                 }
                                             }
-                                            Some(RelayStreamEvent::Completed) => {
-                                                if tx.send((url.clone(), RelayStreamEvent::Completed)).await.is_err() {
-                                                    break;
-                                                }
-                                                break;
-                                            }
-                                            Some(RelayStreamEvent::LimitReached) => {
-                                                if tx.send((url.clone(), RelayStreamEvent::LimitReached)).await.is_err() {
-                                                    break;
-                                                }
+                                            // Forward the terminal outcome and stop
+                                            Some(outcome @ (RelayStreamEvent::Completed | RelayStreamEvent::LimitReached)) => {
+                                                let _ = tx.send((url.clone(), outcome)).await;
                                                 break;
                                             }
                                             None => break,
