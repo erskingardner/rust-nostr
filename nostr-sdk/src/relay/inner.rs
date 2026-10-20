@@ -290,6 +290,27 @@ impl Drop for RawFrame {
 }
 
 impl SubscriptionData {
+    /// Check if the subscription must be restored on the current WebSocket session.
+    fn needs_restore(&self, current_connection: usize) -> bool {
+        if self.is_auto_closing {
+            return false;
+        }
+
+        if let Some(counter) = &self.pending_req_counter {
+            if counter.has_pending() {
+                return false;
+            }
+        }
+
+        if self.closed {
+            return true;
+        }
+
+        // Restore subscriptions dispatched on an earlier WebSocket session,
+        // even when reconnecting within one second.
+        current_connection > self.subscribed_connection
+    }
+
     #[inline]
     fn long_lived(filters: Vec<Filter>, subscribed_connection: usize) -> Self {
         Self {
@@ -637,6 +658,7 @@ impl InnerRelay {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) async fn update_subscription(
         &self,
         id: &SubscriptionId,
@@ -696,37 +718,12 @@ impl InnerRelay {
     }
 
     /// Check if it should subscribe for current websocket session
+    #[cfg(test)]
     pub(crate) async fn should_resubscribe(&self, id: &SubscriptionId) -> bool {
         let subscriptions = self.atomic.subscriptions.read().await;
         match subscriptions.get(id) {
-            Some(SubscriptionData {
-                subscribed_connection,
-                closed,
-                is_auto_closing: false,
-                pending_req_counter,
-                ..
-            }) => {
-                if let Some(counter) = pending_req_counter {
-                    if counter.has_pending() {
-                        return false;
-                    }
-                }
-
-                if *closed {
-                    return true;
-                }
-
-                // Restore subscriptions dispatched on an earlier WebSocket session,
-                // even when reconnecting within one second.
-                let current_connection: usize = self.stats.success();
-                current_connection > *subscribed_connection
-            }
-            // NOT subscribe if auto-closing subscription or subscription not found
-            Some(SubscriptionData {
-                is_auto_closing: true,
-                ..
-            })
-            | None => false,
+            Some(data) => data.needs_restore(self.stats.success()),
+            None => false,
         }
     }
 
@@ -2108,25 +2105,65 @@ impl InnerRelay {
     pub async fn resubscribe(&self) -> Result<(), Error> {
         // TODO: avoid subscriptions clone
         let subscriptions = self.subscriptions().await;
-        for (id, filters) in subscriptions.into_iter() {
-            if !filters.is_empty() && self.should_resubscribe(&id).await {
-                self.update_subscription(&id, filters.clone(), true).await?;
-
-                let msg = ClientMessage::Req {
-                    subscription_id: Cow::Borrowed(&id),
-                    filters: filters.into_iter().map(Cow::Owned).collect(),
-                };
-
-                if let Err(e) = self.send_msg(msg, None).await {
-                    self.subscription_closed(&id).await;
-                    return Err(e);
-                }
-            } else {
+        for id in subscriptions.into_keys() {
+            if !self.queue_resubscription(&id).await? {
                 tracing::debug!("Skip re-subscription of '{id}'");
             }
         }
 
         Ok(())
+    }
+
+    /// Queue the `REQ` that restores a subscription, if it still needs one.
+    ///
+    /// Returns `false` if the subscription doesn't need to be restored.
+    async fn queue_resubscription(&self, id: &SubscriptionId) -> Result<bool, Error> {
+        // Decide and enqueue under the lock every tracked REQ is queued under,
+        // so a REQ queued meanwhile (e.g., a `batch_msg` repair) can't be
+        // followed by a duplicate, which relays may reject by closing the ID.
+        let mut subscriptions = self.atomic.subscriptions.write().await;
+
+        let current_connection: usize = self.stats.success();
+
+        let Some(data) = subscriptions.get_mut(id) else {
+            return Ok(false);
+        };
+
+        if data.filters.is_empty() || !data.needs_restore(current_connection) {
+            return Ok(false);
+        }
+
+        let msg: ClientMessage<'_> = ClientMessage::Req {
+            subscription_id: Cow::Borrowed(id),
+            filters: data.filters.iter().map(Cow::Borrowed).collect(),
+        };
+        let item: JsonMessageItem = JsonMessageItem {
+            json: msg.as_json(),
+            confirmation: None,
+            pending_req: data
+                .pending_req_counter
+                .as_ref()
+                .map(|counter| counter.track(id.clone())),
+        };
+
+        // The relay answers the new REQ with a new stored-events query.
+        data.subscribed_connection = current_connection;
+        data.closed = false;
+        data.received_eose = false;
+        *data.received_events.get_mut() = 0;
+
+        let queued: Result<(), Error> = self
+            .ensure_operational()
+            .and_then(|()| self.ensure_msg_allowed(&msg))
+            .and_then(|()| self.atomic.channels.send_client_msg(item));
+
+        if let Err(e) = queued {
+            // Keep it restorable on the next attempt.
+            data.closed = true;
+            return Err(e);
+        }
+
+        Ok(true)
     }
 
     pub(super) fn spawn_auto_closing_handler(
@@ -5108,6 +5145,63 @@ mod tests {
             assert_eq!(err.to_string(), expected.to_string());
             assert!(queue.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn restoration_does_not_repeat_a_req_queued_during_its_check() {
+        let controlled = ControlledRelay::new();
+        let relay = &controlled.relay;
+        // Holding the queue keeps the connection task from draining it.
+        let mut queue = relay.inner.atomic.channels.rx_nostr().await;
+        let id: SubscriptionId = SubscriptionId::new("live");
+        let filter: Filter = Filter::new().kind(Kind::TextNote);
+
+        relay.connect();
+        relay
+            .subscribe(filter.clone())
+            .with_id(id.clone())
+            .await
+            .unwrap();
+        drop(queue.try_recv().unwrap());
+
+        // The REQ belongs to an earlier session, so restoration wants to send it again.
+        relay.inner.stats.new_success();
+        relay.inner.stats.new_success();
+        assert!(relay.inner.should_resubscribe(&id).await);
+
+        // Park restoration on the subscriptions lock, and queue a repair behind it.
+        let subscriptions = relay.inner.atomic.subscriptions.read().await;
+
+        let mut restore = Box::pin(relay.inner.resubscribe());
+        assert!(futures::poll!(restore.as_mut()).is_pending());
+
+        let mut repair = Box::pin(relay.batch_msg(vec![
+            ClientMessage::close(id.clone()),
+            ClientMessage::req(id.clone(), filter),
+        ]));
+        assert!(futures::poll!(repair.as_mut()).is_pending());
+
+        drop(subscriptions);
+
+        let (restored, repaired) = tokio::join!(restore, repair);
+        restored.unwrap();
+        repaired.unwrap();
+
+        // The relay must never receive a REQ for an ID it still has open.
+        let mut frames: Vec<String> = Vec::new();
+        let mut open: bool = false;
+        while let Ok(item) = queue.try_recv() {
+            match ClientMessage::from_json(&item.json).unwrap() {
+                ClientMessage::Req { .. } => {
+                    assert!(!open, "duplicate REQ in {frames:?} + {}", item.json);
+                    open = true;
+                }
+                ClientMessage::Close(_) => open = false,
+                _ => {}
+            }
+            frames.push(item.json);
+        }
+        assert!(open, "no REQ queued: {frames:?}");
     }
 }
 
