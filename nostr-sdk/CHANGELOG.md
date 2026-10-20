@@ -29,8 +29,24 @@
 
 ## Unreleased
 
+### Breaking change
+
+- Redesign `Relay::count_events` API
+- Redesign `Client::try_connect_relay` API
+- Return `NotificationStream<T>` from client and relay `notifications()` methods instead of a boxed stream.
+- Remove `RelayStatus::Pending` and rename `RelayStatus::Terminated` to `RelayStatus::Idle` (https://github.com/nostrdevkit/nostr/pull/1491).
+
+### Changed
+
+- `Relay::try_connect` waits for an ongoing attempt or scheduled retry (https://github.com/nostrdevkit/nostr/pull/1491).
+
 ### Added
 
+- Add `SyncEvents::with_outcomes` to retain partial reconciliation progress with its terminal error.
+- Add `LocalRelay::connections_left` (https://github.com/nostrdevkit/nostr/pull/1459)
+- Add `LocalRelayBuilderNip42::relay_url` to make it possible to configure a custom `relay_url` for the nip42 challenge validation (https://github.com/nostrdevkit/nostr/pull/1476)
+- Add `LocalRelayBuilder::new_event_channel_size` for customizing the size of the channel used to notify new received events
+- Add opt-in receiver gap reporting with `NotificationStream::with_gaps()`.
 - Add `Client::acquire_events` for per-relay bounded batches with item and
   serialized-event-byte budgets, cancellable partial results, and explicit
   terminal outcomes.
@@ -45,48 +61,32 @@
   can distinguish completion, reached limits, and endpoint errors.
 - Add bounded `FetchEvents::with_outcomes` for aggregate client fetches with
   partial events, per-relay outcomes, and explicit buffer truncation.
-- Add `Client::notifications_with_gaps` and `Relay::notifications_with_gaps`
-  to report receiver-local notification loss while continuing reception.
-- Add `SyncEvents::with_outcomes` to retain per-relay NIP-77 progress when
-  reconciliation fails.
-- Add `LocalRelay::connections_left` (https://github.com/nostrdevkit/nostr/pull/1459)
-- Add `LocalRelayBuilderNip42::relay_url` to make it possible to configure a custom `relay_url` for the nip42 challenge validation (https://github.com/nostrdevkit/nostr/pull/1476)
-- Add `LocalRelayBuilder::new_event_channel_size` for customizing the size of the channel used to notify new received events
 - Add `Relay::batch_msg` to queue several messages on one relay connection
   atomically: every message is queued in order, or none is.
 - Add `Relay::subscription_received_eose` to read whether a subscription got
-  `EOSE` for its current `REQ`. The flag resets whenever the `REQ` is re-sent,
-  such as on resubscription after a reconnection or a re-issue under the same ID.
+  `EOSE` for its current `REQ`.
 
 ### Fixed
 
-- A `REQ` sent with `Relay::send_msg` or `Relay::batch_msg` for a registered
-  long-lived subscription now replaces its stored filters and resets its `EOSE`
-  state, so verification and later resubscriptions follow the re-issued `REQ`.
-- Don't re-send a subscription's `REQ` on reconnect while a `REQ` for the same ID
-  is still queued from before the disconnect, which relays may reject as a duplicate
-  and close the subscription.
+- Retain progress from failed relays in aggregate reconciliation summaries.
+- Require a correlated COUNT response before `Relay::count_events` returns a count.
+- Preserve the broadcast lag or closure cause in event `OK` and authentication waiters instead of returning a generic premature-exit error.
+- Clean up NIP-77 request-owned subscriptions when reconciliation fails or is canceled.
+- Fail NIP-77 reconciliation when a download batch is rejected or closes before its requested events arrive.
+- Retain reconnect requests while a previous WebSocket closes (https://github.com/nostrdevkit/nostr/pull/1491).
+- Allow banning and shutting down idle relays (https://github.com/nostrdevkit/nostr/pull/1491).
+- Restore subscriptions after reconnections within the same second  (https://github.com/nostrdevkit/nostr/pull/1491).
+- Reset subscription EOSE and event-limit tracking when a subscription is restored, so a relay isn't flagged for resending stored events.
+- Avoid duplicate subscription `REQ`s after reconnecting.
+- Reset subscription EOSE and event-limit tracking when a `REQ` is sent again on the same connection.
 - Keep request-local `acquire_events` input out of ordinary live Event
   notifications and the shared seen-event database, preserving later live
   delivery and rejecting late replies after request cleanup.
-- Require a correlated COUNT response before `Relay::count_events` returns a
-  count; report receive loss, closure, and rejection instead of returning zero.
 - Report receive lag and closure from auto-closing event requests. Reporting
   streams also expose disconnection and timeout; legacy awaited streams keep
   their previous quiet termination behavior.
-- Preserve the broadcast lag or closure cause in event `OK` and authentication
-  waiters instead of returning a generic premature-exit error. These outcomes
-  leave publication unconfirmed; they do not imply relay rejection.
-- Preserve partial NIP-77 progress in aggregate sync results when one relay
-  fails, and clean up request-owned subscriptions on interruption.
 - Report an early unprefixed relay `CLOSED` as incomplete in acquisition and
   outcome streams.
-- Fail reconciliation if a download batch is rejected or closes before its
-  requested events arrive, while retaining partial progress.
-- Preserve reconnect requests made while a terminated connection task is still
-  releasing ownership, instead of leaving the relay pending with no task.
-- Restore long-lived subscriptions on immediate reconnect even when both
-  connections occur within one second.
 
 ### Deprecated
 

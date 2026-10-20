@@ -203,50 +203,112 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::future::Future;
+    use std::net::SocketAddr;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use nostr::event::{EventBuilder, FinalizeEvent, Kind};
     use nostr::key::Keys;
+    use nostr::message::MachineReadablePrefix;
 
     use super::*;
     use crate::error::ErrorKind;
-    use crate::local_relay::LocalRelay;
-    use crate::relay::SyncOptions;
+    use crate::local_relay::{LocalRelay, QueryPolicy, QueryPolicyResult};
+
+    #[derive(Debug, Default)]
+    struct RejectSecondDownload {
+        batches: AtomicUsize,
+    }
+
+    impl QueryPolicy for RejectSecondDownload {
+        fn admit_query<'a>(
+            &'a self,
+            query: &'a mut Filter,
+            _addr: &'a SocketAddr,
+        ) -> Pin<Box<dyn Future<Output = QueryPolicyResult> + Send + 'a>> {
+            let reject: bool =
+                query.ids.is_some() && self.batches.fetch_add(1, Ordering::SeqCst) > 0;
+            Box::pin(async move {
+                if reject {
+                    QueryPolicyResult::reject(
+                        MachineReadablePrefix::Blocked,
+                        "second batch rejected",
+                    )
+                } else {
+                    QueryPolicyResult::Accept
+                }
+            })
+        }
+    }
 
     #[tokio::test]
-    async fn sync_keeps_healthy_endpoint_when_another_rejects() {
+    async fn aggregate_sync_retains_failed_relay_progress() {
         let healthy = LocalRelay::new();
+        let failing = LocalRelay::builder()
+            .query_policy(RejectSecondDownload::default())
+            .build();
         healthy.run().await.unwrap();
-        let failing = LocalRelay::builder().max_negentropy_items(0).build();
         failing.run().await.unwrap();
-
-        let expected = EventBuilder::new(Kind::TextNote, "remote")
-            .finalize(&Keys::generate())
-            .unwrap();
-        healthy.add_event(expected.clone()).await.unwrap();
-        failing.add_event(expected.clone()).await.unwrap();
-
+        let keys: Keys = Keys::generate();
+        for index in 0..101 {
+            let event = EventBuilder::new(Kind::TextNote, format!("remote {index}"))
+                .finalize(&keys)
+                .unwrap();
+            healthy.add_event(event.clone()).await.unwrap();
+            failing.add_event(event).await.unwrap();
+        }
         let healthy_url = healthy.url().await;
         let failing_url = failing.url().await;
-        let client = Client::new();
+        let client: Client = Client::new();
         client.add_relay(&healthy_url).and_connect().await.unwrap();
         client.add_relay(&failing_url).and_connect().await.unwrap();
-
         let output = client
             .sync(Filter::new().kind(Kind::TextNote))
-            .opts(SyncOptions::new().initial_timeout(Duration::from_secs(2)))
+            .opts(
+                SyncOptions::new()
+                    .initial_timeout(Duration::from_secs(2))
+                    .idle_timeout(Duration::from_secs(2)),
+            )
             .await
             .unwrap();
-
         assert!(output.success.contains_key(&healthy_url));
-        assert!(output.failed.contains_key(&failing_url));
         assert!(
             output
-                .remote
-                .get(&expected.id)
+                .failed
+                .get(&failing_url)
                 .unwrap()
-                .contains(&healthy_url)
+                .contains("second batch rejected")
         );
+        assert_eq!(output.received.len(), 101);
+        assert_eq!(
+            output
+                .received
+                .values()
+                .filter(|urls| urls.contains(&healthy_url))
+                .count(),
+            101
+        );
+        assert_eq!(
+            output
+                .received
+                .values()
+                .filter(|urls| urls.contains(&failing_url))
+                .count(),
+            100
+        );
+        assert_eq!(
+            output
+                .remote
+                .values()
+                .filter(|urls| urls.contains(&failing_url))
+                .count(),
+            101
+        );
+        client.shutdown().await;
+        healthy.shutdown();
+        failing.shutdown();
     }
 
     #[tokio::test]

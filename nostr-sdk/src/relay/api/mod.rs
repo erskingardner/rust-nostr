@@ -1,4 +1,5 @@
 mod acquire_events;
+mod count_events;
 mod fetch_events;
 mod send_event;
 mod send_msg;
@@ -11,6 +12,7 @@ mod unsubscribe_all;
 
 pub use self::acquire_events::*;
 pub(crate) use self::acquire_events::{RawAcquisition, acquire_relay};
+pub use self::count_events::*;
 pub use self::fetch_events::*;
 pub use self::send_event::*;
 pub use self::send_msg::*;

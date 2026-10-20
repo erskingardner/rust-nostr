@@ -4,7 +4,6 @@
 
 //! Nostr Connect client
 
-use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -12,7 +11,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_utility::time;
-use futures_core::stream::BoxStream;
 use nostr::nips::nip04::AsyncNip04;
 use nostr::nips::nip44::{self, AsyncNip44};
 use nostr::nips::nip46::{
@@ -23,9 +21,10 @@ use nostr::types::Url;
 use nostr_sdk::prelude::*;
 use tokio::sync::OnceCell;
 
+use crate::builder::NostrConnectBuilder;
 use crate::error::Error;
 
-/// Nostr Connect Client
+/// Nostr Connect client
 ///
 /// <https://github.com/nostr-protocol/nips/blob/master/46.md>
 #[derive(Debug, Clone)]
@@ -36,95 +35,55 @@ pub struct NostrConnect {
     user_public_key: OnceCell<PublicKey>,
     client: Client,
     timeout: Duration,
-    opts: RelayOptions,
     auth_url_handler: Option<Arc<dyn AuthUrlHandler>>,
 }
 
 impl NostrConnect {
-    /// Construct Nostr Connect client
-    pub fn new(
-        uri: NostrConnectUri,
-        client_keys: Keys,
-        timeout: Duration,
-        opts: Option<RelayOptions>,
-    ) -> Result<Self, Error> {
+    /// Construct a Nostr Connect client with default configs.
+    ///
+    /// Use [`NostrConnect::builder`] for more advanced configurations.
+    pub fn new(uri: NostrConnectUri, client_keys: Keys) -> Result<Self, Error> {
+        Self::builder(uri, client_keys).build()
+    }
+
+    /// Construct a Nostr Connect client builder.
+    #[inline]
+    pub fn builder(uri: NostrConnectUri, client_keys: Keys) -> NostrConnectBuilder {
+        NostrConnectBuilder::new(uri, client_keys)
+    }
+
+    pub(crate) fn from_builder(builder: NostrConnectBuilder) -> Result<Self, Error> {
         // Check app keys
-        if let NostrConnectUri::Client { public_key, .. } = &uri {
-            if public_key != &client_keys.public_key() {
+        if let NostrConnectUri::Client { public_key, .. } = &builder.uri {
+            if public_key != &builder.client_keys.public_key() {
                 return Err(Error::public_key_not_match_app_keys());
             }
         }
 
         Ok(Self {
-            uri,
-            client_keys,
+            uri: builder.uri,
+            client_keys: builder.client_keys,
+            client: builder.client.unwrap_or_default(),
+            timeout: builder.timeout,
+            auth_url_handler: builder.auth_url_handler,
             // NOT set the remote_signer_public_key, also if bunker URI!
             // If you already set remote_signer_public_key, you'll need another field to know if boostrap was already done.
             // If the URI is bunker, the remote_signer_public_key is set in the bootstrap method.
             remote_signer_public_key: OnceCell::new(),
             user_public_key: OnceCell::new(),
-            client: Client::default(),
-            timeout,
-            opts: opts.unwrap_or_default(),
-            auth_url_handler: None,
         })
     }
 
-    /// Set an `auth_url` handler
-    ///
-    /// ```rust
-    /// use std::future::Future;
-    /// use std::pin::Pin;
-    /// use std::time::Duration;
-    ///
-    /// use nostr_connect::prelude::*;
-    ///
-    /// #[derive(Debug, Clone)]
-    /// struct MyAuthUrlHandler;
-    ///
-    /// impl AuthUrlHandler for MyAuthUrlHandler {
-    ///     fn on_auth_url(&self, auth_url: Url) -> Pin<Box<dyn Future<Output = Result<(), Error>> + Send + '_>> {
-    ///         Box::pin(async move {
-    ///             webbrowser::open(auth_url.as_str()).map_err(Error::other)?;
-    ///             Ok(())
-    ///         })
-    ///     }
-    /// }
-    ///
-    /// #[tokio::main]
-    /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    ///     let uri = NostrConnectUri::parse("bunker://79dff8f82963424e0bb02708a22e44b4980893e3a4be0fa3cb60a43b946764e3?relay=wss://relay.nsec.app")?;
-    ///     let client_keys = Keys::generate();
-    ///     let timeout = Duration::from_secs(60);
-    ///
-    ///     let mut connect = NostrConnect::new(uri, client_keys, timeout, None)?;
-    ///
-    ///     // Set auth_url handler
-    ///     connect.auth_url_handler(MyAuthUrlHandler);
-    ///
-    ///     // ...
-    ///
-    ///     Ok(())
-    /// }
-    /// ```
+    /// Get the inner nostr client
     #[inline]
-    pub fn auth_url_handler<T>(&mut self, handler: T)
-    where
-        T: IntoAuthUrlHandler,
-    {
-        self.auth_url_handler = Some(handler.into_auth_url_handler());
-    }
-
-    /// Get relays status
-    pub async fn status(&self) -> HashMap<RelayUrl, RelayStatus> {
-        let relays = self.client.relays().await;
-        relays.into_iter().map(|(u, r)| (u, r.status())).collect()
+    pub fn client(&self) -> &Client {
+        &self.client
     }
 
     async fn bootstrap(&self) -> Result<PublicKey, Error> {
         // Add relays
         for url in self.uri.relays().iter() {
-            self.client.add_relay(url).opts(self.opts.clone()).await?;
+            self.client.add_relay(url).await?;
         }
 
         // Connect to relays
@@ -155,7 +114,7 @@ impl NostrConnect {
         Ok(remote_signer_public_key)
     }
 
-    async fn subscribe(&self) -> Result<BoxStream<'_, ClientNotification>, Error> {
+    async fn subscribe(&self) -> Result<NotificationStream<ClientNotification>, Error> {
         let public_key: PublicKey = self.client_keys.public_key();
 
         let filter = Filter::new()
@@ -163,7 +122,7 @@ impl NostrConnect {
             .kind(Kind::NostrConnect)
             .limit(0);
 
-        let notifications = self.client.notifications();
+        let notifications: NotificationStream<ClientNotification> = self.client.notifications();
 
         // Subscribe
         self.client.subscribe(filter).await?;
@@ -392,7 +351,7 @@ impl NostrConnect {
 async fn get_remote_signer_public_key(
     client_keys: &Keys,
     expected_secret: &str,
-    mut notifications: BoxStream<'_, ClientNotification>,
+    mut notifications: NotificationStream<ClientNotification>,
     timeout: Duration,
 ) -> Result<PublicKey, Error> {
     time::timeout(Some(timeout), async {
