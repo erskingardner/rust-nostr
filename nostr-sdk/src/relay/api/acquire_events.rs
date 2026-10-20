@@ -1,12 +1,14 @@
 use std::borrow::Cow;
 use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_utility::{task, time};
 use nostr::event::Event;
 use nostr::filter::Filter;
 use nostr::message::{ClientMessage, SubscriptionId};
-use tokio::sync::{mpsc, oneshot, watch};
+use nostr::types::Timestamp;
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 use crate::error::Error;
 use crate::relay::{
@@ -16,19 +18,21 @@ use crate::relay::{
 
 /// Per-relay resource limits for a bounded acquisition.
 ///
-/// Each received EVENT, including a duplicate, consumes one item and its
-/// serialized event JSON length in bytes. This bounds the retained event set,
+/// Each parsed raw EVENT, including filtered events and duplicates, consumes
+/// one item. Validated EVENT notifications also consume their serialized event
+/// JSON length in bytes. This bounds the retained event set,
 /// its deduplication keys and the one-item request activity queue. The queue
 /// producer and collector may each hold one additional event, which can be
 /// larger than the budget. It does not bound Rust object overhead, temporary
 /// serialization, shared connection queues, WebSocket frames, or parser allocations.
-/// Every received event is serialized again to measure its JSON length, including
-/// duplicates; callers should budget CPU as well as retained data for heavy traffic.
+/// Every validated notification is serialized again to measure its JSON length,
+/// including duplicates. Filtered raw events do not consume the byte budget;
+/// connection message limits still apply before parsing.
 #[derive(Debug, Clone, Copy)]
 pub struct AcquisitionLimits {
-    /// Maximum received EVENT notifications per relay, including duplicates.
+    /// Maximum parsed raw EVENTs per relay, including filtered events and duplicates.
     pub max_items: usize,
-    /// Maximum sum of serialized event JSON bytes received per relay.
+    /// Maximum sum of validated notification event JSON bytes per relay.
     pub max_event_bytes: usize,
     /// Maximum simultaneously selected relays.
     pub max_relays: usize,
@@ -92,8 +96,11 @@ pub enum AcquisitionEnd {
     TimedOut,
     /// The relay disconnected.
     Disconnected,
-    /// The shared connection notification receiver skipped notifications.
+    /// The notification receiver skipped this many messages.
     ReceiveLoss(u64),
+    /// A rejected connection message may have contained this request's input.
+    /// It is not an empty page or a skipped notification.
+    InvalidMessage,
     /// The shared connection notification receiver closed unexpectedly.
     ReceiverClosed,
     /// NIP-42 authentication failed.
@@ -129,7 +136,15 @@ pub struct RelayAcquisition {
     pub events: BTreeSet<Event>,
     /// Terminal outcome for this relay.
     pub end: AcquisitionEnd,
-    /// Received EVENT notifications, including duplicates and the over-budget item.
+    /// Parsed EVENTs for this request before event filtering, including duplicates
+    /// and the first over-item-budget event. Frozen when acquisition terminates.
+    /// Malformed messages and frames rejected before EVENT parsing are excluded.
+    pub raw_received_items: usize,
+    /// Minimum raw EVENT timestamp counted in `raw_received_items`, even for
+    /// expired, invalid, mismatched, rejected or deleted events. Untrusted paging
+    /// evidence only: neither admission nor proof of historical coverage.
+    pub oldest_raw_created_at: Option<Timestamp>,
+    /// Validated EVENT notifications, including duplicates and the over-budget item.
     pub received_items: usize,
     /// Sum of serialized event JSON lengths, including duplicates and the over-budget item.
     /// This is an estimate of event payload bytes, not WebSocket wire bytes.
@@ -147,6 +162,8 @@ impl RelayAcquisition {
         Self {
             events: BTreeSet::new(),
             end: AcquisitionEnd::ReceiverClosed,
+            raw_received_items: 0,
+            oldest_raw_created_at: None,
             received_items: 0,
             received_event_bytes: 0,
             duplicates: 0,
@@ -161,7 +178,12 @@ impl RelayAcquisition {
         result
     }
 
-    fn accept_event(&mut self, event: Event, limits: AcquisitionLimits) -> bool {
+    fn accept_event(
+        &mut self,
+        event: Event,
+        limits: AcquisitionLimits,
+        budget: ItemBudget,
+    ) -> bool {
         let event_bytes = event.as_json().len();
         self.received_items = match self.received_items.checked_add(1) {
             Some(items) => items,
@@ -177,7 +199,7 @@ impl RelayAcquisition {
                 return false;
             }
         };
-        if self.received_items > limits.max_items {
+        if budget == ItemBudget::Exceeded || self.received_items > limits.max_items {
             self.end = AcquisitionEnd::ItemBudgetExceeded;
             return false;
         }
@@ -193,6 +215,169 @@ impl RelayAcquisition {
             self.high_water_event_bytes = self.high_water_event_bytes.saturating_add(event_bytes);
         }
         true
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ItemBudget {
+    Within,
+    Exceeded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RawPhase {
+    Active,
+    Exhausted,
+    ExhaustedValid,
+}
+
+#[derive(Debug)]
+struct RawEvidence {
+    phase: RawPhase,
+    closed: bool,
+    items: usize,
+    oldest: Option<Timestamp>,
+    forwarded: usize,
+    rejected: bool,
+}
+
+/// Scalar request-owned evidence: no raw EVENT queue or retained event copies.
+#[derive(Debug)]
+pub(crate) struct RawAcquisition {
+    evidence: Mutex<RawEvidence>,
+    max_items: usize,
+    stop_on_eose: bool,
+    terminal: Notify,
+}
+
+impl RawAcquisition {
+    pub(crate) fn new(max_items: usize, policy: ReqExitPolicy) -> Self {
+        Self {
+            evidence: Mutex::new(RawEvidence {
+                phase: RawPhase::Active,
+                closed: false,
+                items: 0,
+                oldest: None,
+                forwarded: 0,
+                rejected: false,
+            }),
+            max_items,
+            stop_on_eose: matches!(policy, ReqExitPolicy::ExitOnEOSE),
+            terminal: Notify::new(),
+        }
+    }
+
+    pub(crate) fn close(&self) {
+        self.evidence.lock().unwrap().closed = true;
+    }
+
+    pub(crate) fn received_eose(&self) {
+        if self.stop_on_eose {
+            self.close();
+        }
+    }
+
+    pub(crate) fn record(&self, created_at: Timestamp) -> bool {
+        let mut evidence = self.evidence.lock().unwrap();
+        if evidence.closed || evidence.phase != RawPhase::Active || evidence.rejected {
+            return false;
+        }
+        let next: Option<usize> = evidence.items.checked_add(1);
+        evidence.items = next.unwrap_or(usize::MAX);
+        evidence.oldest = Some(
+            evidence
+                .oldest
+                .map_or(created_at, |oldest| oldest.min(created_at)),
+        );
+        if next.is_none() || evidence.items > self.max_items {
+            evidence.phase = RawPhase::Exhausted;
+        }
+        // Validate this first overflow frame so existing validated counters
+        // still include it. The collector must not retain it.
+        true
+    }
+
+    pub(crate) fn forward(&self) {
+        let mut evidence = self.evidence.lock().unwrap();
+        if evidence.closed {
+            return;
+        }
+        match evidence.phase {
+            RawPhase::Active => {
+                evidence.forwarded = evidence.forwarded.saturating_add(1);
+            }
+            RawPhase::Exhausted => {
+                evidence.forwarded = evidence.forwarded.saturating_add(1);
+                evidence.phase = RawPhase::ExhaustedValid;
+            }
+            RawPhase::ExhaustedValid => {}
+        }
+    }
+
+    pub(crate) fn processed(&self) {
+        let evidence = self.evidence.lock().unwrap();
+        if matches!(
+            evidence.phase,
+            RawPhase::Exhausted | RawPhase::ExhaustedValid
+        ) {
+            self.terminal.notify_one();
+        }
+    }
+
+    pub(crate) fn reject_input(&self) {
+        let mut evidence = self.evidence.lock().unwrap();
+        if evidence.closed || evidence.rejected {
+            return;
+        }
+        evidence.rejected = true;
+        self.terminal.notify_one();
+    }
+
+    fn terminal_end(&self) -> AcquisitionEnd {
+        if self.evidence.lock().unwrap().rejected {
+            AcquisitionEnd::InvalidMessage
+        } else {
+            AcquisitionEnd::ItemBudgetExceeded
+        }
+    }
+
+    fn item_budget(&self, received: usize) -> ItemBudget {
+        let evidence = self.evidence.lock().unwrap();
+        if evidence.phase == RawPhase::ExhaustedValid
+            && received.saturating_add(1) >= evidence.forwarded
+        {
+            return ItemBudget::Exceeded;
+        }
+        ItemBudget::Within
+    }
+
+    fn drained(&self, received: usize) -> bool {
+        received >= self.evidence.lock().unwrap().forwarded
+    }
+
+    fn finish(&self, result: &mut RelayAcquisition) {
+        let mut evidence = self.evidence.lock().unwrap();
+        result.raw_received_items = evidence.items;
+        result.oldest_raw_created_at = evidence.oldest;
+        if (evidence.rejected
+            || matches!(
+                evidence.phase,
+                RawPhase::Exhausted | RawPhase::ExhaustedValid
+            ))
+            && matches!(
+                result.end,
+                AcquisitionEnd::Completed
+                    | AcquisitionEnd::ExitLimitReached
+                    | AcquisitionEnd::ReceiverClosed
+            )
+        {
+            result.end = if evidence.rejected {
+                AcquisitionEnd::InvalidMessage
+            } else {
+                AcquisitionEnd::ItemBudgetExceeded
+            };
+        }
+        evidence.closed = true;
     }
 }
 
@@ -231,7 +416,20 @@ pub(crate) async fn acquire_relay(
     relay: Relay,
     filters: Vec<Filter>,
     limits: AcquisitionLimits,
+    cancelled: watch::Receiver<bool>,
+) -> RelayAcquisition {
+    let raw: Arc<RawAcquisition> = Arc::new(RawAcquisition::new(limits.max_items, limits.policy));
+    let mut result: RelayAcquisition = acquire_inner(relay, filters, limits, cancelled, &raw).await;
+    raw.finish(&mut result);
+    result
+}
+
+async fn acquire_inner(
+    relay: Relay,
+    filters: Vec<Filter>,
+    limits: AcquisitionLimits,
     mut cancelled: watch::Receiver<bool>,
+    raw: &Arc<RawAcquisition>,
 ) -> RelayAcquisition {
     let mut result = RelayAcquisition::new();
     let deadline = time::sleep(limits.timeout);
@@ -250,9 +448,10 @@ pub(crate) async fn acquire_relay(
         return result;
     }
     let notifications = relay.inner.internal_notification_sender.subscribe();
-    let register = relay
-        .inner
-        .add_acquisition_subscription(id.clone(), filters.clone());
+    let register =
+        relay
+            .inner
+            .add_acquisition_subscription(id.clone(), filters.clone(), raw.clone());
     tokio::pin!(register);
     let register_result = tokio::select! {
         biased;
@@ -308,6 +507,7 @@ pub(crate) async fn acquire_relay(
     );
     setup_guard.id = None;
     let _cancel_on_drop = CancelOnDrop(Some(cancel_tx));
+    let mut raw_terminal: bool = false;
 
     loop {
         if *cancelled.borrow() {
@@ -324,9 +524,23 @@ pub(crate) async fn acquire_relay(
                 result.end = AcquisitionEnd::TimedOut;
                 break;
             }
+            _ = raw.terminal.notified(), if !raw_terminal => {
+                raw_terminal = true;
+                // Drain previously validated notifications through the existing
+                // bounded queue before reporting raw overflow or parse loss.
+                if raw.drained(result.received_items) {
+                    result.end = raw.terminal_end();
+                    break;
+                }
+            }
             activity = activity_rx.recv() => match activity {
                 Some(SubscriptionActivity::ReceivedEvent(event)) => {
-                    if !result.accept_event(event, limits) {
+                    let budget: ItemBudget = raw.item_budget(result.received_items);
+                    if !result.accept_event(event, limits, budget) {
+                        break;
+                    }
+                    if raw_terminal && raw.drained(result.received_items) {
+                        result.end = raw.terminal_end();
                         break;
                     }
                 }
@@ -358,6 +572,57 @@ mod tests {
     }
 
     #[test]
+    fn raw_evidence_stops_at_limit() {
+        let raw: RawAcquisition = RawAcquisition::new(2, ReqExitPolicy::ExitOnEOSE);
+        assert!(raw.record(Timestamp::from(20)));
+        raw.forward();
+        assert!(raw.record(Timestamp::from(20)));
+        assert!(raw.record(Timestamp::from(10)));
+        raw.processed();
+        assert!(!raw.record(Timestamp::from(1)));
+        assert!(!raw.drained(0));
+        assert!(raw.drained(1));
+        let mut result: RelayAcquisition = RelayAcquisition::new();
+        raw.finish(&mut result);
+        assert_eq!(result.raw_received_items, 3);
+        assert_eq!(result.oldest_raw_created_at, Some(Timestamp::from(10)));
+        assert!(matches!(result.end, AcquisitionEnd::ItemBudgetExceeded));
+        assert!(!raw.record(Timestamp::from(0)));
+        assert_eq!(result.received_items, 0);
+        assert_eq!(result.received_event_bytes, 0);
+    }
+
+    #[test]
+    fn raw_parse_loss_survives_eose() {
+        let raw: RawAcquisition = RawAcquisition::new(2, ReqExitPolicy::ExitOnEOSE);
+        raw.reject_input();
+        raw.received_eose();
+        let mut result: RelayAcquisition = RelayAcquisition::new();
+        result.end = AcquisitionEnd::Completed;
+        raw.finish(&mut result);
+        assert!(matches!(result.end, AcquisitionEnd::InvalidMessage));
+        assert_eq!(result.raw_received_items, 0);
+        assert_eq!(result.oldest_raw_created_at, None);
+        assert!(!raw.record(Timestamp::from(1)));
+    }
+
+    #[test]
+    fn raw_eose_ignores_late_input() {
+        let raw = RawAcquisition::new(1, ReqExitPolicy::ExitOnEOSE);
+        assert!(raw.record(Timestamp::from(20)));
+        raw.forward();
+        raw.received_eose();
+        assert!(!raw.record(Timestamp::from(1)));
+        raw.reject_input();
+        let mut result = RelayAcquisition::new();
+        result.end = AcquisitionEnd::Completed;
+        raw.finish(&mut result);
+        assert!(matches!(result.end, AcquisitionEnd::Completed));
+        assert_eq!(result.raw_received_items, 1);
+        assert_eq!(result.oldest_raw_created_at, Some(Timestamp::from(20)));
+    }
+
+    #[test]
     fn large_event_exhausts_byte_budget_and_preserves_partial_result() {
         let small = event("first");
         let small_bytes = small.as_json().len();
@@ -366,8 +631,8 @@ mod tests {
         let limits =
             AcquisitionLimits::new(1, 10, small_bytes + large_bytes - 1, Duration::from_secs(1));
         let mut result = RelayAcquisition::new();
-        assert!(result.accept_event(small, limits));
-        assert!(!result.accept_event(large, limits));
+        assert!(result.accept_event(small, limits, ItemBudget::Within));
+        assert!(!result.accept_event(large, limits, ItemBudget::Within));
         assert!(matches!(result.end, AcquisitionEnd::ByteBudgetExceeded));
         assert_eq!(result.received_event_bytes, small_bytes + large_bytes);
         assert_eq!(result.high_water_items, 1);
@@ -376,13 +641,38 @@ mod tests {
     }
 
     #[test]
+    fn raw_overflow_keeps_valid_stats() {
+        let raw: RawAcquisition = RawAcquisition::new(1, ReqExitPolicy::ExitOnEOSE);
+        assert!(raw.record(Timestamp::from(20)));
+        raw.forward();
+        raw.processed();
+        assert!(raw.record(Timestamp::from(10)));
+        raw.forward();
+        raw.processed();
+        raw.close();
+        assert_eq!(raw.item_budget(0), ItemBudget::Within);
+        assert_eq!(raw.item_budget(1), ItemBudget::Exceeded);
+        assert!(!raw.drained(1));
+        let limits: AcquisitionLimits =
+            AcquisitionLimits::new(1, 10, 100_000, Duration::from_secs(1));
+        let mut result: RelayAcquisition = RelayAcquisition::new();
+        assert!(result.accept_event(event("first"), limits, raw.item_budget(0)));
+        assert!(!result.accept_event(event("overflow"), limits, raw.item_budget(1)));
+        raw.finish(&mut result);
+        assert_eq!(result.raw_received_items, 2);
+        assert_eq!(result.received_items, 2);
+        assert_eq!(result.events.len(), 1);
+        assert!(matches!(result.end, AcquisitionEnd::ItemBudgetExceeded));
+    }
+
+    #[test]
     fn many_small_events_exhaust_item_budget_with_partial_result() {
         let limits = AcquisitionLimits::new(1, 3, 100_000, Duration::from_secs(1));
         let mut result = RelayAcquisition::new();
         for index in 0..3 {
-            assert!(result.accept_event(event(&index.to_string()), limits));
+            assert!(result.accept_event(event(&index.to_string()), limits, ItemBudget::Within));
         }
-        assert!(!result.accept_event(event("fourth"), limits));
+        assert!(!result.accept_event(event("fourth"), limits, ItemBudget::Within));
         assert!(matches!(result.end, AcquisitionEnd::ItemBudgetExceeded));
         assert_eq!(result.events.len(), 3);
         assert_eq!(result.high_water_items, 3);
@@ -396,9 +686,9 @@ mod tests {
         let limits = AcquisitionLimits::new(1, 1_024, 1_024 * bytes, Duration::from_secs(1));
         let mut result = RelayAcquisition::new();
         for _ in 0..1_024 {
-            assert!(result.accept_event(repeated.clone(), limits));
+            assert!(result.accept_event(repeated.clone(), limits, ItemBudget::Within));
         }
-        assert!(!result.accept_event(repeated, limits));
+        assert!(!result.accept_event(repeated, limits, ItemBudget::Within));
         assert!(matches!(result.end, AcquisitionEnd::ItemBudgetExceeded));
         assert_eq!(result.events.len(), 1);
         assert_eq!(result.high_water_event_bytes, bytes);

@@ -136,16 +136,23 @@ mod tests {
     use std::collections::BTreeSet;
     use std::time::{Duration, Instant};
 
-    use futures::{Stream, StreamExt};
-    use nostr::event::{Event, EventBuilder, EventId, FinalizeEvent, Kind};
-    use nostr::filter::Filter;
+    use async_wsocket::native::{self, Message as WsMessage};
+    use futures::{SinkExt, Stream, StreamExt};
+    use nostr::event::{Event, EventBuilder, EventId, FinalizeEvent, Kind, Tag};
+    use nostr::filter::{Filter, MatchEventOptions};
     use nostr::key::Keys;
-    use nostr::message::RelayMessage;
+    use nostr::message::{ClientMessage, RelayMessage, SubscriptionId};
+    use nostr::types::Timestamp;
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
+    use tokio::task::JoinHandle;
     use tokio::time::{sleep, timeout};
 
     use super::*;
     use crate::local_relay::MockRelay;
-    use crate::relay::{AcquisitionEnd, Relay, RelayNotification, ReqExitPolicy};
+    use crate::relay::{
+        AcquisitionEnd, Relay, RelayLimits, RelayMessageLimits, RelayNotification, ReqExitPolicy,
+    };
     use crate::test_utils::setup_client;
 
     #[tokio::test]
@@ -286,6 +293,807 @@ mod tests {
         AcquisitionLimits::new(2, items, 100_000, Duration::from_secs(2))
     }
 
+    #[derive(Clone, Copy)]
+    enum FilteredEvent {
+        Expired,
+        Invalid,
+    }
+
+    fn filtered_event(keys: &Keys, at: u64, rejection: FilteredEvent) -> Event {
+        let builder: EventBuilder = EventBuilder::new(Kind::TextNote, format!("raw-{at}"))
+            .custom_created_at(Timestamp::from(at));
+        match rejection {
+            FilteredEvent::Expired => builder
+                .tags([Tag::expiration(Timestamp::from(1))])
+                .finalize(keys)
+                .unwrap(),
+            FilteredEvent::Invalid => {
+                let mut event: Event = builder.finalize(keys).unwrap();
+                event.sig = EventBuilder::new(Kind::TextNote, "signature for another event")
+                    .finalize(keys)
+                    .unwrap()
+                    .sig;
+                event
+            }
+        }
+    }
+
+    // Unlike MockRelay's database, this socket fixture deliberately serves
+    // expired events and invalid signatures without admitting them first.
+    async fn raw_history_relay(
+        mut events: Vec<Event>,
+    ) -> (RelayUrl, JoinHandle<()>, mpsc::Receiver<SubscriptionId>) {
+        events.sort_by_key(|event| std::cmp::Reverse(event.created_at));
+        let listener: TcpListener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url: RelayUrl =
+            RelayUrl::parse(&format!("ws://{}", listener.local_addr().unwrap())).unwrap();
+        let (closed_tx, closed_rx) = mpsc::channel(4);
+        let server: JoinHandle<()> = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = native::accept_async(stream).await.unwrap();
+            while let Some(Ok(frame)) = socket.next().await {
+                let WsMessage::Text(text) = frame else {
+                    continue;
+                };
+                match ClientMessage::from_json(text.as_str()) {
+                    Ok(ClientMessage::Req {
+                        subscription_id,
+                        filters,
+                    }) => {
+                        for filter in filters {
+                            for event in events
+                                .iter()
+                                .filter(|event| filter.match_event(event, MatchEventOptions::new()))
+                                .take(filter.limit.unwrap_or(usize::MAX))
+                            {
+                                let reply: RelayMessage = RelayMessage::Event {
+                                    subscription_id: Cow::Borrowed(subscription_id.as_ref()),
+                                    event: Cow::Borrowed(event),
+                                };
+                                if socket
+                                    .send(WsMessage::Text(reply.as_json().into()))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                        }
+                        let eose: RelayMessage = RelayMessage::eose(subscription_id.into_owned());
+                        if socket
+                            .send(WsMessage::Text(eose.as_json().into()))
+                            .await
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Ok(ClientMessage::Close(id)) => {
+                        // A queued reply after CLOSE must not affect the next
+                        // request's scalar evidence or enter the shared cache.
+                        if let Some(event) = events.last() {
+                            let late: RelayMessage = RelayMessage::Event {
+                                subscription_id: Cow::Borrowed(id.as_ref()),
+                                event: Cow::Borrowed(event),
+                            };
+                            if socket
+                                .send(WsMessage::Text(late.as_json().into()))
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
+                        }
+                        let _ = closed_tx.try_send(id.into_owned());
+                    }
+                    _ => {}
+                }
+            }
+        });
+        (url, server, closed_rx)
+    }
+
+    #[tokio::test]
+    async fn raw_full_page_finds_older() {
+        for rejection in [FilteredEvent::Expired, FilteredEvent::Invalid] {
+            let keys: Keys = Keys::generate();
+            let older: Event = EventBuilder::new(Kind::TextNote, "older valid commit")
+                .custom_created_at(Timestamp::from(1))
+                .finalize(&keys)
+                .unwrap();
+            let mut events: Vec<Event> = (257..513)
+                .map(|at| filtered_event(&keys, at, rejection))
+                .collect();
+            let filtered_id: EventId = events[0].id;
+            events.push(older.clone());
+            let (url, server, mut closed) = raw_history_relay(events).await;
+            let client: Client = setup_client(url.clone()).await;
+            let report: AcquisitionReport = client
+                .acquire_events(
+                    ReqTarget::single(&url, [Filter::new().kind(Kind::TextNote).limit(256)]),
+                    limits(256),
+                )
+                .await
+                .unwrap()
+                .finish()
+                .await
+                .unwrap();
+            let page: &RelayAcquisition = &report.relays[&url];
+            assert!(matches!(page.end, AcquisitionEnd::Completed));
+            assert_eq!(page.raw_received_items, 256);
+            assert_eq!(page.oldest_raw_created_at, Some(Timestamp::from(257)));
+            assert_eq!(page.received_items, 0);
+            assert_eq!(page.received_event_bytes, 0);
+            assert!(page.events.is_empty());
+            timeout(Duration::from_secs(2), closed.recv())
+                .await
+                .unwrap()
+                .unwrap();
+
+            let report: AcquisitionReport = client
+                .acquire_events(
+                    ReqTarget::single(
+                        &url,
+                        [Filter::new()
+                            .kind(Kind::TextNote)
+                            .until(Timestamp::from(256))
+                            .limit(256)],
+                    ),
+                    limits(256),
+                )
+                .await
+                .unwrap()
+                .finish()
+                .await
+                .unwrap();
+            let page: &RelayAcquisition = &report.relays[&url];
+            assert!(matches!(page.end, AcquisitionEnd::Completed));
+            assert_eq!(page.raw_received_items, 1);
+            assert_eq!(page.oldest_raw_created_at, Some(older.created_at));
+            assert_eq!(page.received_items, 1);
+            assert_eq!(page.events.first().map(|event| event.id), Some(older.id));
+            for id in [filtered_id, older.id] {
+                assert_eq!(
+                    client.database().check_id(&id).await.unwrap(),
+                    nostr_database::DatabaseEventStatus::NotExistent
+                );
+            }
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_parse_loss_is_scoped() {
+        enum Expected {
+            Partial,
+            Completed,
+        }
+        for (input, expected) in [
+            ("[".to_owned(), Expected::Partial),
+            (
+                format!(r#"["NOTICE","{}"]"#, "x".repeat(1_024)),
+                Expected::Partial,
+            ),
+            (
+                format!(r#"["OK","{}",true]"#, "00".repeat(32)),
+                Expected::Completed,
+            ),
+            (r#"["COUNT","request",{}]"#.to_owned(), Expected::Completed),
+            (r#"["UNKNOWN",{}]"#.to_owned(), Expected::Completed),
+        ] {
+            let listener: TcpListener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url: RelayUrl =
+                RelayUrl::parse(&format!("ws://{}", listener.local_addr().unwrap())).unwrap();
+            let server: JoinHandle<()> = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = native::accept_async(stream).await.unwrap();
+                let mut requests: Vec<SubscriptionId> = Vec::with_capacity(2);
+                let mut input: Option<String> = Some(input);
+                while let Some(Ok(frame)) = socket.next().await {
+                    let WsMessage::Text(text) = frame else {
+                        continue;
+                    };
+                    let Ok(ClientMessage::Req {
+                        subscription_id, ..
+                    }) = ClientMessage::from_json(text.as_str())
+                    else {
+                        continue;
+                    };
+                    let id: SubscriptionId = subscription_id.into_owned();
+                    if requests.len() < 2 {
+                        requests.push(id);
+                        if requests.len() == 2 {
+                            socket
+                                .send(WsMessage::Text(input.take().unwrap().into()))
+                                .await
+                                .unwrap();
+                            for request in &requests {
+                                socket
+                                    .send(WsMessage::Text(
+                                        RelayMessage::EndOfStoredEvents(Cow::Borrowed(request))
+                                            .as_json()
+                                            .into(),
+                                    ))
+                                    .await
+                                    .unwrap();
+                            }
+                        }
+                    } else {
+                        socket
+                            .send(WsMessage::Text(RelayMessage::eose(id).as_json().into()))
+                            .await
+                            .unwrap();
+                    }
+                }
+            });
+            let client: Client = Client::default();
+            client
+                .add_relay(&url)
+                .limits(RelayLimits {
+                    messages: RelayMessageLimits {
+                        max_size: Some(512),
+                    },
+                    ..RelayLimits::default()
+                })
+                .await
+                .unwrap();
+            client
+                .try_connect_relay(url.clone())
+                .timeout(Duration::from_secs(2))
+                .await
+                .unwrap();
+            let first: AcquisitionHandle = client
+                .acquire_events(
+                    ReqTarget::single(&url, [Filter::new().kind(Kind::Metadata)]),
+                    limits(4),
+                )
+                .await
+                .unwrap();
+            let second: AcquisitionHandle = client
+                .acquire_events(
+                    ReqTarget::single(&url, [Filter::new().kind(Kind::TextNote)]),
+                    limits(4),
+                )
+                .await
+                .unwrap();
+            let (first, second) = tokio::join!(first.finish(), second.finish());
+            for report in [first.unwrap(), second.unwrap()] {
+                match expected {
+                    Expected::Partial => assert!(matches!(
+                        report.relays[&url].end,
+                        AcquisitionEnd::InvalidMessage
+                    )),
+                    Expected::Completed => {
+                        assert!(matches!(report.relays[&url].end, AcquisitionEnd::Completed))
+                    }
+                }
+                assert_eq!(report.relays[&url].raw_received_items, 0);
+            }
+            let report: AcquisitionReport = client
+                .acquire_events(
+                    ReqTarget::single(&url, [Filter::new().kind(Kind::Metadata)]),
+                    limits(4),
+                )
+                .await
+                .unwrap()
+                .finish()
+                .await
+                .unwrap();
+            assert!(
+                matches!(report.relays[&url].end, AcquisitionEnd::Completed),
+                "a later request must not inherit a closed request's input loss"
+            );
+            client.shutdown().await;
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_eose_keeps_page() {
+        let keys = Keys::generate();
+        let expired = filtered_event(&keys, 20, FilteredEvent::Expired);
+        let live = EventBuilder::new(Kind::TextNote, "queued live input")
+            .custom_created_at(Timestamp::from(1))
+            .finalize(&keys)
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = RelayUrl::parse(&format!("ws://{}", listener.local_addr().unwrap())).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = native::accept_async(stream).await.unwrap();
+            while let Some(Ok(frame)) = socket.next().await {
+                let WsMessage::Text(text) = frame else {
+                    continue;
+                };
+                let Ok(ClientMessage::Req {
+                    subscription_id, ..
+                }) = ClientMessage::from_json(text.as_str())
+                else {
+                    continue;
+                };
+                for _ in 0..256 {
+                    socket
+                        .feed(WsMessage::Text(
+                            RelayMessage::Event {
+                                subscription_id: Cow::Borrowed(subscription_id.as_ref()),
+                                event: Cow::Borrowed(&expired),
+                            }
+                            .as_json()
+                            .into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+                socket
+                    .feed(WsMessage::Text(
+                        RelayMessage::EndOfStoredEvents(Cow::Borrowed(subscription_id.as_ref()))
+                            .as_json()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                socket
+                    .feed(WsMessage::Text(
+                        RelayMessage::Event {
+                            subscription_id: Cow::Borrowed(subscription_id.as_ref()),
+                            event: Cow::Borrowed(&live),
+                        }
+                        .as_json()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                socket.feed(WsMessage::Text("[".into())).await.unwrap();
+                socket.flush().await.unwrap();
+                while let Some(Ok(frame)) = socket.next().await {
+                    let WsMessage::Text(text) = frame else {
+                        continue;
+                    };
+                    if matches!(
+                        ClientMessage::from_json(text.as_str()),
+                        Ok(ClientMessage::Close(_))
+                    ) {
+                        return;
+                    }
+                }
+                return;
+            }
+        });
+        let client = setup_client(url.clone()).await;
+        let report = client
+            .acquire_events(
+                ReqTarget::single(&url, [Filter::new().kind(Kind::TextNote).limit(256)]),
+                limits(256),
+            )
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        let page = &report.relays[&url];
+        assert!(
+            matches!(page.end, AcquisitionEnd::Completed),
+            "{:?}",
+            page.end
+        );
+        assert_eq!(page.raw_received_items, 256);
+        assert_eq!(page.oldest_raw_created_at, Some(Timestamp::from(20)));
+        assert_eq!(page.received_items, 0);
+        assert!(page.events.is_empty());
+        timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
+        client.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn raw_parse_loss_is_incomplete() {
+        let valid: Event = EventBuilder::new(Kind::Metadata, "unaffected request")
+            .finalize(&Keys::generate())
+            .unwrap();
+        let expected: EventId = valid.id;
+        let live: Event = EventBuilder::new(Kind::Custom(4_000), "live before parse loss")
+            .finalize(&Keys::generate())
+            .unwrap();
+        let live_expected: EventId = live.id;
+        let update: Event = EventBuilder::new(Kind::Custom(4_000), "live after parse loss")
+            .finalize(&Keys::generate())
+            .unwrap();
+        let update_expected: EventId = update.id;
+        let listener: TcpListener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url: RelayUrl =
+            RelayUrl::parse(&format!("ws://{}", listener.local_addr().unwrap())).unwrap();
+        let server: JoinHandle<()> = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = native::accept_async(stream).await.unwrap();
+            let mut live_subscription: Option<SubscriptionId> = None;
+            while let Some(Ok(frame)) = socket.next().await {
+                let WsMessage::Text(text) = frame else {
+                    continue;
+                };
+                match ClientMessage::from_json(text.as_str()) {
+                    Ok(ClientMessage::Req {
+                        subscription_id,
+                        filters,
+                    }) => {
+                        let event: Option<&Event> = [&valid, &live].into_iter().find(|event| {
+                            filters
+                                .iter()
+                                .any(|filter| filter.match_event(event, MatchEventOptions::new()))
+                        });
+                        if event.is_some_and(|event| event.id == live.id) {
+                            live_subscription = Some(subscription_id.as_ref().clone());
+                        }
+                        let reply: String = match event {
+                            Some(event) => RelayMessage::Event {
+                                subscription_id: Cow::Borrowed(subscription_id.as_ref()),
+                                event: Cow::Borrowed(event),
+                            }
+                            .as_json(),
+                            None => format!(
+                                r#"["EVENT","{}",{{"created_at":"invalid"}}]"#,
+                                subscription_id
+                            ),
+                        };
+                        socket.send(WsMessage::Text(reply.into())).await.unwrap();
+                        socket
+                            .send(WsMessage::Text(
+                                RelayMessage::eose(subscription_id.into_owned())
+                                    .as_json()
+                                    .into(),
+                            ))
+                            .await
+                            .unwrap();
+                        if event.is_none() {
+                            if let Some(id) = &live_subscription {
+                                let delivery: RelayMessage = RelayMessage::Event {
+                                    subscription_id: Cow::Borrowed(id),
+                                    event: Cow::Borrowed(&update),
+                                };
+                                socket
+                                    .send(WsMessage::Text(delivery.as_json().into()))
+                                    .await
+                                    .unwrap();
+                            }
+                        }
+                    }
+                    Ok(ClientMessage::Close(id)) => {
+                        let late: String = format!(r#"["EVENT","{}",{{}}]"#, id);
+                        if socket.send(WsMessage::Text(late.into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let client: Client = setup_client(url.clone()).await;
+        let connection: Relay = client.pool().relay(&url).await.unwrap();
+        let mut notifications = connection.notifications();
+        let live_id: SubscriptionId = connection
+            .subscribe(Filter::new().kind(Kind::Custom(4_000)))
+            .await
+            .unwrap();
+        let pending: AcquisitionHandle = client
+            .acquire_events(
+                ReqTarget::single(&url, [Filter::new().id(expected)]),
+                limits(4).policy(ReqExitPolicy::WaitDurationAfterEOSE(Duration::from_secs(5))),
+            )
+            .await
+            .unwrap();
+        wait_for_acquisition_eose(&connection, &mut notifications).await;
+        let report: AcquisitionReport = client
+            .acquire_events(
+                ReqTarget::single(&url, [Filter::new().kind(Kind::TextNote)]),
+                limits(4),
+            )
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        let page: &RelayAcquisition = &report.relays[&url];
+        assert!(matches!(page.end, AcquisitionEnd::InvalidMessage));
+        assert_eq!(page.raw_received_items, 0);
+        assert_eq!(page.oldest_raw_created_at, None);
+        assert_eq!(page.received_items, 0);
+        assert!(page.events.is_empty());
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(RelayNotification::Event {
+                    subscription_id,
+                    event,
+                    ..
+                }) = notifications.next().await
+                {
+                    if subscription_id == live_id && event.id == update_expected {
+                        break;
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(connection.inner.subscription(&live_id).await.is_some());
+        for id in [live_expected, update_expected] {
+            assert_eq!(
+                client.database().check_id(&id).await.unwrap(),
+                nostr_database::DatabaseEventStatus::Saved
+            );
+        }
+        pending.cancel();
+        let report: AcquisitionReport = pending.finish().await.unwrap();
+        let page: &RelayAcquisition = &report.relays[&url];
+        assert!(matches!(page.end, AcquisitionEnd::Cancelled));
+        assert_eq!(page.raw_received_items, 1);
+        assert_eq!(page.events.first().map(|event| event.id), Some(expected));
+        let report: AcquisitionReport = client
+            .acquire_events(
+                ReqTarget::single(&url, [Filter::new().id(expected)]),
+                limits(4),
+            )
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        assert!(matches!(report.relays[&url].end, AcquisitionEnd::Completed));
+        assert_eq!(report.relays[&url].raw_received_items, 1);
+        assert_eq!(
+            client.database().check_id(&expected).await.unwrap(),
+            nostr_database::DatabaseEventStatus::NotExistent
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn raw_mixed_page_keeps_ties() {
+        let keys: Keys = Keys::generate();
+        let newest: Event = EventBuilder::new(Kind::TextNote, "newest")
+            .custom_created_at(Timestamp::from(500))
+            .finalize(&keys)
+            .unwrap();
+        let older: Event = EventBuilder::new(Kind::TextNote, "older")
+            .custom_created_at(Timestamp::from(100))
+            .finalize(&keys)
+            .unwrap();
+        let invalid: Event = filtered_event(&keys, 400, FilteredEvent::Invalid);
+        let (url, server, _) = raw_history_relay(vec![
+            newest.clone(),
+            older.clone(),
+            filtered_event(&keys, 400, FilteredEvent::Expired),
+            invalid.clone(),
+            invalid,
+        ])
+        .await;
+        let client: Client = setup_client(url.clone()).await;
+        let report: AcquisitionReport = client
+            .acquire_events(
+                ReqTarget::single(&url, [Filter::new().kind(Kind::TextNote).limit(4)]),
+                limits(4),
+            )
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        let page: &RelayAcquisition = &report.relays[&url];
+        assert!(matches!(page.end, AcquisitionEnd::Completed));
+        assert_eq!(page.raw_received_items, 4);
+        assert_eq!(page.oldest_raw_created_at, Some(Timestamp::from(400)));
+        assert_eq!(page.received_items, 1);
+        assert_eq!(page.events.first().map(|event| event.id), Some(newest.id));
+
+        // Inclusive until preserves ties. Raw metadata does not certify that
+        // every event sharing a saturated boundary timestamp was returned.
+        let report: AcquisitionReport = client
+            .acquire_events(
+                ReqTarget::single(
+                    &url,
+                    [Filter::new()
+                        .kind(Kind::TextNote)
+                        .until(page.oldest_raw_created_at.unwrap())
+                        .limit(4)],
+                ),
+                limits(4),
+            )
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        let page: &RelayAcquisition = &report.relays[&url];
+        assert!(matches!(page.end, AcquisitionEnd::Completed));
+        assert_eq!(page.raw_received_items, 4);
+        assert_eq!(page.oldest_raw_created_at, Some(older.created_at));
+        assert_eq!(page.received_items, 1);
+        assert_eq!(page.events.first().map(|event| event.id), Some(older.id));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn raw_limits_and_cancel_cleanup() {
+        let keys: Keys = Keys::generate();
+        let mut events: Vec<Event> = (100..120)
+            .map(|at| filtered_event(&keys, at, FilteredEvent::Expired))
+            .collect();
+        let older: Event = EventBuilder::new(Kind::TextNote, "late valid")
+            .custom_created_at(Timestamp::from(1))
+            .finalize(&keys)
+            .unwrap();
+        events.push(older.clone());
+        let (url, server, mut closed) = raw_history_relay(events).await;
+        let client: Client = setup_client(url.clone()).await;
+        let connection: Relay = client.pool().relay(&url).await.unwrap();
+        let report: AcquisitionReport = client
+            .acquire_events(
+                ReqTarget::single(&url, [Filter::new().kind(Kind::TextNote)]),
+                limits(4),
+            )
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        let page: &RelayAcquisition = &report.relays[&url];
+        assert!(matches!(page.end, AcquisitionEnd::ItemBudgetExceeded));
+        assert_eq!(page.raw_received_items, 5);
+        assert_eq!(page.oldest_raw_created_at, Some(Timestamp::from(115)));
+        assert_eq!(page.received_items, 0);
+        assert!(page.events.is_empty());
+        timeout(Duration::from_secs(2), closed.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut notifications = connection.notifications();
+        let handle: AcquisitionHandle = client
+            .acquire_events(
+                ReqTarget::single(&url, [Filter::new().kind(Kind::TextNote).limit(2)]),
+                limits(4).policy(ReqExitPolicy::WaitDurationAfterEOSE(Duration::from_secs(5))),
+            )
+            .await
+            .unwrap();
+        wait_for_acquisition_eose(&connection, &mut notifications).await;
+        handle.cancel();
+        let report: AcquisitionReport = handle.finish().await.unwrap();
+        let page: &RelayAcquisition = &report.relays[&url];
+        assert!(matches!(page.end, AcquisitionEnd::Cancelled));
+        assert_eq!(page.raw_received_items, 2);
+        assert_eq!(page.oldest_raw_created_at, Some(Timestamp::from(118)));
+        assert_eq!(page.received_items, 0);
+        timeout(Duration::from_secs(2), closed.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let report: AcquisitionReport = client
+            .acquire_events(
+                ReqTarget::single(&url, [Filter::new().id(older.id)]),
+                limits(4),
+            )
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        let page: &RelayAcquisition = &report.relays[&url];
+        assert!(matches!(page.end, AcquisitionEnd::Completed));
+        assert_eq!(page.raw_received_items, 1);
+        assert_eq!(page.received_items, 1);
+        assert_eq!(page.oldest_raw_created_at, Some(older.created_at));
+        assert_eq!(
+            client.database().check_id(&older.id).await.unwrap(),
+            nostr_database::DatabaseEventStatus::NotExistent
+        );
+        timeout(Duration::from_secs(2), async {
+            while connection.inner.active_subscription_count().await != 0 {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn raw_requests_keep_evidence() {
+        let keys: Keys = Keys::generate();
+        let expired: Event = filtered_event(&keys, 200, FilteredEvent::Expired);
+        let valid: Event = EventBuilder::new(Kind::TextNote, "other acquisition")
+            .custom_created_at(Timestamp::from(100))
+            .finalize(&keys)
+            .unwrap();
+        let live: Event = EventBuilder::new(Kind::Metadata, "live subscription")
+            .custom_created_at(Timestamp::from(50))
+            .finalize(&keys)
+            .unwrap();
+        let (url, server, _) =
+            raw_history_relay(vec![expired.clone(), valid.clone(), live.clone()]).await;
+        let client: Client = setup_client(url.clone()).await;
+        let connection: Relay = client.pool().relay(&url).await.unwrap();
+        let mut notifications = connection.notifications();
+        let live_id: SubscriptionId = connection
+            .subscribe(Filter::new().id(live.id))
+            .await
+            .unwrap();
+        let pending: AcquisitionHandle = client
+            .acquire_events(
+                ReqTarget::single(&url, [Filter::new().id(expired.id)]),
+                limits(4).policy(ReqExitPolicy::WaitDurationAfterEOSE(Duration::from_secs(5))),
+            )
+            .await
+            .unwrap();
+        wait_for_acquisition_eose(&connection, &mut notifications).await;
+
+        let report: AcquisitionReport = client
+            .acquire_events(
+                ReqTarget::single(&url, [Filter::new().id(valid.id)]),
+                limits(4),
+            )
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        let page: &RelayAcquisition = &report.relays[&url];
+        assert!(matches!(page.end, AcquisitionEnd::Completed));
+        assert_eq!(page.raw_received_items, 1);
+        assert_eq!(page.oldest_raw_created_at, Some(valid.created_at));
+        pending.cancel();
+        let report: AcquisitionReport = pending.finish().await.unwrap();
+        let page: &RelayAcquisition = &report.relays[&url];
+        assert!(matches!(page.end, AcquisitionEnd::Cancelled));
+        assert_eq!(page.raw_received_items, 1);
+        assert_eq!(page.oldest_raw_created_at, Some(expired.created_at));
+        assert_eq!(page.received_items, 0);
+        assert!(connection.inner.subscription(&live_id).await.is_some());
+        assert_eq!(
+            client.database().check_id(&valid.id).await.unwrap(),
+            nostr_database::DatabaseEventStatus::NotExistent
+        );
+        assert_eq!(
+            client.database().check_id(&live.id).await.unwrap(),
+            nostr_database::DatabaseEventStatus::Saved
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn raw_filtered_overflow_counts() {
+        let keys: Keys = Keys::generate();
+        let valid: Event = EventBuilder::new(Kind::TextNote, "valid overflow")
+            .custom_created_at(Timestamp::from(1))
+            .finalize(&keys)
+            .unwrap();
+        let mut events: Vec<Event> = (100..104)
+            .map(|at| filtered_event(&keys, at, FilteredEvent::Expired))
+            .collect();
+        events.push(valid.clone());
+        let (url, server, _) = raw_history_relay(events).await;
+        let client: Client = setup_client(url.clone()).await;
+        let report: AcquisitionReport = client
+            .acquire_events(
+                ReqTarget::single(&url, [Filter::new().kind(Kind::TextNote)]),
+                limits(4),
+            )
+            .await
+            .unwrap()
+            .finish()
+            .await
+            .unwrap();
+        let page: &RelayAcquisition = &report.relays[&url];
+        assert!(matches!(page.end, AcquisitionEnd::ItemBudgetExceeded));
+        assert_eq!(page.raw_received_items, 5);
+        assert_eq!(page.oldest_raw_created_at, Some(valid.created_at));
+        assert_eq!(page.received_items, 1);
+        assert_eq!(page.received_event_bytes, valid.as_json().len());
+        assert!(page.events.is_empty());
+        assert_eq!(page.high_water_items, 0);
+        server.abort();
+    }
+
     async fn wait_for_acquisition_eose<S>(relay: &Relay, notifications: &mut S)
     where
         S: Stream<Item = RelayNotification> + Unpin,
@@ -348,6 +1156,7 @@ mod tests {
         let first = &first.relays[&url];
         assert!(matches!(first.end, AcquisitionEnd::ItemBudgetExceeded));
         assert_eq!(first.events.len(), 3);
+        assert_eq!(first.raw_received_items, 4);
         assert_eq!(first.received_items, 4);
         assert_eq!(first.high_water_items, 3);
         let first_high_water_bytes = first.high_water_event_bytes;

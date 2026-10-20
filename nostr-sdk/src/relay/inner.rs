@@ -13,6 +13,7 @@ use async_wsocket::Message;
 use futures::{self, SinkExt, StreamExt};
 use nostr::filter::MatchEventOptions;
 use nostr::message::MachineReadablePrefix;
+use nostr::message::relay::RelayMessageContext;
 use nostr::nips::nip42;
 use nostr_database::prelude::*;
 #[cfg(not(target_arch = "wasm32"))]
@@ -41,6 +42,7 @@ use crate::client::ClientNotification;
 use crate::error::{Error, ErrorKind};
 use crate::mutex::{NonPoisoningMutex, NonPoisoningMutexGuard};
 use crate::policy::AdmitStatus;
+use crate::relay::RawAcquisition;
 use crate::shared::SharedState;
 use crate::transport::websocket::{WebSocketSink, WebSocketStream};
 
@@ -264,7 +266,7 @@ struct SubscriptionData {
     pub subscribed_connection: usize,
     pub is_auto_closing: bool,
     /// Request-local acquisitions do not publish into the shared event cache.
-    pub is_acquisition: bool,
+    pub acquisition: Option<Arc<RawAcquisition>>,
     /// Received EOSE msg
     pub received_eose: bool,
     /// Number of received events
@@ -275,6 +277,18 @@ struct SubscriptionData {
     pending_req_counter: Option<PendingReqCounter>,
 }
 
+// Signal raw exhaustion only after this frame has either been rejected or
+// forwarded. The collector can then drain all preceding validated traffic.
+struct RawFrame(Option<Arc<RawAcquisition>>);
+
+impl Drop for RawFrame {
+    fn drop(&mut self) {
+        if let Some(raw) = &self.0 {
+            raw.processed();
+        }
+    }
+}
+
 impl SubscriptionData {
     #[inline]
     fn long_lived(filters: Vec<Filter>, subscribed_connection: usize) -> Self {
@@ -282,7 +296,7 @@ impl SubscriptionData {
             filters,
             subscribed_connection,
             is_auto_closing: false,
-            is_acquisition: false,
+            acquisition: None,
             received_eose: false,
             received_events: AtomicUsize::new(0),
             closed: false,
@@ -291,12 +305,12 @@ impl SubscriptionData {
     }
 
     #[inline]
-    fn auto_closing(filters: Vec<Filter>, is_acquisition: bool) -> Self {
+    fn auto_closing(filters: Vec<Filter>, acquisition: Option<Arc<RawAcquisition>>) -> Self {
         Self {
             filters,
             subscribed_connection: 0,
             is_auto_closing: true,
-            is_acquisition,
+            acquisition,
             received_eose: false,
             received_events: AtomicUsize::new(0),
             closed: false,
@@ -573,8 +587,9 @@ impl InnerRelay {
         &self,
         id: SubscriptionId,
         filters: Vec<Filter>,
+        raw: Arc<RawAcquisition>,
     ) -> Result<(), Error> {
-        self.register_auto_closing_subscription(id, filters, true)
+        self.register_auto_closing_subscription(id, filters, Some(raw))
             .await
     }
 
@@ -584,7 +599,7 @@ impl InnerRelay {
         id: SubscriptionId,
         filters: Vec<Filter>,
     ) -> Result<(), Error> {
-        self.register_auto_closing_subscription(id, filters, false)
+        self.register_auto_closing_subscription(id, filters, None)
             .await
     }
 
@@ -602,7 +617,7 @@ impl InnerRelay {
         &self,
         id: SubscriptionId,
         filters: Vec<Filter>,
-        is_acquisition: bool,
+        acquisition: Option<Arc<RawAcquisition>>,
     ) -> Result<(), Error> {
         #[cfg(test)]
         let gate = self.atomic.registration_gate.lock().take();
@@ -617,7 +632,7 @@ impl InnerRelay {
             return Err(Error::invalid_msg("subscription ID already exists"));
         }
 
-        subscriptions.insert(id, SubscriptionData::auto_closing(filters, is_acquisition));
+        subscriptions.insert(id, SubscriptionData::auto_closing(filters, acquisition));
 
         Ok(())
     }
@@ -656,7 +671,7 @@ impl InnerRelay {
             .get_mut(id)
             .ok_or_else(|| Error::not_found("subscription not found"))?;
 
-        *data = SubscriptionData::auto_closing(filters, data.is_acquisition);
+        *data = SubscriptionData::auto_closing(filters, data.acquisition.clone());
 
         Ok(())
     }
@@ -674,6 +689,9 @@ impl InnerRelay {
         let mut subscriptions = self.atomic.subscriptions.write().await;
         if let Some(data) = subscriptions.get_mut(id) {
             data.received_eose = true;
+            if let Some(raw) = &data.acquisition {
+                raw.received_eose();
+            }
         }
     }
 
@@ -1566,6 +1584,15 @@ impl InnerRelay {
         }
     }
 
+    async fn reject_unattributed(&self) {
+        let subscriptions = self.atomic.subscriptions.read().await;
+        for subscription in subscriptions.values() {
+            if let Some(raw) = &subscription.acquisition {
+                raw.reject_input();
+            }
+        }
+    }
+
     async fn handle_raw_relay_message(
         &self,
         msg: &str,
@@ -1585,12 +1612,36 @@ impl InnerRelay {
         if let Some(max_size) = self.opts.limits.messages.max_size {
             let max_size: usize = max_size as usize;
             if size > max_size {
+                self.reject_unattributed().await;
                 return Err(Error::limit_exceeded("relay message too large"));
             }
         }
 
-        // Handle msg
-        match RelayMessage::from_json(msg)? {
+        // Preserve a decoded EVENT ID on parse failure without reparsing the
+        // frame. A subsequent EOSE cannot turn lost request input into an
+        // apparently empty completed acquisition.
+        let mut context = RelayMessageContext::Unknown;
+        let parsed = RelayMessage::from_json_with_context(msg, &mut context);
+        if parsed.is_err() {
+            match context {
+                RelayMessageContext::Event(Some(id)) => {
+                    if id.as_str().starts_with(&self.atomic.acquisition_namespace) {
+                        let subscriptions = self.atomic.subscriptions.read().await;
+                        if let Some(raw) = subscriptions
+                            .get(&id)
+                            .and_then(|data| data.acquisition.as_ref())
+                        {
+                            raw.reject_input();
+                        }
+                    }
+                }
+                RelayMessageContext::Unknown | RelayMessageContext::Event(None) => {
+                    self.reject_unattributed().await;
+                }
+                RelayMessageContext::NonEvent => {}
+            }
+        }
+        match parsed? {
             RelayMessage::Event {
                 subscription_id,
                 event,
@@ -1610,18 +1661,24 @@ impl InnerRelay {
         let own_acquisition_id = subscription_id
             .as_str()
             .starts_with(&self.atomic.acquisition_namespace);
-        // A relay may send queued frames after CLOSE. Discard a closed
-        // request before size checks, which would otherwise log raw EVENT JSON.
-        if own_acquisition_id
-            && !self
-                .atomic
-                .subscriptions
-                .read()
-                .await
-                .contains_key(&subscription_id)
-        {
-            return Ok(None);
-        }
+        // Attribute raw evidence under the registry lock, before event size,
+        // filter, expiry, verification, admission or deletion checks. Closed
+        // generated IDs never touch evidence or the shared live cache.
+        let raw: Option<Arc<RawAcquisition>> = if own_acquisition_id {
+            let subscriptions = self.atomic.subscriptions.read().await;
+            let Some(subscription) = subscriptions.get(&subscription_id) else {
+                return Ok(None);
+            };
+            if let Some(raw) = &subscription.acquisition {
+                if !raw.record(event.created_at) {
+                    return Ok(None);
+                }
+            }
+            subscription.acquisition.clone()
+        } else {
+            None
+        };
+        let raw: RawFrame = RawFrame(raw);
 
         // Check event size
         if let Some(max_size) = self.opts.limits.events.get_max_size(&event.kind) {
@@ -1708,7 +1765,7 @@ impl InnerRelay {
                     ));
                 }
             }
-            subscription.is_some_and(|data| data.is_acquisition)
+            subscription.is_some_and(|data| data.acquisition.is_some())
         } else {
             // All generated acquisition IDs have the private prefix. Ordinary
             // traffic keeps the default no-lock path when verification is off.
@@ -1783,6 +1840,10 @@ impl InnerRelay {
             if let Some(gossip) = &self.state.gossip {
                 gossip.process(&event, Some(&self.url)).await?;
             }
+        }
+
+        if let Some(raw) = &raw.0 {
+            raw.forward();
         }
 
         Ok(Some(RelayMessage::Event {
@@ -2079,6 +2140,13 @@ impl InnerRelay {
     ) {
         let relay = self.clone(); // <-- FULL RELAY CLONE HERE
         task::spawn(async move {
+            let acquisition = relay
+                .atomic
+                .subscriptions
+                .read()
+                .await
+                .get(&id)
+                .and_then(|data| data.acquisition.clone());
             // Create a handle auto-closing future
             let handle_fut =
                 relay.handle_auto_closing(&id, &filters, opts, notifications, &activity);
@@ -2098,6 +2166,10 @@ impl InnerRelay {
                 // No cancel receiver, await directly the handle auto-closing future
                 None => handle_fut.await,
             };
+
+            if let Some(raw) = acquisition {
+                raw.close();
+            }
 
             // Check if CLOSE needed
             let to_close: bool = match result {
@@ -4473,7 +4545,11 @@ mod tests {
         let acquire_id = relay.inner.acquisition_subscription_id();
         relay
             .inner
-            .add_acquisition_subscription(acquire_id.clone(), vec![filter.clone()])
+            .add_acquisition_subscription(
+                acquire_id.clone(),
+                vec![filter.clone()],
+                Arc::new(RawAcquisition::new(usize::MAX, ReqExitPolicy::ExitOnEOSE)),
+            )
             .await
             .unwrap();
 
@@ -4548,7 +4624,11 @@ mod tests {
         let id = relay.inner.acquisition_subscription_id();
         relay
             .inner
-            .add_acquisition_subscription(id.clone(), vec![Filter::new().id(event.id)])
+            .add_acquisition_subscription(
+                id.clone(),
+                vec![Filter::new().id(event.id)],
+                Arc::new(RawAcquisition::new(usize::MAX, ReqExitPolicy::ExitOnEOSE)),
+            )
             .await
             .unwrap();
         let mut forged = event.clone();
@@ -4597,7 +4677,11 @@ mod tests {
         let id = relay.inner.acquisition_subscription_id();
         relay
             .inner
-            .add_acquisition_subscription(id.clone(), vec![Filter::new().id(event.id)])
+            .add_acquisition_subscription(
+                id.clone(),
+                vec![Filter::new().id(event.id)],
+                Arc::new(RawAcquisition::new(usize::MAX, ReqExitPolicy::ExitOnEOSE)),
+            )
             .await
             .unwrap();
         relay.inner.remove_subscription(&id).await;
@@ -4706,7 +4790,11 @@ mod tests {
         let late_id = limited.inner.acquisition_subscription_id();
         limited
             .inner
-            .add_acquisition_subscription(late_id.clone(), vec![Filter::new().id(event.id)])
+            .add_acquisition_subscription(
+                late_id.clone(),
+                vec![Filter::new().id(event.id)],
+                Arc::new(RawAcquisition::new(usize::MAX, ReqExitPolicy::ExitOnEOSE)),
+            )
             .await
             .unwrap();
         limited.inner.remove_subscription(&late_id).await;
