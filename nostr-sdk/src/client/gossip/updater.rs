@@ -524,6 +524,16 @@ mod tests {
         client_builder_with_gossip().build()
     }
 
+    /// Run a relay that rejects every negentropy request, so the gossip sync fails
+    /// and the client falls back to a `REQ`.
+    async fn run_relay_without_negentropy() -> LocalRelay {
+        let relay = LocalRelay::builder()
+            .max_negentropy_subscriptions(0)
+            .build();
+        relay.run().await.unwrap();
+        relay
+    }
+
     async fn assert_nip65_status(
         client: &Client,
         public_key: PublicKey,
@@ -586,10 +596,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_marks_missing_gossip_key_checked_when_all_fallback_relays_active() {
-        let mock1 = MockRelay::run().await.unwrap();
-        let url1 = mock1.url().await;
-        let mock2 = MockRelay::run().await.unwrap();
-        let url2 = mock2.url().await;
+        let relay1 = run_relay_without_negentropy().await;
+        let url1 = relay1.url().await;
+        let relay2 = run_relay_without_negentropy().await;
+        let url2 = relay2.url().await;
 
         let client = client_with_gossip();
         client.add_relay(&url1).await.unwrap();
@@ -609,8 +619,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_marks_missing_gossip_key_checked_when_some_fallback_relays_active() {
-        let mock1 = MockRelay::run().await.unwrap();
-        let url1 = mock1.url().await;
+        let relay1 = run_relay_without_negentropy().await;
+        let url1 = relay1.url().await;
 
         let inactive1 = RelayUrl::parse("ws://inactive1-fake.myfakedomain.local").unwrap();
 
@@ -632,11 +642,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_fetches_newer_gossip_list_from_failed_sync_relays() {
-        // Reject every negentropy request, so the sync fails and the client falls back to a REQ.
-        let local = LocalRelay::builder()
-            .max_negentropy_subscriptions(0)
-            .build();
-        local.run().await.unwrap();
+        let local = run_relay_without_negentropy().await;
         let url = local.url().await;
 
         let keys = Keys::generate();
