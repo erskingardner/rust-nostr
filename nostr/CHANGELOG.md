@@ -35,6 +35,9 @@
 
 ### Added
 
+- Add `RelayMessage::from_json_with_context` and `RelayMessageContext` to distinguish
+  lost EVENT input from malformed control messages, preserving an already-decoded
+  EVENT subscription ID without reparsing or copying it.
 - Impl `From<PublicKey>` for `Tag` (https://github.com/nostrdevkit/nostr/pull/1446)
 - Take an `Into<Tag>` iterator instead of `Tag` iterator in
   `GiftWrapBuilder::extra_tags`, `PrivateDirectMessageBuilder::extra_tags`

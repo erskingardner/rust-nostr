@@ -44,15 +44,24 @@ for (url, outcome) in report.relays {
 ## Resource contract
 
 Limits are per relay, and the call rejects more than `max_relays` selected
-targets. All selected relays run concurrently. `max_items` counts every received
-EVENT notification, including duplicates and the first over-limit item.
-`max_event_bytes` counts `Event::as_json().len()` for those same notifications.
+targets. All selected relays run concurrently. `max_items` counts raw EVENTs
+received for the request, including filtered events, duplicates and the first
+over-limit item. That overflow frame is still validated and, if valid, counted
+in the validated counters, but it is never retained. Later frames for the
+exhausted request are discarded before validation. Validated notifications
+already queued are drained before the request ends, unless it is cancelled,
+times out or fails first.
+
+`max_event_bytes` counts `Event::as_json().len()` for validated EVENT
+notifications, including duplicates and the first over-budget notification.
 This is a serialized event JSON estimate, excluding EVENT envelope, subscription
-ID, WebSocket framing, TLS, and retransmission. A duplicate consumes both
-budgets. The first over-limit event is counted but not retained; its outcome is
-incomplete. Once exactly at a budget, the request waits for its normal terminal
-message or the next event. It never silently drops a possible new event and
-then reports completion.
+ID, WebSocket framing, TLS, and retransmission. Rejected raw events do not
+consume it; the item cap, deadline and connection message limit bound their
+processing.
+
+Once exactly at a budget, the request waits for its normal terminal message or
+the next event. It never silently drops a possible new event and then reports
+completion.
 
 Distinct retained events live in one `BTreeSet<Event>`, which is also the
 deduplication state. It holds at most `max_items` events and at most
@@ -66,6 +75,38 @@ retained event JSON estimate is at most `max_relays * max_event_bytes`; this is
 **not** a process memory bound.
 Rust `Event` structure and tree nodes add overhead, `as_json()` allocates a
 temporary string, and an over-budget item can be larger than the budget.
+
+### Raw evidence and validated results
+
+Each `RelayAcquisition` exposes two views of the request:
+
+- `raw_received_items` counts parsed EVENTs for the request before size, tag,
+  filter, expiry, signature, admission or deletion checks. It includes
+  duplicates and the first over-budget frame, then stops.
+  `oldest_raw_created_at` is the minimum `created_at` among them.
+- `events`, `received_items`, `received_event_bytes`, `duplicates` and the
+  high-water counters cover only validated notifications.
+
+A completed page can therefore hold 256 expired or invalid raw events and no
+validated ones while older valid history remains. The raw count and timestamp
+distinguish that case from a genuinely empty page. They are untrusted paging
+hints, not admission, a coverage certificate or a cursor: duplicate or
+dishonest timestamps and relay truncation still need caller-owned paging
+policy, and stepping one second below a saturated boundary can skip ties.
+
+Messages that fail to parse are not counted. If the parser decoded the EVENT
+subscription ID, only that acquisition ends as `InvalidMessage`. If the message
+type or EVENT ID could not be decoded, or the message exceeded the connection
+size limit, every active acquisition on that connection ends as
+`InvalidMessage`. Malformed non-EVENT messages do not affect acquisitions. A
+later EOSE cannot turn lost input into an empty completed page, and live
+subscriptions are unaffected.
+
+Evidence is scalar per-request state attributed under the subscription registry
+lock; there is no raw-event queue. With `ExitOnEOSE` it freezes at EOSE in wire
+order, so input queued after EOSE cannot change the outcome. Other policies
+freeze it when the auto-closing handler stops, so count-based policies have no
+wire-order cutoff at the n-th validated event.
 
 Connection-level buffers are shared by all subscriptions. The default relay
 notification broadcast has 2,048 slots; its occupants can include parsed
@@ -98,9 +139,10 @@ rejected without a retained tombstone or connection-wide teardown.
 
 Each relay reports `Completed`, `ExitLimitReached`, `ItemBudgetExceeded`,
 `ByteBudgetExceeded`, `Cancelled`, `TimedOut`, `Disconnected`, `ReceiveLoss`,
-`ReceiverClosed`, `AuthenticationFailed`, `Rejected`, `RelayClosed`, or setup
-`Failed`. An unprefixed relay `CLOSED` before the request exit policy is
-satisfied is `RelayClosed`, including during the post-EOSE grace interval.
+`InvalidMessage`, `ReceiverClosed`, `AuthenticationFailed`, `Rejected`,
+`RelayClosed`, or setup `Failed`. An unprefixed relay `CLOSED` before the
+request exit policy is satisfied is `RelayClosed`, including during the
+post-EOSE grace interval.
 Only `Completed` satisfies the chosen request exit policy. This says nothing
 about durable MDK admission or full historical coverage. A configured relay
 count exit policy is incomplete even if the relay stopped normally. There is
@@ -112,7 +154,7 @@ unknown missing history efficiently.
 
 The test `finite_explicit_id_reacquisition_preserves_partial_and_reports_traffic`
 stores eight known events. One three-item-budget query returns three events
-and `ItemBudgetExceeded` after four received EVENT notifications. Four
+and `ItemBudgetExceeded` after four received EVENTs. Four
 two-ID batches then acquire all eight IDs. A measured run used five requests,
 12 EVENT notifications, 4,176 estimated serialized event bytes, 6,695
 connection text bytes received, and 1,020 connection text bytes sent (7,715
@@ -141,3 +183,10 @@ cleanup. Tests print cancellation and live-delivery elapsed times and the
 request's retained-state high-water counters. These are local latency samples,
 not service-level guarantees. Run them with
 `cargo test -p nostr-sdk --lib acquire_events -- --nocapture`.
+
+The loopback socket tests named `raw_*` exercise filtered-page evidence
+through the client API: a full page of expired or invalid-signature events above
+an older valid event, mixed pages and timestamp ties, overflow after filtering,
+cancellation and late replies, overlapping IDs, and parse loss followed by EOSE.
+Run them with
+`cargo test -p nostr-sdk --lib client::api::acquire_events::tests::raw_ -- --nocapture`.
