@@ -4282,6 +4282,143 @@ mod tests {
             Some(SubscriptionAutoClosedReason::Completed)
         ));
     }
+
+    #[tokio::test]
+    async fn auto_closing_idle_timeout_is_not_completion() {
+        let relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
+        let id = SubscriptionId::new("idle");
+        let (_tx, rx) = broadcast::channel(2);
+
+        let result = relay
+            .inner
+            .handle_auto_closing(
+                &id,
+                &[Filter::new()],
+                SubscribeAutoCloseOptions::default().idle_timeout(Some(Duration::from_millis(50))),
+                rx,
+                &None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            result.reason,
+            Some(SubscriptionAutoClosedReason::TimedOut)
+        ));
+    }
+
+    #[tokio::test]
+    async fn auto_closing_idle_timeout_counts_from_last_event() {
+        let relay = Relay::new(RelayUrl::parse("wss://relay.example.com").unwrap());
+        let id = SubscriptionId::new("idle-after-event");
+        let (tx, rx) = broadcast::channel(16);
+        let event = EventBuilder::new(Kind::TextNote, "idle")
+            .finalize(&Keys::generate())
+            .unwrap();
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::Event {
+                subscription_id: Cow::Owned(id.clone()),
+                event: Cow::Owned(event),
+            }),
+        })
+        .unwrap();
+
+        // Unrelated notifications keep arriving, but only events reset the idle timeout.
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                if tx.send(RelayNotification::Authenticated).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let result = time::timeout(
+            Some(Duration::from_secs(2)),
+            relay.inner.handle_auto_closing(
+                &id,
+                &[Filter::new()],
+                SubscribeAutoCloseOptions::default().idle_timeout(Some(Duration::from_millis(100))),
+                rx,
+                &None,
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(
+            result.reason,
+            Some(SubscriptionAutoClosedReason::TimedOut)
+        ));
+    }
+
+    #[tokio::test]
+    async fn post_eose_grace_forwards_events_until_it_elapses() {
+        let id = SubscriptionId::new("grace-events");
+        let (tx, mut rx) = broadcast::channel(2);
+        let (activity_tx, mut activity_rx) = mpsc::channel(2);
+        let event = EventBuilder::new(Kind::TextNote, "grace")
+            .finalize(&Keys::generate())
+            .unwrap();
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::Event {
+                subscription_id: Cow::Owned(id.clone()),
+                event: Cow::Owned(event.clone()),
+            }),
+        })
+        .unwrap();
+
+        let reason = post_eose_grace(
+            &id,
+            Duration::from_millis(50),
+            &mut rx,
+            &Some(activity_tx),
+            true,
+        )
+        .await;
+        assert!(reason.is_none());
+        assert!(matches!(
+            activity_rx.try_recv(),
+            Ok(SubscriptionActivity::ReceivedEvent(received)) if received.id == event.id
+        ));
+    }
+
+    #[tokio::test]
+    async fn post_eose_grace_reports_early_end() {
+        let id = SubscriptionId::new("grace-end");
+
+        let (tx, mut rx) = broadcast::channel(2);
+        tx.send(RelayNotification::Message {
+            message: Box::new(RelayMessage::Closed {
+                subscription_id: Cow::Owned(id.clone()),
+                message: Cow::Borrowed("error: shutting down"),
+            }),
+        })
+        .unwrap();
+        let reason = post_eose_grace(&id, Duration::from_secs(2), &mut rx, &None, true).await;
+        assert!(matches!(
+            reason,
+            Some(SubscriptionAutoClosedReason::Closed(ref message)) if message == "error: shutting down"
+        ));
+
+        let (tx, mut rx) = broadcast::channel(2);
+        tx.send(RelayNotification::RelayStatus {
+            status: RelayStatus::Disconnected,
+        })
+        .unwrap();
+        let reason = post_eose_grace(&id, Duration::from_secs(2), &mut rx, &None, true).await;
+        assert!(matches!(
+            reason,
+            Some(SubscriptionAutoClosedReason::Disconnected)
+        ));
+
+        let (tx, mut rx) = broadcast::channel::<RelayNotification>(2);
+        drop(tx);
+        let reason = post_eose_grace(&id, Duration::from_secs(2), &mut rx, &None, true).await;
+        assert!(matches!(
+            reason,
+            Some(SubscriptionAutoClosedReason::ReceiverClosed)
+        ));
+    }
 }
 
 #[cfg(bench)]

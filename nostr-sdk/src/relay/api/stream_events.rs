@@ -362,6 +362,22 @@ mod tests {
             other => panic!("expected receiver loss, got {other:?}"),
         }
         assert!(stream.next().await.is_none());
+
+        let (tx, rx) = mpsc::channel(2);
+        let (cancel_tx, _cancel_rx) = oneshot::channel();
+        let mut stream = SubscriptionActivityEventStream::new(rx, cancel_tx, true);
+        tx.send(SubscriptionActivity::Closed(
+            SubscriptionAutoClosedReason::ReceiverClosed,
+        ))
+        .await
+        .unwrap();
+        match stream.next().await {
+            Some(RelayStreamEvent::Error(error)) => {
+                assert!(error.to_string().contains("closed"));
+            }
+            other => panic!("expected receiver closure, got {other:?}"),
+        }
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]
