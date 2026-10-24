@@ -25,7 +25,7 @@ use crate::monitor::Monitor;
 use crate::policy::AdmitStatus;
 use crate::relay::{
     AtomicRelayCapabilities, Relay, RelayCapabilities, RelayOptions, RelayStreamEvent,
-    ReqExitPolicy, SubscribeAutoCloseOptions, SyncOptions,
+    ReqExitPolicy, SubscribeAutoCloseOptions, SubscriptionData, SyncOptions,
 };
 use crate::shared::SharedState;
 use crate::stream::ReceiverStream;
@@ -388,11 +388,11 @@ impl RelayPool {
     #[inline]
     pub(crate) async fn subscriptions(
         &self,
-    ) -> HashMap<SubscriptionId, HashMap<RelayUrl, Vec<Filter>>> {
+    ) -> HashMap<SubscriptionId, HashMap<RelayUrl, SubscriptionData>> {
         // Lock with read shared access
         let relays = self.relays.read().await;
 
-        let mut subscriptions: HashMap<SubscriptionId, HashMap<RelayUrl, Vec<Filter>>> =
+        let mut subscriptions: HashMap<SubscriptionId, HashMap<RelayUrl, SubscriptionData>> =
             HashMap::new();
 
         for (url, relay) in relays.iter() {
@@ -400,11 +400,11 @@ impl RelayPool {
             let relay_subscriptions = relay.subscriptions().await;
 
             // Iterate relay subscriptions and populate the general subscriptions map
-            for (id, list) in relay_subscriptions.into_iter() {
+            for (id, data) in relay_subscriptions.into_iter() {
                 subscriptions
                     .entry(id)
                     .or_default()
-                    .insert(url.clone(), list);
+                    .insert(url.clone(), data);
             }
         }
 
@@ -412,21 +412,24 @@ impl RelayPool {
     }
 
     #[inline]
-    pub(crate) async fn subscription(&self, id: &SubscriptionId) -> HashMap<RelayUrl, Vec<Filter>> {
+    pub(crate) async fn subscription(
+        &self,
+        id: &SubscriptionId,
+    ) -> HashMap<RelayUrl, SubscriptionData> {
         // Lock with read shared access
         let relays = self.relays.read().await;
 
-        let mut filters: HashMap<RelayUrl, Vec<Filter>> = HashMap::new();
+        let mut subscription: HashMap<RelayUrl, SubscriptionData> = HashMap::new();
 
-        // Iterate relays and populate filters
+        // Iterate relays and collect the subscription registered on each
         for (url, relay) in relays.iter() {
             // try to get subscription by ID from the relay
-            if let Some(list) = relay.subscription(id).await {
-                filters.insert(url.clone(), list);
+            if let Some(data) = relay.subscription(id).await {
+                subscription.insert(url.clone(), data);
             }
         }
 
-        filters
+        subscription
     }
 
     pub(crate) async fn send_msg(
