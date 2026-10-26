@@ -89,6 +89,7 @@ impl<'relay> IntoFuture for FetchEvents<'relay> {
     }
 }
 
+#[allow(deprecated)]
 #[cfg(test)]
 mod tests {
     use nostr::event::{EventBuilder, FinalizeEvent, Kind};

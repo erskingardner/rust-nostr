@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::time::Duration;
 
 use nostr_sdk::prelude::*;
+use tokio_stream::StreamExt;
 
 #[derive(Debug, Default)]
 struct Filtering {
@@ -53,14 +54,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let filter = Filter::new()
         .authors([muted_public_key, public_key])
         .kind(Kind::Metadata);
-    let events = client
-        .fetch_events(filter)
+    let mut stream = client
+        .stream_events(filter)
         .timeout(Duration::from_secs(10))
         .await?;
-    println!("Received {} events.", events.len());
 
-    assert_eq!(events.len(), 1);
-    assert_eq!(events.first().unwrap().pubkey, public_key);
+    while let Some((_, res)) = stream.next().await {
+        let event = res?;
+        println!("{}", event.as_json());
+    }
 
     Ok(())
 }

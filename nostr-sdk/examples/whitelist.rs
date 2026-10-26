@@ -54,16 +54,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let filter = Filter::new()
         .authors([allowed_public_key, not_in_whitelist_public_key])
         .kind(Kind::Metadata);
-    let events = client
-        .fetch_events(filter)
+    let mut stream = client
+        .stream_events(filter)
         .timeout(Duration::from_secs(10))
         .await?;
-    println!("Received {} events.", events.len());
 
-    assert_eq!(events.len(), 1);
-    assert_eq!(events.first().unwrap().pubkey, allowed_public_key);
-
-    for event in events.into_iter() {
+    while let Some((_, res)) = stream.next().await {
+        let event = res?;
         println!("{}", event.as_json());
     }
 

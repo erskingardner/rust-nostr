@@ -10,7 +10,7 @@
 #![warn(rustdoc::bare_urls)]
 #![allow(clippy::arc_with_non_send_sync)]
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -198,8 +198,8 @@ impl NostrWalletConnect {
             .author(self.uri.public_key)
             .limit(1);
 
-        let events: BTreeSet<Event> = self.client.fetch_events(filter).max_events(1).await.ok()?;
-        let info_event: Event = events.into_iter().next()?;
+        let mut stream = self.client.stream_events(filter).await.ok()?;
+        let info_event: Event = stream.next().await.map(|(_, res)| res.ok())??;
 
         info_event
             .tags
@@ -470,8 +470,8 @@ mod tests {
             client.send_event(&event).await.unwrap();
         }
 
-        let request = client
-            .fetch_events(
+        let mut stream = client
+            .stream_events(
                 Filter::new()
                     .kind(Kind::WalletConnectRequest)
                     .author(ckeys.public_key())
@@ -479,9 +479,12 @@ mod tests {
             )
             .policy(ReqExitPolicy::WaitForEvents(1))
             .await
-            .unwrap()
-            .into_iter()
+            .unwrap();
+        let request: Event = stream
             .next()
+            .await
+            .map(|(_, res)| res.ok())
+            .unwrap()
             .unwrap();
 
         let cipher = request

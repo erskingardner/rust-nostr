@@ -1018,7 +1018,7 @@ impl Client {
     /// }
     /// # Ok(()) }
     /// ```
-    #[inline]
+    #[deprecated(since = "0.46.0", note = "Use `Client::stream_events` instead")]
     pub fn fetch_events<'client, 'url, F>(&'client self, target: F) -> FetchEvents<'client, 'url>
     where
         F: Into<ReqTarget<'url>>,

@@ -108,6 +108,7 @@ where
     }
 }
 
+#[allow(deprecated)]
 #[cfg(test)]
 mod tests {
     use std::time::Duration;

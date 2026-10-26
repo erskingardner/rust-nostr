@@ -402,7 +402,7 @@ impl Relay {
     }
 
     /// Fetch events
-    #[inline]
+    #[deprecated(since = "0.46.0", note = "Use `Relay::stream_events` instead")]
     pub fn fetch_events<F>(&self, filters: F) -> FetchEvents<'_>
     where
         F: Into<Vec<Filter>>,
@@ -982,13 +982,14 @@ mod tests {
         time::sleep(Duration::from_secs(3)).await;
         check_relay_is_sleeping(&relay);
 
-        // Test wake up when fetch events
+        // Test wake up when stream events
         let filter = Filter::new().kind(Kind::TextNote);
-        let _ = relay
-            .fetch_events(filter)
+        let mut stream = relay
+            .stream_events(filter)
             .timeout(Duration::from_secs(10))
             .await
             .unwrap();
+        let _ = stream.next().await;
         assert_eq!(relay.status(), RelayStatus::Connected);
 
         // Check if relay is sleeping

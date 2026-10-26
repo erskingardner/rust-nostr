@@ -54,12 +54,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Get events
     let filter = Filter::new().author(pubkey).kind(Kind::TextNote).limit(3);
-    let events = client
-        .fetch_events(filter)
+    let mut stream = client
+        .stream_events(filter)
         .timeout(Duration::from_secs(10))
         .await?;
 
-    for event in events.into_iter() {
+    while let Some((_, res)) = stream.next().await {
+        let event = res?;
         println!("{}", event.as_json());
     }
 

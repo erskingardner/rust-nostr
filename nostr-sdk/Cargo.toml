@@ -67,9 +67,6 @@ name = "client"
 name = "comment"
 
 [[example]]
-name = "fetch-events"
-
-[[example]]
 name = "gossip"
 
 [[example]]

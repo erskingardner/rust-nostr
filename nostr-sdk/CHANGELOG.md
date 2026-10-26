@@ -68,6 +68,7 @@
 ### Deprecated
 
 - Deprecate `LocalRelayBuilder::max_query_results` and `LocalRelayBuilder::default_filter_limit` (https://github.com/nostrdevkit/nostr/pull/1461)
+- Deprecate `Relay::fetch_events` and `Client::fetch_events`
 
 ## v0.45.4 - 2026/09/19
 
