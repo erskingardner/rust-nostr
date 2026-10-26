@@ -24,8 +24,8 @@ pub enum SleepWhenIdle {
 
 impl SleepWhenIdle {
     #[inline]
-    pub(super) fn is_disabled(&self) -> bool {
-        matches!(self, SleepWhenIdle::Disabled)
+    pub(super) fn is_enabled(&self) -> bool {
+        matches!(self, SleepWhenIdle::Enabled { .. })
     }
 }
 

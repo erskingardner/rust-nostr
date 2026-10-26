@@ -496,9 +496,6 @@ impl InnerRelay {
 
     /// Perform checks to ensure that the relay is ready for use.
     pub(super) fn ensure_operational(&self) -> Result<(), Error> {
-        // Ensures that the relay is awake.
-        self.ensure_awake_for_activity();
-
         // Get current status
         let status: RelayStatus = self.status();
 
@@ -512,8 +509,16 @@ impl InnerRelay {
             return Err(Error::banned());
         }
 
-        // Sanity-check, to ensure that the relay is not sleeping.
-        if status.is_sleeping() {
+        if self.opts.sleep_when_idle.is_enabled() {
+            self.stats.update_activity();
+
+            if status.is_sleeping() {
+                tracing::debug!(url = %self.url, "Waking up sleeping relay.");
+                self.request_connect();
+                self.stats.just_woke_up();
+            }
+        } else if status.is_sleeping() {
+            // Sanity-check. This must be unreachable, Sleeping requires the feature to be enabled.
             return Err(Error::sleeping());
         }
 
@@ -798,29 +803,6 @@ impl InnerRelay {
         let idle_duration_secs: u64 = Timestamp::now().as_secs() - reference_time.as_secs();
         let idle_duration: Duration = Duration::from_secs(idle_duration_secs);
         idle_duration >= timeout
-    }
-
-    /// Wake up the relay if it's sleeping and update the last activity timestamp.
-    #[inline]
-    fn ensure_awake_for_activity(&self) {
-        // If the sleeping is disabled, immediately return.
-        if self.opts.sleep_when_idle.is_disabled() {
-            return;
-        }
-
-        // Update last activity timestamp
-        self.stats.update_activity();
-
-        // If it isn't sleeping, immediately return.
-        if !self.status().is_sleeping() {
-            return;
-        }
-
-        tracing::debug!(url = %self.url, "Waking up sleeping relay.");
-
-        self.request_connect();
-
-        self.stats.just_woke_up();
     }
 
     #[inline]
