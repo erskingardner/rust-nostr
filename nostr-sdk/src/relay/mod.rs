@@ -953,7 +953,7 @@ mod tests {
 
         // Relay
         let opts = RelayOptions::default().sleep_when_idle(SleepWhenIdle::Enabled {
-            timeout: Duration::from_secs(2),
+            timeout: Duration::from_millis(1500),
         });
         let relay = new_relay(url, opts);
 
@@ -968,7 +968,7 @@ mod tests {
         assert_eq!(relay.status(), RelayStatus::Connected);
 
         // Wait to make sure the relay go in sleep mode (see SLEEP_INTERVAL const)
-        time::sleep(Duration::from_secs(3)).await;
+        time::sleep(Duration::from_millis(3500)).await;
         check_relay_is_sleeping(&relay);
 
         // Test wake up when sending an event
@@ -979,7 +979,7 @@ mod tests {
         assert_eq!(relay.status(), RelayStatus::Connected);
 
         // Check if relay is sleeping
-        time::sleep(Duration::from_secs(3)).await;
+        time::sleep(Duration::from_millis(3500)).await;
         check_relay_is_sleeping(&relay);
 
         // Test wake up when stream events
@@ -993,7 +993,7 @@ mod tests {
         assert_eq!(relay.status(), RelayStatus::Connected);
 
         // Check if relay is sleeping
-        time::sleep(Duration::from_secs(3)).await;
+        time::sleep(Duration::from_millis(3500)).await;
         check_relay_is_sleeping(&relay);
 
         // Test wake up when sync
@@ -1002,7 +1002,7 @@ mod tests {
         assert_eq!(relay.status(), RelayStatus::Connected);
 
         // Check if relay is sleeping
-        time::sleep(Duration::from_secs(3)).await;
+        time::sleep(Duration::from_millis(3500)).await;
         check_relay_is_sleeping(&relay);
     }
 
