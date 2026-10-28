@@ -213,6 +213,19 @@ impl<'a> DatabaseEvent<'a> {
         fbb.finished_data()
     }
 
+    /// Extract event IDs from `e` tags.
+    #[inline]
+    pub(crate) fn event_ids(&self) -> impl Iterator<Item = EventId> + '_ {
+        self.tags.iter().filter_map(|t| {
+            if t.kind() != "e" {
+                return None;
+            }
+
+            let content: &str = t.content()?;
+            EventId::from_hex(content).ok()
+        })
+    }
+
     /// Into owned event
     pub fn into_owned(self) -> Event {
         Event::new(

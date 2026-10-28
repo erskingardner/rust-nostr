@@ -14,15 +14,16 @@ pub use self::mock::*;
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::future::Future;
     use std::pin::Pin;
 
-    use nostr::event::{EventBuilder, EventId, FinalizeEvent, Kind, Tag};
+    use futures::stream::StreamExt;
+    use nostr::event::{Event, EventBuilder, EventId, FinalizeEvent, Kind, Tag};
     use nostr::filter::Filter;
     use nostr::key::{Keys, PublicKey};
     use nostr::nips::nip17::PrivateDirectMessageBuilder;
     use nostr_memory::MemoryDatabase;
-    use tokio_stream::StreamExt;
 
     use super::*;
     use crate::client::Client;
@@ -79,7 +80,11 @@ mod tests {
         client.send_event(&event).await.unwrap();
 
         // Empty filter to get all events. It should be updated to have `UPDATE_TAG`
-        let events = client.fetch_events(Filter::new()).await.unwrap();
+        let stream = client.stream_events(Filter::new()).await.unwrap();
+        let events: BTreeSet<Event> = stream
+            .filter_map(|(_, event)| async { event.ok() })
+            .collect()
+            .await;
 
         assert!(!events.is_empty(), "Should not be empty");
         assert!(
@@ -270,13 +275,17 @@ mod tests {
                 .unwrap();
         }
 
-        let result = client
-            .fetch_events([
+        let stream = client
+            .stream_events([
                 Filter::new().kind(Kind::TextNote),
                 Filter::new().kind(Kind::Comment),
             ])
             .await
             .unwrap();
+        let result: BTreeSet<Event> = stream
+            .filter_map(|(_, event)| async { event.ok() })
+            .collect()
+            .await;
 
         assert_eq!(6, result.len(), "max result is 6");
         assert_eq!(

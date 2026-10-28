@@ -29,6 +29,7 @@ pub use self::builder::*;
 pub use self::capabilities::*;
 pub(crate) use self::constants::DEFAULT_FETCH_EVENTS_LIMIT;
 use self::inner::InnerRelay;
+pub use self::inner::SubscriptionData;
 pub use self::limits::*;
 pub use self::notification::*;
 pub use self::options::*;
@@ -186,15 +187,15 @@ impl Relay {
         &self.inner.capabilities
     }
 
-    /// Get subscriptions
+    /// Get long-lived subscriptions
     #[inline]
-    pub async fn subscriptions(&self) -> HashMap<SubscriptionId, Vec<Filter>> {
+    pub async fn subscriptions(&self) -> HashMap<SubscriptionId, SubscriptionData> {
         self.inner.subscriptions().await
     }
 
-    /// Get filters by [SubscriptionId]
+    /// Get subscription by [SubscriptionId]
     #[inline]
-    pub async fn subscription(&self, id: &SubscriptionId) -> Option<Vec<Filter>> {
+    pub async fn subscription(&self, id: &SubscriptionId) -> Option<SubscriptionData> {
         self.inner.subscription(id).await
     }
 
@@ -414,6 +415,26 @@ impl Relay {
         UnsubscribeAll::new(self)
     }
 
+    /// Reissue a long-lived subscription, so the relay sends its stored events again.
+    ///
+    /// Queues `CLOSE` followed by a `REQ` with the stored filters, both or neither.
+    /// The relay is never left without the subscription,
+    /// and never receives a `REQ` for an ID it still has open.
+    ///
+    /// If the relay isn't connected, both messages wait in the queue
+    /// and are sent on the next connection instead of the automatic restoration of the subscription,
+    /// so the relay still receives a single `REQ`.
+    ///
+    /// Returns an error if the subscription isn't registered or is auto-closing,
+    /// if the relay isn't operational or can't read, or if the queue can't fit both messages.
+    #[inline]
+    pub fn reissue_subscription<'id>(
+        &self,
+        id: &'id SubscriptionId,
+    ) -> ReissueSubscription<'_, 'id> {
+        ReissueSubscription::new(self, id)
+    }
+
     /// Stream events from relay.
     ///
     /// Awaiting the builder preserves the legacy event stream behavior: timeout
@@ -431,6 +452,7 @@ impl Relay {
     /// timeout or disconnect; use [`StreamEvents::with_outcomes`] for a terminal
     /// outcome when that distinction matters.
     #[inline]
+    #[deprecated(since = "0.46.0", note = "Use `Relay::stream_events` instead")]
     pub fn fetch_events<F>(&self, filters: F) -> FetchEvents<'_>
     where
         F: Into<Vec<Filter>>,
@@ -1018,7 +1040,7 @@ mod tests {
 
         // Relay
         let opts = RelayOptions::default().sleep_when_idle(SleepWhenIdle::Enabled {
-            timeout: Duration::from_secs(2),
+            timeout: Duration::from_millis(1500),
         });
         let relay = new_relay(url, opts);
 
@@ -1033,7 +1055,7 @@ mod tests {
         assert_eq!(relay.status(), RelayStatus::Connected);
 
         // Wait to make sure the relay go in sleep mode (see SLEEP_INTERVAL const)
-        time::sleep(Duration::from_secs(3)).await;
+        time::sleep(Duration::from_millis(3500)).await;
         check_relay_is_sleeping(&relay);
 
         // Test wake up when sending an event
@@ -1044,20 +1066,21 @@ mod tests {
         assert_eq!(relay.status(), RelayStatus::Connected);
 
         // Check if relay is sleeping
-        time::sleep(Duration::from_secs(3)).await;
+        time::sleep(Duration::from_millis(3500)).await;
         check_relay_is_sleeping(&relay);
 
-        // Test wake up when fetch events
+        // Test wake up when stream events
         let filter = Filter::new().kind(Kind::TextNote);
-        let _ = relay
-            .fetch_events(filter)
+        let mut stream = relay
+            .stream_events(filter)
             .timeout(Duration::from_secs(10))
             .await
             .unwrap();
+        let _ = stream.next().await;
         assert_eq!(relay.status(), RelayStatus::Connected);
 
         // Check if relay is sleeping
-        time::sleep(Duration::from_secs(3)).await;
+        time::sleep(Duration::from_millis(3500)).await;
         check_relay_is_sleeping(&relay);
 
         // Test wake up when sync
@@ -1066,7 +1089,7 @@ mod tests {
         assert_eq!(relay.status(), RelayStatus::Connected);
 
         // Check if relay is sleeping
-        time::sleep(Duration::from_secs(3)).await;
+        time::sleep(Duration::from_millis(3500)).await;
         check_relay_is_sleeping(&relay);
     }
 

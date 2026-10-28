@@ -19,15 +19,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let event_id =
         EventId::from_bech32("note1hrrgx2309my3wgeecx2tt6fl2nl8hcwl0myr3xvkcqpnq24pxg2q06armr")?;
-    let events = client
-        .fetch_events(Filter::new().id(event_id))
+    let mut stream = client
+        .stream_events(Filter::new().id(event_id))
         .timeout(Duration::from_secs(10))
         .await?;
+    let (_, res) = stream.next().await.unwrap();
+    let comment_to = res?;
+    drop(stream);
 
     let keys = Keys::generate();
 
-    let comment_to = events.first().unwrap();
-    let event = CommentBuilder::new("This is a reply", comment_to).finalize(&keys)?;
+    let event = CommentBuilder::new("This is a reply", &comment_to).finalize(&keys)?;
 
     let output = client.send_event(&event).await?;
     println!("Output: {:?}", output);

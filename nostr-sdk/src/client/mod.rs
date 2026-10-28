@@ -29,7 +29,8 @@ use crate::pool::{RelayPool, RelayPoolBuilder};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::proxy::Proxy;
 use crate::relay::{
-    Relay, RelayCapabilities, RelayLimits, RelayOptions, SleepWhenIdle, SyncOptions,
+    Relay, RelayCapabilities, RelayLimits, RelayOptions, SleepWhenIdle, SubscriptionData,
+    SyncOptions,
 };
 use crate::stream::NotificationStream;
 
@@ -591,15 +592,17 @@ impl Client {
         self.pool().disconnect().await
     }
 
-    /// Get subscriptions
+    /// Get long-lived subscriptions, with the data registered on each relay
     #[inline]
-    pub async fn subscriptions(&self) -> HashMap<SubscriptionId, HashMap<RelayUrl, Vec<Filter>>> {
+    pub async fn subscriptions(
+        &self,
+    ) -> HashMap<SubscriptionId, HashMap<RelayUrl, SubscriptionData>> {
         self.pool().subscriptions().await
     }
 
-    /// Get subscription
+    /// Get subscription by [`SubscriptionId`], with the data registered on each relay
     #[inline]
-    pub async fn subscription(&self, id: &SubscriptionId) -> HashMap<RelayUrl, Vec<Filter>> {
+    pub async fn subscription(&self, id: &SubscriptionId) -> HashMap<RelayUrl, SubscriptionData> {
         self.pool().subscription(id).await
     }
 
@@ -1026,7 +1029,7 @@ impl Client {
     /// }
     /// # Ok(()) }
     /// ```
-    #[inline]
+    #[deprecated(since = "0.46.0", note = "Use `Client::stream_events` instead")]
     pub fn fetch_events<'client, 'url, F>(&'client self, target: F) -> FetchEvents<'client, 'url>
     where
         F: Into<ReqTarget<'url>>,

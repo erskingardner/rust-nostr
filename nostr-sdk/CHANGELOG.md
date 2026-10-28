@@ -35,6 +35,7 @@
 - Redesign `Client::try_connect_relay` API
 - Return `NotificationStream<T>` from client and relay `notifications()` methods instead of a boxed stream.
 - Remove `RelayStatus::Pending` and rename `RelayStatus::Terminated` to `RelayStatus::Idle` (https://github.com/nostrdevkit/nostr/pull/1491).
+- Return `SubscriptionData` from `Relay::subscriptions`, `Relay::subscription`, `Client::subscriptions` and `Client::subscription` (one per relay) instead of the filters. It also tells whether the current `REQ` was answered with `EOSE` and whether the relay closed the subscription.
 
 ### Changed
 
@@ -65,6 +66,7 @@
   atomically: every message is queued in order, or none is.
 - Add `Relay::subscription_received_eose` to read whether a subscription got
   `EOSE` for its current `REQ`.
+- Add `Relay::reissue_subscription` to queue `CLOSE` and `REQ` for a long-lived subscription as a single unit, so the relay sends its stored events again.
 
 ### Fixed
 
@@ -87,10 +89,12 @@
   their previous quiet termination behavior.
 - Report an early unprefixed relay `CLOSED` as incomplete in acquisition and
   outcome streams.
+- Avoid a duplicate subscription `REQ` when another `REQ` for it is queued while it's being restored after a reconnection.
 
 ### Deprecated
 
 - Deprecate `LocalRelayBuilder::max_query_results` and `LocalRelayBuilder::default_filter_limit` (https://github.com/nostrdevkit/nostr/pull/1461)
+- Deprecate `Relay::fetch_events` and `Client::fetch_events`
 
 ## v0.45.4 - 2026/09/19
 

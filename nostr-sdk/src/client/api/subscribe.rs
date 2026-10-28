@@ -70,19 +70,60 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::time::Duration;
+    use std::{future, slice};
 
     use futures::StreamExt;
     use nostr::event::{EventBuilder, FinalizeEvent, Kind};
     use nostr::filter::Filter;
     use nostr::key::Keys;
-    use nostr::message::SubscriptionId;
+    use nostr::message::{RelayMessage, SubscriptionId};
+    use nostr::types::RelayUrl;
 
     use crate::authenticator::SignerAuthenticator;
     use crate::client::ClientNotification;
+    use crate::local_relay::MockRelay;
+    use crate::relay::SubscriptionData;
     use crate::test_utils::{
         setup_client, setup_client_with_authenticator, setup_nip42_read_local_relay,
     };
+
+    #[tokio::test]
+    async fn test_client_subscription_returns_data_registered_on_each_relay() {
+        let mock = MockRelay::run().await.unwrap();
+        let url: RelayUrl = mock.url().await;
+        let client = setup_client(url.clone()).await;
+        let filter: Filter = Filter::new().kind(Kind::TextNote);
+        let id: SubscriptionId = SubscriptionId::new("client-subscription-data");
+
+        let notifications = client.notifications();
+
+        client
+            .subscribe(filter.clone())
+            .with_id(id.clone())
+            .await
+            .unwrap();
+
+        let eose = notifications.any(|notification| {
+            future::ready(matches!(notification, ClientNotification::Message { ref message, .. }
+                if matches!(message.as_ref(), RelayMessage::EndOfStoredEvents(received) if received.as_ref() == &id)))
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), eose)
+                .await
+                .unwrap()
+        );
+
+        let subscription: HashMap<RelayUrl, SubscriptionData> = client.subscription(&id).await;
+        let data: &SubscriptionData = subscription.get(&url).unwrap();
+        assert_eq!(data.filters(), slice::from_ref(&filter));
+        assert!(data.received_eose());
+        assert!(!data.is_closed());
+
+        let subscriptions = client.subscriptions().await;
+        assert_eq!(subscriptions[&id][&url].filters(), [filter]);
+    }
 
     #[tokio::test]
     async fn test_client_subscribe_dont_resubscribes_after_auth_required_closed_without_authenticator()

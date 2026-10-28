@@ -185,6 +185,7 @@ where
     }
 }
 
+#[allow(deprecated)]
 #[cfg(test)]
 mod tests {
     use std::future::Future;

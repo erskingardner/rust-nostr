@@ -1,6 +1,7 @@
 mod acquire_events;
 mod count_events;
 mod fetch_events;
+mod reissue_subscription;
 mod send_event;
 mod send_msg;
 mod stream_events;
@@ -14,6 +15,7 @@ pub use self::acquire_events::*;
 pub(crate) use self::acquire_events::{RawAcquisition, acquire_relay};
 pub use self::count_events::*;
 pub use self::fetch_events::*;
+pub use self::reissue_subscription::*;
 pub use self::send_event::*;
 pub use self::send_msg::*;
 pub use self::stream_events::*;
