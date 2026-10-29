@@ -1,4 +1,4 @@
-// Copyright (c) 2026 Nostr Dev Kit Developers
+// Copyright (c) 2026 Rust Nostr Developers
 // Distributed under the MIT software license
 
 //! NIP-67: EOSE Completeness Hint

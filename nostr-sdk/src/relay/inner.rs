@@ -2794,19 +2794,19 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-        let RelayNotification::Message { message } = notification else {
-            panic!("expected an EOSE message");
-        };
+        let expected: RelayMessage = RelayMessage::eose_with_hints(
+            ended.clone(),
+            vec![
+                EoseHint::Auth,
+                EoseHint::More,
+                EoseHint::Unknown(String::from("future")),
+            ],
+        );
         assert_eq!(
-            *message,
-            RelayMessage::eose_with_hints(
-                ended.clone(),
-                vec![
-                    EoseHint::Auth,
-                    EoseHint::More,
-                    EoseHint::Unknown(String::from("future"))
-                ],
-            )
+            notification,
+            RelayNotification::Message {
+                message: Box::new(expected),
+            }
         );
         assert!(relay.subscription(&ended).await.unwrap().received_eose());
         assert!(!relay.subscription(&other).await.unwrap().received_eose());
