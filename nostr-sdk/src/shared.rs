@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use lru::LruCache;
 use nostr::error::{Error, ErrorKind};
-use nostr::event::{Event, EventId};
+use nostr::event::{Event, EventId, Signature};
 use nostr_database::NostrDatabase;
 use nostr_gossip::NostrGossip;
 use tokio::sync::Mutex;
@@ -22,7 +22,7 @@ pub(crate) struct SharedState {
     pub(crate) database: Arc<dyn NostrDatabase>,
     pub(crate) transport: Arc<dyn WebSocketTransport>,
     pub(crate) gossip: Option<Arc<dyn NostrGossip>>,
-    verification_cache: Arc<Mutex<LruCache<EventId, ()>>>,
+    verification_cache: Arc<Mutex<LruCache<EventId, Signature>>>,
     pub(crate) admit_policy: Option<Arc<dyn AdmitPolicy>>,
     pub(crate) authenticator: Option<Arc<dyn Authenticator>>,
     pub(crate) monitor: Option<Monitor>,
@@ -81,8 +81,8 @@ impl SharedState {
             ));
         }
 
-        // Skip signature verification if the event is already cached
-        if cache.contains(&event.id) {
+        // The event ID doesn't cover the signature, so both must match the cache.
+        if cache.peek(&event.id) == Some(&event.sig) {
             return Ok(());
         }
 
@@ -96,7 +96,7 @@ impl SharedState {
         }
 
         // Event is fully (ID + signature) verified, so we can cache it.
-        cache.put(event.id, ());
+        cache.put(event.id, event.sig);
 
         Ok(())
     }
@@ -104,6 +104,9 @@ impl SharedState {
 
 #[cfg(test)]
 mod tests {
+    use nostr::event::{EventBuilder, FinalizeEvent, Kind};
+    use nostr::key::Keys;
+
     use super::*;
     use crate::events_tracker::MemoryEventsTracker;
     use crate::transport::websocket::DefaultWebsocketTransport;
@@ -117,6 +120,86 @@ mod tests {
             None,
             None,
         )
+    }
+
+    #[tokio::test]
+    async fn verify_and_cache_rejects_invalid_signature() {
+        let keys: Keys = Keys::generate();
+        let event: Event = EventBuilder::new(Kind::TextNote, "test")
+            .finalize(&keys)
+            .unwrap();
+        let mut invalid_event: Event = event.clone();
+        invalid_event.sig = Signature::from_byte_array([0; 64]);
+        assert!(invalid_event.verify_id());
+        assert!(!invalid_event.verify_signature());
+
+        let event_verifier: SharedState = shared_state();
+
+        // An invalid signature must not populate an empty cache.
+        assert!(
+            event_verifier
+                .verify_and_cache(&invalid_event)
+                .await
+                .is_err()
+        );
+        assert!(event_verifier.verification_cache.lock().await.is_empty());
+
+        assert!(event_verifier.verify_and_cache(&event).await.is_ok());
+
+        // The same ID must not let an invalid signature bypass verification.
+        assert!(
+            event_verifier
+                .verify_and_cache(&invalid_event)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            event_verifier
+                .verification_cache
+                .lock()
+                .await
+                .peek(&event.id),
+            Some(&event.sig)
+        );
+        assert!(event_verifier.verify_and_cache(&event).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn verify_and_cache_accepts_alternative_valid_signature() {
+        let keys: Keys = Keys::generate();
+        let event: Event = EventBuilder::new(Kind::TextNote, "test")
+            .finalize(&keys)
+            .unwrap();
+        let mut alternative_event: Event = event.clone();
+        alternative_event.sig = keys.sign_schnorr(event.id.as_bytes());
+        assert_ne!(event.sig, alternative_event.sig);
+        assert!(alternative_event.verify().is_ok());
+
+        let event_verifier: SharedState = shared_state();
+        assert!(event_verifier.verify_and_cache(&event).await.is_ok());
+        assert!(
+            event_verifier
+                .verify_and_cache(&alternative_event)
+                .await
+                .is_ok()
+        );
+        assert_eq!(
+            event_verifier
+                .verification_cache
+                .lock()
+                .await
+                .peek(&event.id),
+            Some(&alternative_event.sig)
+        );
+        assert!(event_verifier.verify_and_cache(&event).await.is_ok());
+        assert_eq!(
+            event_verifier
+                .verification_cache
+                .lock()
+                .await
+                .peek(&event.id),
+            Some(&event.sig)
+        );
     }
 
     #[tokio::test]

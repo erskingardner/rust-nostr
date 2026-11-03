@@ -33,6 +33,9 @@
 
 - Always verify the event ID before consulting the verification cache, rejecting
   tampered events even when their supplied ID was previously verified.
+- Bind cached verification to both the event ID and signature. Reject invalid
+  signatures on cache hits without replacing a verified entry, and verify
+  alternative signatures before caching them.
 
 ### Added
 
