@@ -29,6 +29,11 @@
 
 ## Unreleased
 
+### Security
+
+- Always verify the event ID before consulting the verification cache, rejecting
+  tampered events even when their supplied ID was previously verified.
+
 ### Added
 
 - Add `Client::acquire_events` for per-relay bounded batches with item and
